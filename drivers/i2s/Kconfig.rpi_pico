@@ -1,0 +1,20 @@
+# STM32 I2S driver configuration options
+
+# Copyright (c) 2018 STMicroelectronics
+# SPDX-License-Identifier: Apache-2.0
+
+config I2S_RPI_PICO_PIO
+	bool "Raspberry Pi Pico PIO I2S controller driver"
+	default y
+	# depends on DT_HAS_RASPBERRYPI_PICO_SPI_PIO_ENABLED # TODO: do this for device tree I2S
+	select PICOSDK_USE_PIO
+	select PICOSDK_USE_CLAIM
+	select PINCTRL
+	help
+	  Enable driving I2S via PIO on the Raspberry Pi Pico
+
+
+if I2S_RPI_PICO_PIO
+
+
+endif # I2S_RPI_PICO_PIO
