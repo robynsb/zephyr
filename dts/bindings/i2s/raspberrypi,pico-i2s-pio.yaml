@@ -1,0 +1,5 @@
+description: Raspberry Pi Pico PIO I2S
+
+compatible: "raspberrypi,pico-i2s-pio"
+
+include: [i2s-controller.yaml, pinctrl-device.yaml]
