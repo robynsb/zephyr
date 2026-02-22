@@ -13,6 +13,7 @@
 #include <hardware/dma.h>
 #include <zephyr/logging/log.h>
 #include <hardware/clocks.h>
+#include <math.h>
 
 #include <zephyr/sys/util.h>
 
@@ -21,21 +22,129 @@ LOG_MODULE_REGISTER(i2s_pico_pio);
 
 typedef void (*pio_i2s_irq_config_func_t)(const struct device *dev);
 
+struct queue_item {
+	void *mem_block;
+	size_t size;
+};
+
 struct pio_i2s_config {
 	const struct device *piodev;
 	const struct pinctrl_dev_config *pcfg;
 	const uint32_t data_pin;
 	const uint32_t clock_pin_base;
 	const uint8_t dma_channel;
-    const pio_i2s_irq_config_func_t irq_config;
+    const pio_i2s_irq_config_func_t irq_config; // TODO: Is this function pointer necessary?
+};
+
+struct stream {
+	enum i2s_state state;
+	struct k_msgq *msgq;
+
+	struct i2s_config cfg;
+	void *mem_block;
 };
 
 struct pio_i2s_data {
 	uint8_t tx_sm;
     uint32_t freq;
-    uint8_t dma_channel; // TODO: Look into why there are two dma_channel variables?
+    uint8_t dma_channel; // TODO: Why there are two dma_channel variables?
+    struct stream tx;
 };
 
+static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
+			       const struct i2s_config *i2s_cfg)
+{
+    const struct pio_i2s_config *config = dev->config;
+	struct pio_i2s_data *data = dev->data;
+    if (dir != I2S_DIR_TX) {
+		LOG_ERR("I2S direction is unsupported."); // TODO:
+		return -EINVAL;
+    }
+
+    if (i2s_cfg->word_size != 16) {
+		LOG_ERR("I2S direction is unsupported.");
+		return -EINVAL;
+    }
+
+    // TODO: Handle the config better
+
+	struct stream *stream = &data->tx;
+
+	if (stream->state != I2S_STATE_NOT_READY &&
+	    stream->state != I2S_STATE_READY) {
+		LOG_ERR("invalid state");
+		return -EINVAL;
+	}
+
+	memcpy(&stream->cfg, i2s_cfg, sizeof(struct i2s_config));
+
+	stream->state = I2S_STATE_READY;
+	return 0;
+}
+
+static int i2s_rpi_pico_write(const struct device *dev, void *mem_block, size_t size)
+{
+    const struct pio_i2s_config *config = dev->config;
+	struct pio_i2s_data *data = dev->data;
+	const struct stream *stream = &data->tx;
+	enum i2s_state state = stream->state;
+	int err = 0;
+
+	if (state != I2S_STATE_RUNNING && state != I2S_STATE_READY) {
+		LOG_DBG("Invalid state: %d", (int)state);
+		return -EIO;
+	}
+
+	if (size > stream->cfg.block_size) {
+		LOG_DBG("Max write size is: %u", stream->cfg.block_size);
+		return -EIO;
+	}
+
+	struct queue_item item = {.mem_block = mem_block, .size = size};
+
+	err = k_msgq_put(stream->msgq, &item,
+			 K_MSEC(stream->cfg.timeout));
+	if (err < 0) {
+		LOG_DBG("TX queue full");
+	}
+
+	// return err;
+    return 0;
+}
+
+static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
+			     enum i2s_trigger_cmd cmd)
+{
+    const struct pio_i2s_config *config = dev->config;
+	struct pio_i2s_data *data = dev->data;
+	int ret;
+
+    if (dir != I2S_DIR_TX) {
+		LOG_ERR("I2S direction is unsupported.");
+		return -EINVAL;
+    }
+
+	struct stream *stream = &data->tx;
+
+	switch (cmd) {
+	case I2S_TRIGGER_START:
+		if (stream->state != I2S_STATE_READY) {
+			LOG_ERR("START trigger: invalid state %d",
+				    stream->state);
+			return -EIO;
+		}
+        audio_i2s_start(dev);
+		stream->state = I2S_STATE_RUNNING;
+
+		break;
+	default:
+        //TODO: Handle all other trigger commands
+		LOG_ERR("Unsupported trigger command");
+		return -EINVAL;
+	}
+
+	return 0;
+}
 
 RPI_PICO_PIO_DEFINE_PROGRAM(i2s_tx, 0, 3,
             //     .wrap_target
@@ -53,7 +162,7 @@ RPI_PICO_PIO_DEFINE_PROGRAM(i2s_tx, 0, 3,
 #define audio_i2s_wrap_target 0
 #define audio_i2s_wrap 7
 #define audio_i2s_offset_entry_point 7u
-#define PICO_AUDIO_I2S_DMA_IRQ 0 // We hardcode to use DMA_IRQ_0
+#define PICO_AUDIO_I2S_DMA_IRQ 0 // TODO: This is hardcoded to use DMA_IRQ_0
 
 static int pio_i2s_tx_init(PIO pio, uint32_t sm, uint32_t data_pin, uint32_t clock_pin_base)
 {
@@ -79,8 +188,8 @@ static int pio_i2s_tx_init(PIO pio, uint32_t sm, uint32_t data_pin, uint32_t clo
     pio_sm_exec(pio, sm, pio_encode_jmp(offset + audio_i2s_offset_entry_point));
 
     // update_pio_frequency
-    uint32_t sample_freq = 24000; // TODO: some hardcoded thing idk
-                                  // Make it work with config?
+    uint32_t sample_freq = 24000; // TODO: Frequency is hardcoded 
+                                  // Make it work with config
     uint32_t system_clock_frequency = clock_get_hz(clk_sys);
     assert(system_clock_frequency < 0x40000000);
     uint32_t divider = system_clock_frequency * 4 / sample_freq; // avoid arithmetic overflow
@@ -90,17 +199,21 @@ static int pio_i2s_tx_init(PIO pio, uint32_t sm, uint32_t data_pin, uint32_t clo
 	return 0;
 }
 
-#define SAMPLE_LENGTH 128 // Hardcoded sample length
-static int32_t sine_wave_table[SAMPLE_LENGTH] = {0};
-#ifndef M_PI
-#define M_PI 3.14159265358979323846
-#endif
-
 static inline void audio_start_dma_transfer(const struct device *dev)
 {
     const struct pio_i2s_config *config = dev->config;
 	struct pio_i2s_data *data = dev->data;
+    struct stream *stream = &data->tx;
 
+	size_t mem_block_size;
+	struct queue_item item;
+	int ret = k_msgq_get(stream->msgq, &item, SYS_TIMEOUT_MS(0));
+    if (ret < 0) {
+		return; // TODO: Handle errors
+	}
+
+    stream->mem_block = item.mem_block; 
+    mem_block_size = item.size;
 
     // if (!) {
     //     // just play some silence
@@ -114,7 +227,7 @@ static inline void audio_start_dma_transfer(const struct device *dev)
     dma_channel_config c = dma_get_channel_config(data->dma_channel);
     channel_config_set_read_increment(&c, true);
     dma_channel_set_config(data->dma_channel, &c, false);
-    dma_channel_transfer_from_buffer_now(data->dma_channel, (void *) sine_wave_table, SAMPLE_LENGTH);
+    dma_channel_transfer_from_buffer_now(data->dma_channel, (void *) stream->mem_block, mem_block_size/4); // Hardcoded 32 bit words
 }
 
 
@@ -124,6 +237,10 @@ void audio_i2s_dma_irq_handler(const struct device *dev) {
     uint dma_channel = data->dma_channel;
     if (dma_irqn_get_channel_status(PICO_AUDIO_I2S_DMA_IRQ, dma_channel)) {
         dma_irqn_acknowledge_channel(PICO_AUDIO_I2S_DMA_IRQ, dma_channel);
+
+        struct stream *stream = &data->tx;
+        k_mem_slab_free(stream->cfg.mem_slab, stream->mem_block);
+        stream->mem_block = NULL;
 
         audio_start_dma_transfer(dev);
     }
@@ -183,25 +300,7 @@ static int pio_i2s_init(const struct device *dev)
                           false // trigger
     );
 
-    // irq_add_shared_handler(DMA_IRQ_0 + PICO_AUDIO_I2S_DMA_IRQ, audio_i2s_dma_irq_handler, PICO_SHARED_IRQ_HANDLER_DEFAULT_ORDER_PRIORITY);
-    // retval = irq_connect_dynamic(DT_IRQN(DT_NODELABEL(dma)),  // TODO: Do proper interrupt
-    //             0, 
-    //             audio_i2s_dma_irq_handler, 
-    //             NULL, 
-    //             0);
-    // if (retval < 0) {
-	// 	LOG_ERR("irq_connect_dynamic failed with ret = %d", retval);
-    //     return retval;
-	// }
-
     dma_irqn_set_channel_enabled(PICO_AUDIO_I2S_DMA_IRQ, dma_channel, 1);
-
-    float volume = 0.15;
-    for (int i = 0; i < SAMPLE_LENGTH; i++) {
-        int16_t val = 32767 * volume * cosf(i * 2 * (float) (M_PI / SAMPLE_LENGTH));
-        // sine_wave_table[i] = 32767 * volume * cosf(i * 2 * (float) (M_PI / SAMPLE_LENGTH));
-        sine_wave_table[i]= (val  & 0xFFFF) | (val << 16);
-    }
 
     return !(retval >= 0);
 }
@@ -220,20 +319,17 @@ void audio_i2s_start(const struct device *dev) {
 
 }
 
-int i2s_rpi_pico_dummy_write(const struct device *dev, void *mem_block, size_t size) {
-    audio_i2s_start(dev);
-}
-
 static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
-	.configure = NULL,
+	.configure = i2s_rpi_pico_configure,
 	.config_get = NULL,
 	.read = NULL,
-	.write = i2s_rpi_pico_dummy_write,
-	.trigger = NULL,
+	.write = i2s_rpi_pico_write,
+	.trigger = i2s_rpi_pico_trigger,
 };
 
 // TODO: magic number 11!
 // TODO: hardcoded dma_channel
+// TODO: hardcoded queue size!
 #define PIO_I2S_INIT(idx)									\
 	PINCTRL_DT_INST_DEFINE(idx);								\
     static void pio_i2s_irq_config_##idx(const struct device *dev)				\
@@ -250,9 +346,15 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 		.clock_pin_base = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, tx_pins, 1),	\
         .irq_config = pio_i2s_irq_config_##idx,		\
         .dma_channel = 7                    \
-	};											\
-	static struct pio_i2s_data pio_i2s##idx##_data;					\
-												\
+	};                                                  \
+    K_MSGQ_DEFINE(tx_##idx##_queue, sizeof(struct queue_item),		\
+            32, 4);			\
+	static struct pio_i2s_data pio_i2s##idx##_data = {                \
+        .tx = {                                                        \
+            .msgq = &tx_##idx##_queue,                               \
+            .state = I2S_STATE_NOT_READY,                                \
+        },                                             \
+    };					\
 	DEVICE_DT_INST_DEFINE(idx, pio_i2s_init, NULL, &pio_i2s##idx##_data,			\
 			      &pio_i2s##idx##_config, POST_KERNEL,				\
 			      CONFIG_I2S_INIT_PRIORITY,					\
