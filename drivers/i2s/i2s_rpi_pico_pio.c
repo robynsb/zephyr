@@ -20,8 +20,6 @@
 #define LOG_LEVEL CONFIG_I2S_LOG_LEVEL
 LOG_MODULE_REGISTER(i2s_pico_pio);
 
-typedef void (*pio_i2s_irq_config_func_t)(const struct device *dev);
-
 struct queue_item {
 	void *mem_block;
 	size_t size;
@@ -33,7 +31,7 @@ struct pio_i2s_config {
 	const uint32_t data_pin;
 	const uint32_t clock_pin_base;
 	const uint8_t dma_channel;
-    const pio_i2s_irq_config_func_t irq_config; // TODO: Is this function pointer necessary?
+	void (*irq_config)(const struct device *dev);
 };
 
 struct stream {
