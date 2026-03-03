@@ -30,13 +30,13 @@ struct pio_i2s_config {
 	const struct pinctrl_dev_config *pcfg;
 	const uint32_t data_pin;
 	const uint32_t clock_pin_base;
-	const uint8_t dma_channel;
 	void (*irq_config)(const struct device *dev);
 };
 
 struct stream {
 	enum i2s_state state;
 	struct k_msgq *msgq;
+	uint32_t dma_channel;
 
 	struct i2s_config cfg;
 	void *mem_block;
@@ -45,7 +45,6 @@ struct stream {
 struct pio_i2s_data {
 	uint8_t tx_sm;
     uint32_t freq;
-    uint8_t dma_channel; // TODO: Why there are two dma_channel variables?
     struct stream tx;
 };
 
@@ -199,6 +198,7 @@ static int pio_i2s_tx_init(PIO pio, uint32_t sm, uint32_t data_pin, uint32_t clo
 
 static inline void audio_start_dma_transfer(const struct device *dev)
 {
+	// TODO: Currently assumes only one DMA channel/ I2S device exists.
     const struct pio_i2s_config *config = dev->config;
 	struct pio_i2s_data *data = dev->data;
     struct stream *stream = &data->tx;
@@ -222,17 +222,22 @@ static inline void audio_start_dma_transfer(const struct device *dev)
     //     dma_channel_transfer_from_buffer_now(shared_state.dma_channel, &zero, SAMPLE_LENGTH);
     //     return;
     // }
-    dma_channel_config c = dma_get_channel_config(data->dma_channel);
+    dma_channel_config c = dma_get_channel_config(data->tx.dma_channel);
     channel_config_set_read_increment(&c, true);
-    dma_channel_set_config(data->dma_channel, &c, false);
-    dma_channel_transfer_from_buffer_now(data->dma_channel, (void *) stream->mem_block, mem_block_size/4); // Hardcoded 32 bit words
+    dma_channel_set_config(data->tx.dma_channel, &c, false);
+    dma_channel_transfer_from_buffer_now(data->tx.dma_channel, (void *) stream->mem_block, mem_block_size/4); // Hardcoded 32 bit words
 }
 
 
 void audio_i2s_dma_irq_handler(const struct device *dev) {
+	// TODO: This is currently a zephyr interrupt waiting on the physical DMA finished interupt request line.
+	// Since it is a zephyr interrupt I specified in my IRQ_CONNECT macro that the i2s device should be passed.
+	// When I move my DMA handling over to zephyr DMA module, the IRQ works differently,
+	// I will receieve the DMA device instead which in that interupt handler i then need to find access to the
+	// i2s device.
     const struct pio_i2s_config *config = dev->config;
 	struct pio_i2s_data *data = dev->data;
-    uint dma_channel = data->dma_channel;
+    uint dma_channel = data->tx.dma_channel;
     if (dma_irqn_get_channel_status(PICO_AUDIO_I2S_DMA_IRQ, dma_channel)) {
         dma_irqn_acknowledge_channel(PICO_AUDIO_I2S_DMA_IRQ, dma_channel);
 
@@ -276,10 +281,8 @@ static int pio_i2s_init(const struct device *dev)
 	}
 
     // TODO: Use zephyr's DMA driver.
-    uint8_t dma_channel = config->dma_channel;
+    uint8_t dma_channel = data->tx.dma_channel;
     dma_channel_claim(dma_channel);
-
-    data->dma_channel = dma_channel;
 
     dma_channel_config dma_config = dma_channel_get_default_config(dma_channel);
 
@@ -343,7 +346,6 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 		.data_pin = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, tx_pins, 0),	\
 		.clock_pin_base = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, tx_pins, 1),	\
         .irq_config = pio_i2s_irq_config_##idx,		\
-        .dma_channel = 7                    \
 	};                                                  \
     K_MSGQ_DEFINE(tx_##idx##_queue, sizeof(struct queue_item),		\
             32, 4);			\
@@ -351,6 +353,7 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
         .tx = {                                                        \
             .msgq = &tx_##idx##_queue,                               \
             .state = I2S_STATE_NOT_READY,                                \
+			.dma_channel = 7,                    \
         },                                             \
     };					\
 	DEVICE_DT_INST_DEFINE(idx, pio_i2s_init, NULL, &pio_i2s##idx##_data,			\
