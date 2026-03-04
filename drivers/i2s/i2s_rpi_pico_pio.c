@@ -37,13 +37,13 @@ struct stream {
 	enum i2s_state state;
 	struct k_msgq *msgq;
 	uint32_t dma_channel;
+	uint8_t sm; // TODO: move this to stream
 
 	struct i2s_config cfg;
 	void *mem_block;
 };
 
 struct pio_i2s_data {
-	uint8_t tx_sm; // TODO: move this to stream
     struct stream tx;
 };
 
@@ -84,7 +84,7 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 	memcpy(&stream->cfg, i2s_cfg, sizeof(struct i2s_config));
 
 	PIO pio = pio_rpi_pico_get_pio(config->piodev);
-	update_pio_frequency(pio, data->tx_sm, i2s_cfg->frame_clk_freq);
+	update_pio_frequency(pio, data->tx.sm, i2s_cfg->frame_clk_freq);
 
 	stream->state = I2S_STATE_READY;
 	return 0;
@@ -235,7 +235,7 @@ static int pio_i2s_init(const struct device *dev)
 		return retval;
 	}
 
-	data->tx_sm = tx_sm;
+	data->tx.sm = tx_sm;
 
 	retval = pio_i2s_tx_init(pio, tx_sm, config->data_pin, config->clock_pin_base);
 	if (retval < 0) {
@@ -286,7 +286,7 @@ void audio_i2s_start(const struct device *dev) {
     // irq_set_enabled(DMA_IRQ_0 + PICO_AUDIO_I2S_DMA_IRQ, true);
     // irq_enable(DT_IRQN(DT_NODELABEL(dma)));
     config->irq_config(dev);
-    pio_sm_set_enabled(pio, data->tx_sm, true);
+    pio_sm_set_enabled(pio, data->tx.sm, true);
     audio_start_dma_transfer(dev);
 
 }
