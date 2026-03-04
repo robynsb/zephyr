@@ -37,7 +37,7 @@ struct stream {
 	enum i2s_state state;
 	struct k_msgq *msgq;
 	uint32_t dma_channel;
-	uint8_t sm; // TODO: move this to stream
+	uint8_t sm;
 
 	struct i2s_config cfg;
 	void *mem_block;
@@ -260,7 +260,6 @@ static int pio_i2s_init(const struct device *dev)
     channel_config_set_dreq(&dma_config,
                             DREQ_PIO1_TX0 + tx_sm // TODO: Hardcoded from device tree choosing PIO1
     );
-    // channel_config_set_dreq(&dma_config, DREQ_FORCE);
 
     channel_config_set_transfer_data_size(&dma_config, DMA_SIZE_32); // TODO: Hardcoded 16 bit audio, 2*16 for stereo = 4 bytes
 
@@ -325,9 +324,29 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 	return 0;
 }
 
+// TODO: Test this function
+static const struct i2s_config *i2s_rpi_pico_config_get(const struct device *dev,
+						     enum i2s_dir dir)
+{
+	struct pio_i2s_data *const dev_data = dev->data;
+	struct stream *stream = NULL;
+
+	if (dir == I2S_DIR_RX) {
+		stream = NULL;
+	} else if (dir == I2S_DIR_TX) {
+		stream = &dev_data->tx;
+	}
+
+	if (stream != NULL && stream->state != I2S_STATE_NOT_READY) {
+		return &stream->cfg;
+	}
+
+	return NULL;
+}
+
 static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 	.configure = i2s_rpi_pico_configure,
-	.config_get = NULL,
+	.config_get = i2s_rpi_pico_config_get,
 	.read = NULL,
 	.write = i2s_rpi_pico_write,
 	.trigger = i2s_rpi_pico_trigger,
