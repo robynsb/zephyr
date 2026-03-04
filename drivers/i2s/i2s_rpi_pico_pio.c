@@ -43,10 +43,18 @@ struct stream {
 };
 
 struct pio_i2s_data {
-	uint8_t tx_sm;
-    uint32_t freq;
+	uint8_t tx_sm; // TODO: move this to stream
     struct stream tx;
 };
+
+// TODO: Do some experiments to tripple check that this is correct.
+void update_pio_frequency(PIO pio, uint32_t sm, uint32_t sample_freq) { 
+    uint32_t system_clock_frequency = clock_get_hz(clk_sys);
+    assert(system_clock_frequency < 0x40000000);
+    uint32_t divider = system_clock_frequency * 4 / sample_freq; // avoid arithmetic overflow
+    assert(divider < 0x1000000);
+    pio_sm_set_clkdiv_int_frac(pio, sm, divider >> 8u, divider & 0xffu);
+}
 
 static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 			       const struct i2s_config *i2s_cfg)
@@ -59,7 +67,7 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
     }
 
     if (i2s_cfg->word_size != 16) {
-		LOG_ERR("I2S direction is unsupported.");
+		LOG_ERR("I2S word size is unsupported.");
 		return -EINVAL;
     }
 
@@ -74,6 +82,9 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 	}
 
 	memcpy(&stream->cfg, i2s_cfg, sizeof(struct i2s_config));
+
+	PIO pio = pio_rpi_pico_get_pio(config->piodev);
+	update_pio_frequency(pio, data->tx_sm, i2s_cfg->frame_clk_freq);
 
 	stream->state = I2S_STATE_READY;
 	return 0;
@@ -109,39 +120,6 @@ static int i2s_rpi_pico_write(const struct device *dev, void *mem_block, size_t 
     return 0;
 }
 
-static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
-			     enum i2s_trigger_cmd cmd)
-{
-    const struct pio_i2s_config *config = dev->config;
-	struct pio_i2s_data *data = dev->data;
-	int ret;
-
-    if (dir != I2S_DIR_TX) {
-		LOG_ERR("I2S direction is unsupported.");
-		return -EINVAL;
-    }
-
-	struct stream *stream = &data->tx;
-
-	switch (cmd) {
-	case I2S_TRIGGER_START:
-		if (stream->state != I2S_STATE_READY) {
-			LOG_ERR("START trigger: invalid state %d",
-				    stream->state);
-			return -EIO;
-		}
-        audio_i2s_start(dev);
-		stream->state = I2S_STATE_RUNNING;
-
-		break;
-	default:
-        //TODO: Handle all other trigger commands
-		LOG_ERR("Unsupported trigger command");
-		return -EINVAL;
-	}
-
-	return 0;
-}
 
 RPI_PICO_PIO_DEFINE_PROGRAM(i2s_tx, 0, 3,
             //     .wrap_target
@@ -184,15 +162,6 @@ static int pio_i2s_tx_init(PIO pio, uint32_t sm, uint32_t data_pin, uint32_t clo
     pio_sm_set_pins(pio, sm, 0); // clear pins
     pio_sm_exec(pio, sm, pio_encode_jmp(offset + audio_i2s_offset_entry_point));
 
-    // update_pio_frequency
-    uint32_t sample_freq = 24000; // TODO: Frequency is hardcoded 
-                                  // Make it work with config
-    uint32_t system_clock_frequency = clock_get_hz(clk_sys);
-    assert(system_clock_frequency < 0x40000000);
-    uint32_t divider = system_clock_frequency * 4 / sample_freq; // avoid arithmetic overflow
-    assert(divider < 0x1000000);
-    pio_sm_set_clkdiv_int_frac(pio, sm, divider >> 8u, divider & 0xffu);
-
 	return 0;
 }
 
@@ -207,6 +176,7 @@ static inline void audio_start_dma_transfer(const struct device *dev)
 	struct queue_item item;
 	int ret = k_msgq_get(stream->msgq, &item, SYS_TIMEOUT_MS(0));
     if (ret < 0) {
+		LOG_ERR("Failed to get message from message queue");
 		return; // TODO: Handle errors
 	}
 
@@ -274,6 +244,7 @@ static int pio_i2s_init(const struct device *dev)
 	}
 
 
+
 	retval = pinctrl_apply_state(config->pcfg, PINCTRL_STATE_DEFAULT);
 	if (retval < 0) {
 		LOG_ERR("pinctrl_apply_state failed with ret = %d", retval);
@@ -318,6 +289,40 @@ void audio_i2s_start(const struct device *dev) {
     pio_sm_set_enabled(pio, data->tx_sm, true);
     audio_start_dma_transfer(dev);
 
+}
+
+static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
+			     enum i2s_trigger_cmd cmd)
+{
+    const struct pio_i2s_config *config = dev->config;
+	struct pio_i2s_data *data = dev->data;
+	int ret;
+
+    if (dir != I2S_DIR_TX) {
+		LOG_ERR("I2S direction is unsupported.");
+		return -EINVAL;
+    }
+
+	struct stream *stream = &data->tx;
+
+	switch (cmd) {
+	case I2S_TRIGGER_START:
+		if (stream->state != I2S_STATE_READY) {
+			LOG_ERR("START trigger: invalid state %d",
+				    stream->state);
+			return -EIO;
+		}
+        audio_i2s_start(dev);
+		stream->state = I2S_STATE_RUNNING;
+
+		break;
+	default:
+        //TODO: Handle all other trigger commands
+		LOG_ERR("Unsupported trigger command");
+		return -EINVAL;
+	}
+
+	return 0;
 }
 
 static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
