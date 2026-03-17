@@ -353,7 +353,6 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 };
 
 // TODO: magic number 11!
-// TODO: hardcoded dma_channel
 // TODO: hardcoded queue size!
 #define PIO_I2S_INIT(idx)									\
 	PINCTRL_DT_INST_DEFINE(idx);								\
@@ -377,7 +376,7 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
         .tx = {                                                        \
             .msgq = &tx_##idx##_queue,                               \
             .state = I2S_STATE_NOT_READY,                                \
-			.dma_channel = 7,                    \
+			.dma_channel = DT_INST_DMAS_CELL_BY_NAME(idx, tx, channel),  \
         },                                             \
     };					\
 	DEVICE_DT_INST_DEFINE(idx, pio_i2s_init, NULL, &pio_i2s##idx##_data,			\
