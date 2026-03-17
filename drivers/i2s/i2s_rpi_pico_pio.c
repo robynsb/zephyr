@@ -10,10 +10,16 @@
 #include <zephyr/drivers/i2s.h>
 #include <zephyr/drivers/misc/pio_rpi_pico/pio_rpi_pico.h>
 #include <hardware/pio.h>
-#include <hardware/dma.h>
+#include <zephyr/drivers/dma.h>
+#include <hardware/dma.h> // TODO: Hopefully remove this include eventually?
 #include <zephyr/logging/log.h>
 #include <hardware/clocks.h>
 #include <math.h>
+#if defined(CONFIG_SOC_SERIES_RP2040)
+#include <zephyr/dt-bindings/dma/rpi-pico-dma-rp2040.h>
+#elif defined(CONFIG_SOC_SERIES_RP2350)
+#include <zephyr/dt-bindings/dma/rpi-pico-dma-rp2350.h>
+#endif
 
 #include <zephyr/sys/util.h>
 
@@ -30,13 +36,14 @@ struct pio_i2s_config {
 	const struct pinctrl_dev_config *pcfg;
 	const uint32_t data_pin;
 	const uint32_t clock_pin_base;
-	void (*irq_config)(const struct device *dev);
 };
 
 struct stream {
 	enum i2s_state state;
 	struct k_msgq *msgq;
 	uint32_t dma_channel;
+	const struct device *dev_dma;
+	struct dma_config dma_cfg;
 	uint8_t sm;
 
 	struct i2s_config cfg;
@@ -165,6 +172,61 @@ static int pio_i2s_tx_init(PIO pio, uint32_t sm, uint32_t data_pin, uint32_t clo
 	return 0;
 }
 
+static int reload_dma(const struct device *dev_dma, uint32_t channel,
+		      struct dma_config *dcfg, void *src, void *dst,
+		      uint32_t blk_size)
+{
+	int ret;
+
+	ret = dma_reload(dev_dma, channel, (uint32_t)src, (uint32_t)dst, blk_size);
+	if (ret < 0) {
+		LOG_ERR("dma_reload failed with ret=%d", ret);
+		return ret;
+	}
+
+	ret = dma_start(dev_dma, channel);
+
+	return ret;
+}
+
+static int start_dma(const struct device *dev_dma, uint32_t channel,
+		     struct dma_config *dcfg, void *src,
+		     bool src_addr_increment, void *dst,
+		     bool dst_addr_increment,
+		     uint32_t blk_size)
+{
+	struct dma_block_config blk_cfg;
+	int ret;
+
+	memset(&blk_cfg, 0, sizeof(blk_cfg));
+	blk_cfg.block_size = blk_size;
+	blk_cfg.source_address = (uint32_t)src;
+	blk_cfg.dest_address = (uint32_t)dst;
+	if (src_addr_increment) {
+		blk_cfg.source_addr_adj = DMA_ADDR_ADJ_INCREMENT;
+	} else {
+		blk_cfg.source_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
+	}
+	if (dst_addr_increment) {
+		blk_cfg.dest_addr_adj = DMA_ADDR_ADJ_INCREMENT;
+	} else {
+		blk_cfg.dest_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
+	}
+	// blk_cfg.fifo_mode_control = fifo_threshold; // TODO: i guess this does nothing for pico?
+
+	dcfg->head_block = &blk_cfg;
+
+	ret = dma_config(dev_dma, channel, dcfg);
+	if (ret < 0) {
+		LOG_ERR("dma_config failed with error %d", ret);
+		return ret;
+	}
+
+	ret = dma_start(dev_dma, channel);
+
+	return ret;
+}
+
 static inline void audio_start_dma_transfer(const struct device *dev)
 {
 	// TODO: Currently assumes only one DMA channel/ I2S device exists.
@@ -183,6 +245,7 @@ static inline void audio_start_dma_transfer(const struct device *dev)
     stream->mem_block = item.mem_block; 
     mem_block_size = item.size;
 
+
     // if (!) {
     //     // just play some silence
     //     static uint32_t zero;
@@ -199,24 +262,50 @@ static inline void audio_start_dma_transfer(const struct device *dev)
 }
 
 
-void audio_i2s_dma_irq_handler(const struct device *dev) {
-	// TODO: This is currently a zephyr interrupt waiting on the physical DMA finished interupt request line.
-	// Since it is a zephyr interrupt I specified in my IRQ_CONNECT macro that the i2s device should be passed.
-	// When I move my DMA handling over to zephyr DMA module, the IRQ works differently,
-	// I will receieve the DMA device instead which in that interupt handler i then need to find access to the
-	// i2s device.
+void audio_i2s_dma_irq_handler(const struct device *dma_dev, void *arg, uint32_t channel,
+				      int status) {
+	const struct device *dev = (const struct device *)arg;
     const struct pio_i2s_config *config = dev->config;
 	struct pio_i2s_data *data = dev->data;
     uint dma_channel = data->tx.dma_channel;
-    if (dma_irqn_get_channel_status(PICO_AUDIO_I2S_DMA_IRQ, dma_channel)) {
-        dma_irqn_acknowledge_channel(PICO_AUDIO_I2S_DMA_IRQ, dma_channel);
+	PIO pio = pio_rpi_pico_get_pio(config->piodev);
+	// TODO: Use a spinlock here?
 
-        struct stream *stream = &data->tx;
-        k_mem_slab_free(stream->cfg.mem_slab, stream->mem_block);
-        stream->mem_block = NULL;
+	if (status < 0) {
+		LOG_ERR("Something is wrong with DMA!");
+		return; // TODO: Handle errors
+	}
 
-        audio_start_dma_transfer(dev);
-    }
+	int retval;
+
+	struct stream *stream = &data->tx;
+	k_mem_slab_free(stream->cfg.mem_slab, stream->mem_block);
+	stream->mem_block = NULL;
+
+
+	struct queue_item item;
+	size_t mem_block_size;
+	int ret = k_msgq_get(stream->msgq, &item, SYS_TIMEOUT_MS(0));
+	if (ret < 0) {
+		LOG_ERR("Failed to get message from message queue");
+		return; // TODO: Handle errors
+	}
+
+	stream->mem_block = item.mem_block; 
+    mem_block_size = item.size;
+
+	retval = reload_dma(stream->dev_dma, stream->dma_channel,
+		&stream->dma_cfg,
+		stream->mem_block,
+		(void *)&pio->txf[data->tx.sm],
+		mem_block_size);
+
+	if (retval < 0) {
+		LOG_DBG("Failed to start TX DMA transfer: %d", retval);
+		return;
+	}
+
+	// audio_start_dma_transfer(dev);
 }
 
 static int pio_i2s_init(const struct device *dev)
@@ -236,6 +325,8 @@ static int pio_i2s_init(const struct device *dev)
 	}
 
 	data->tx.sm = tx_sm;
+	data->tx.dma_cfg.user_data = (void*) dev;
+	data->tx.dma_cfg.dma_slot = RPI_PICO_DMA_DREQ_TO_SLOT(pio_get_dreq(pio, data->tx.sm, true));
 
 	retval = pio_i2s_tx_init(pio, tx_sm, config->data_pin, config->clock_pin_base);
 	if (retval < 0) {
@@ -251,42 +342,109 @@ static int pio_i2s_init(const struct device *dev)
         return retval;
 	}
 
-    // TODO: Use zephyr's DMA driver.
+
+	// AJKSDLAKSJD
+	/*
+	// 	struct spi_pico_pio_data *data = dev->data;
+	// const struct spi_pico_pio_config *dev_cfg = dev->config;
+	struct dma_config *dma_cfg = &data->tx.dma_cfg;
+	struct dma_block_config *block_cfg = &data->dma_block;
+	uint32_t dma_channel =
+		dir ? dev_cfg->dma_config.tx_channel : dev_cfg->dma_config.rx_channel;
+	PIO pio = pio_rpi_pico_get_pio(dev_cfg->piodev);
+	int ret;
+
+	memset(dma_cfg, 0, sizeof(struct dma_config));
+	memset(block_cfg, 0, sizeof(struct dma_block_config));
+
+	dma_cfg->source_burst_length = 1;
+	dma_cfg->dest_burst_length = 1;
+	dma_cfg->user_data = (void *)dev;
+	dma_cfg->block_count = 1U;
+	dma_cfg->head_block = block_cfg;
+	dma_cfg->dma_slot = RPI_PICO_DMA_DREQ_TO_SLOT(pio_get_dreq(pio, data->pio_sm, dir));
+	dma_cfg->channel_direction = MEMORY_TO_PERIPHERAL;
+	dma_cfg->source_data_size = 4; // Hardcoded to 32 bits
+	dma_cfg->dest_data_size = 4;
+
+	block_cfg->block_size = spi_context_max_continuous_chunk(&data->spi_ctx);
+	dma_cfg->dma_callback = spi_pico_pio_dma_callback;
+
+	ret = dma_config(dev_cfg->dma_config.dev, dma_channel, dma_cfg);
+	if (ret < 0) {
+		LOG_ERR("dma ctrl %p: dma_config failed with %d", dev_cfg->dma_config.dev, ret);
+		return ret;
+	}
+	*/
+
     uint8_t dma_channel = data->tx.dma_channel;
-    dma_channel_claim(dma_channel);
+	retval = dma_config(data->tx.dev_dma, dma_channel, &data->tx.dma_cfg);
+	if (retval < 0) {
+		LOG_ERR("dma ctrl %p: dma_config failed with %d", data->tx.dev_dma, retval);
+		return retval;
+	}
 
-    dma_channel_config dma_config = dma_channel_get_default_config(dma_channel);
 
-    channel_config_set_dreq(&dma_config,
-                            DREQ_PIO1_TX0 + tx_sm // TODO: Hardcoded from device tree choosing PIO1
-    );
 
-    channel_config_set_transfer_data_size(&dma_config, DMA_SIZE_32); // TODO: Hardcoded 16 bit audio, 2*16 for stereo = 4 bytes
+    // TODO: Use zephyr's DMA driver.
+    // dma_channel_claim(dma_channel);
 
-    dma_channel_configure(dma_channel,
-                          &dma_config,
-                          &pio->txf[tx_sm],  // dest
-                          NULL, // src
-                          0, // count
-                          false // trigger
-    );
+    // dma_channel_config dma_config = dma_channel_get_default_config(dma_channel);
 
-    dma_irqn_set_channel_enabled(PICO_AUDIO_I2S_DMA_IRQ, dma_channel, 1);
+    // channel_config_set_dreq(&dma_config,
+    //                         DREQ_PIO1_TX0 + tx_sm // TODO: Hardcoded from device tree choosing PIO1
+    // );
 
-    return !(retval >= 0);
+    // channel_config_set_transfer_data_size(&dma_config, DMA_SIZE_32); // TODO: Hardcoded 16 bit audio, 2*16 for stereo = 4 bytes
+
+    // dma_channel_configure(dma_channel,
+    //                       &dma_config,
+    //                       &pio->txf[tx_sm],  // dest
+    //                       NULL, // src
+    //                       0, // count
+    //                       false // trigger
+    // );
+
+    // dma_irqn_set_channel_enabled(PICO_AUDIO_I2S_DMA_IRQ, dma_channel, 1);
+
+    // return !(retval >= 0);
 }
 
 
 void audio_i2s_start(const struct device *dev) {
 	const struct pio_i2s_config *config = dev->config;
-	const struct pio_i2s_data *data = dev->data;
+	struct pio_i2s_data *data = dev->data;
 	PIO pio = pio_rpi_pico_get_pio(config->piodev);
 
     // irq_set_enabled(DMA_IRQ_0 + PICO_AUDIO_I2S_DMA_IRQ, true);
     // irq_enable(DT_IRQN(DT_NODELABEL(dma)));
-    config->irq_config(dev);
+    // config->irq_config(dev);
     pio_sm_set_enabled(pio, data->tx.sm, true);
-    audio_start_dma_transfer(dev);
+
+    struct stream *stream = &data->tx;
+
+	size_t mem_block_size;
+	struct queue_item item;
+	int ret = k_msgq_get(stream->msgq, &item, SYS_TIMEOUT_MS(0));
+    if (ret < 0) {
+		LOG_ERR("Failed to get message from message queue");
+		return; // TODO: Handle errors
+	}
+
+	stream->mem_block = item.mem_block; 
+    mem_block_size = item.size;
+
+	ret = start_dma(stream->dev_dma, stream->dma_channel,
+			&stream->dma_cfg,
+			stream->mem_block, true, /* TODO: scr addr increment setting? */
+			(void *)&pio->txf[data->tx.sm],
+			false,
+			stream->cfg.block_size);
+	if (ret < 0) {
+		LOG_ERR("Failed to start TX DMA transfer: %d", ret);
+		return;
+	}
+    // audio_start_dma_transfer(dev);
 
 }
 
@@ -352,23 +510,14 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 	.trigger = i2s_rpi_pico_trigger,
 };
 
-// TODO: magic number 11!
 // TODO: hardcoded queue size!
 #define PIO_I2S_INIT(idx)									\
 	PINCTRL_DT_INST_DEFINE(idx);								\
-    static void pio_i2s_irq_config_##idx(const struct device *dev)				\
-	{											\
-		IRQ_CONNECT(11,				\
-			    0, audio_i2s_dma_irq_handler,					\
-			    DEVICE_DT_INST_GET(idx), 0);					\
-		irq_enable(11);				\
-	}                                                              \
 	static const struct pio_i2s_config pio_i2s##idx##_config = {				\
 		.piodev = DEVICE_DT_GET(DT_INST_PARENT(idx)),					\
 		.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(idx),					\
 		.data_pin = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, tx_pins, 0),	\
 		.clock_pin_base = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, tx_pins, 1),	\
-        .irq_config = pio_i2s_irq_config_##idx,		\
 	};                                                  \
     K_MSGQ_DEFINE(tx_##idx##_queue, sizeof(struct queue_item),		\
             32, 4);			\
@@ -376,7 +525,19 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
         .tx = {                                                        \
             .msgq = &tx_##idx##_queue,                               \
             .state = I2S_STATE_NOT_READY,                                \
+			.dev_dma = DEVICE_DT_GET(DT_INST_DMAS_CTLR_BY_NAME(idx, tx)),		\
 			.dma_channel = DT_INST_DMAS_CELL_BY_NAME(idx, tx, channel),  \
+			.dma_cfg = {							\
+				.block_count = 1, /* block_count > 1 not supported */	\
+				.channel_direction = MEMORY_TO_PERIPHERAL,		\
+				.source_data_size = 4,  /* 32bit hard coded */		\
+				.dest_data_size = 4,    /* TODO: 32bit hard coded */		\
+				/* single transfers (burst length = data size) */	\
+				.source_burst_length = 1, /* unused i think */			\
+				.dest_burst_length = 1,	/* unused i think */			\
+				.channel_priority = 1, /* TODO: hardcoded */		\
+				.dma_callback = audio_i2s_dma_irq_handler			\
+			},								\
         },                                             \
     };					\
 	DEVICE_DT_INST_DEFINE(idx, pio_i2s_init, NULL, &pio_i2s##idx##_data,			\
