@@ -77,6 +77,9 @@ Boards
   pin mapping from GPIO32/GPIO33 to GPIO16/GPIO17 to match the documented Grove
   PORT.C wiring.
 
+* The Ai-Thinker ``ai_m62_12f`` and ``ai_wb2_12f`` boards have been renamed to
+  ``ai_m62_12f_kit`` and ``ai_wb2_12f_kit`` respectively.
+
 * Compile definitions 'XIP_EXTERNAL_FLASH', 'USE_HYPERRAM' and 'XIP_BOOT_HEADER_XMCD_ENABLE'
   are only used in :zephyr_file:`boards/nxp/mimxrt1180_evk/xip/evkmimxrt1180_flexspi_nor_config.c`
   and :zephyr_file:`boards/nxp/mimxrt1170_evk/xmcd/xmcd.c`, we have changed them to local scope
@@ -493,6 +496,9 @@ Display
 * ``solomon,ssd1306fb`` and ``solomon,ssd1309fb`` devicetree compatibles has been renamed
   :dtcompatible:`solomon,ssd1306` and :dtcompatible:`solomon,ssd1309` respectively,
   to harmonize with other display controllers and eliminate the zephyr-irrelevant ``fb`` suffix.
+
+* The NXP eLCDIF controller (:dtcompatible:`nxp,imx-elcdif`) now correctly advertises support for
+  :c:macro:`PIXEL_FORMAT_XRGB_8888` instead of :c:macro:`PIXEL_FORMAT_ARGB_8888`.
 
 DMA
 ===
@@ -937,6 +943,24 @@ STM32
 
 Timer
 =====
+
+* Out-of-tree SoC or platform code that implements the legacy Cortex-M SysTick low-power
+  companion interface through the compatibility macros ``z_cms_lptim_hook_on_lpm_entry``
+  and ``z_cms_lptim_hook_on_lpm_exit`` should migrate to :c:func:`z_sys_clock_lpm_enter`
+  and :c:func:`z_sys_clock_lpm_exit` from :zephyr_file:`include/zephyr/drivers/timer/system_timer_lpm.h`.
+  The compatibility shim in :zephyr_file:`drivers/timer/cortex_m_systick.h` is deprecated
+  in Zephyr 4.4.0 and is currently scheduled for removal in Zephyr 4.6.0.
+  The legacy Kconfig options:
+  :kconfig:option:`CONFIG_CORTEX_M_SYSTICK_LPM_TIMER_NONE`,
+  :kconfig:option:`CONFIG_CORTEX_M_SYSTICK_LPM_TIMER_COUNTER`,
+  :kconfig:option:`CONFIG_CORTEX_M_SYSTICK_LPM_TIMER_HOOKS`, and
+  :kconfig:option:`CONFIG_CORTEX_M_SYSTICK_RESET_BY_LPM` are also deprecated.
+  The chosen property ``/chosen/zephyr,cortex-m-idle-timer`` is deprecated in
+  favor of ``/chosen/zephyr,system-timer-companion``.
+  Migrate to :kconfig:option:`CONFIG_SYSTEM_TIMER_LPM_COMPANION_NONE`,
+  :kconfig:option:`CONFIG_SYSTEM_TIMER_LPM_COMPANION_COUNTER`,
+  :kconfig:option:`CONFIG_SYSTEM_TIMER_LPM_COMPANION_HOOKS`, and
+  :kconfig:option:`CONFIG_SYSTEM_TIMER_RESET_BY_LPM`.
 
 * :dtcompatible:`renesas,rza2m-ostm` name has been replaced by :dtcompatible:`renesas,rza2m-ostm-timer`.
   The choice :kconfig:option:`DT_HAS_RENESAS_RZA2M_OSTM_ENABLED` has been replaced with
