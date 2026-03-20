@@ -1,8 +1,19 @@
 /*
- * Copyright (c) 2023 Stephen Boylan <stephen.boylan@beechwoods.com>
+ * Copyright (c) 2026 Robin Sachsenweger Ballantyne <makenenjoy@gmail.com>
  *
  * SPDX-License-Identifier: Apache-2.0
  */
+
+/*
+	TOOO: 
+	 - Check that all errors are handled properly
+	 - Respect all properties of config
+	 - RX stream functionality
+	 - Support all trigger commands
+	 - Change LOG statements to be more inline with the rest of zephyr
+	 - Think about syncronisation primitives
+*/
+
 
 #define DT_DRV_COMPAT raspberrypi_pico_i2s_pio
 
@@ -25,6 +36,11 @@
 
 #define LOG_LEVEL CONFIG_I2S_LOG_LEVEL
 LOG_MODULE_REGISTER(i2s_pico_pio);
+
+static bool queue_is_empty(struct k_msgq *q)
+{
+	return (k_msgq_num_used_get(q) == 0) ? true : false;
+}
 
 struct queue_item {
 	void *mem_block;
@@ -124,10 +140,8 @@ static int i2s_rpi_pico_write(const struct device *dev, void *mem_block, size_t 
 		return err;
 	}
 
-	// return err;
     return 0;
 }
-
 
 RPI_PICO_PIO_DEFINE_PROGRAM(i2s_tx, 0, 3,
             //     .wrap_target
@@ -227,6 +241,10 @@ static int start_dma(const struct device *dev_dma, uint32_t channel,
 	}
 
 	ret = dma_start(dev_dma, channel);
+	if (ret < 0) {
+		LOG_ERR("dma_start failed with error %d", ret);
+		return ret;
+	}
 
 	return ret;
 }
@@ -240,24 +258,32 @@ void audio_i2s_dma_irq_handler(const struct device *dma_dev, void *arg, uint32_t
 	PIO pio = pio_rpi_pico_get_pio(config->piodev);
 	// TODO: Use a spinlock here?
 
-	if (status < 0) {
-		LOG_ERR("Something is wrong with DMA!");
-		return; // TODO: Handle errors
-	}
-
 	int retval;
 
 	struct stream *stream = &data->tx;
-	k_mem_slab_free(stream->cfg.mem_slab, stream->mem_block);
+
+	if (status < 0) {
+		LOG_ERR("Something went wrong with DMA. status=%d", status);
+		stream->state = I2S_STATE_ERROR;
+		return; // TODO: abort DMA? 
+	}
+
+	// TODO: Should we free only if no error or in all cases?
+	k_mem_slab_free(stream->cfg.mem_slab, stream->mem_block); 
 	stream->mem_block = NULL;
 
+	if(stream->state == I2S_STATE_STOPPING && queue_is_empty(stream->msgq)) {
+		stream->state = I2S_STATE_READY;
+		return;
+	}
 
 	struct queue_item item;
 	size_t mem_block_size;
 	int ret = k_msgq_get(stream->msgq, &item, SYS_TIMEOUT_MS(0));
 	if (ret < 0) {
 		LOG_ERR("Failed to get message from message queue");
-		return; // TODO: Handle errors
+		stream->state = I2S_STATE_ERROR;
+		return; // TODO: abort DMA?
 	}
 
 	stream->mem_block = item.mem_block; 
@@ -273,8 +299,6 @@ void audio_i2s_dma_irq_handler(const struct device *dma_dev, void *arg, uint32_t
 		LOG_DBG("Failed to start TX DMA transfer: %d", retval);
 		return;
 	}
-
-	// audio_start_dma_transfer(dev);
 }
 
 static int pio_i2s_init(const struct device *dev)
@@ -319,29 +343,6 @@ static int pio_i2s_init(const struct device *dev)
 		return retval;
 	}
 	return 0;
-
-    // TODO: Use zephyr's DMA driver.
-    // dma_channel_claim(dma_channel);
-
-    // dma_channel_config dma_config = dma_channel_get_default_config(dma_channel);
-
-    // channel_config_set_dreq(&dma_config,
-    //                         DREQ_PIO1_TX0 + tx_sm // TODO: Hardcoded from device tree choosing PIO1
-    // );
-
-    // channel_config_set_transfer_data_size(&dma_config, DMA_SIZE_32); // TODO: Hardcoded 16 bit audio, 2*16 for stereo = 4 bytes
-
-    // dma_channel_configure(dma_channel,
-    //                       &dma_config,
-    //                       &pio->txf[tx_sm],  // dest
-    //                       NULL, // src
-    //                       0, // count
-    //                       false // trigger
-    // );
-
-    // dma_irqn_set_channel_enabled(PICO_AUDIO_I2S_DMA_IRQ, dma_channel, 1);
-
-    // return !(retval >= 0);
 }
 
 
@@ -350,9 +351,6 @@ int audio_i2s_start(const struct device *dev) {
 	struct pio_i2s_data *data = dev->data;
 	PIO pio = pio_rpi_pico_get_pio(config->piodev);
 
-    // irq_set_enabled(DMA_IRQ_0 + PICO_AUDIO_I2S_DMA_IRQ, true);
-    // irq_enable(DT_IRQN(DT_NODELABEL(dma)));
-    // config->irq_config(dev);
     pio_sm_set_enabled(pio, data->tx.sm, true);
 
     struct stream *stream = &data->tx;
@@ -405,11 +403,18 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 		}
         ret = audio_i2s_start(dev);
 		if (ret < 0) {
-			LOG_ERR("Starting I2S audio failed with error %d!", ret);
+			LOG_ERR("START trigger failed %d", ret);
 			return ret;
 		}
 		stream->state = I2S_STATE_RUNNING;
-
+		break;
+	case I2S_TRIGGER_DRAIN:
+		if (stream->state != I2S_STATE_RUNNING) {
+			LOG_ERR("DRAIN trigger: invalid state %d",
+					stream->state);
+			return -EIO;
+		}
+		stream->state = I2S_STATE_STOPPING;
 		break;
 	default:
         //TODO: Handle all other trigger commands
