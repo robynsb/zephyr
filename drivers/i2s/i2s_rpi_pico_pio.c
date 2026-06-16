@@ -57,11 +57,13 @@ struct pio_i2s_config {
 
 struct stream {
 	enum i2s_state state;
+	bool last_block;
 	struct k_msgq *msgq;
 	uint32_t dma_channel;
 	const struct device *dev_dma;
 	struct dma_config dma_cfg;
 	uint8_t sm;
+	struct k_spinlock lock;
 
 	struct i2s_config cfg;
 	void *mem_block;
@@ -132,6 +134,11 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 
 	if (i2s_cfg->options & I2S_OPT_PINGPONG) {
 		LOG_ERR("I2S_OPT_PINGPONG unsupported.");
+		return -EINVAL;
+	}
+
+	if (!(i2s_cfg->options & I2S_OPT_BIT_CLK_GATED)) {
+		LOG_ERR("Continous bit clock is unsupported.");
 		return -EINVAL;
 	}
 
@@ -290,7 +297,7 @@ static int start_dma(const struct device *dev_dma, uint32_t channel,
 	return ret;
 }
 
-void audio_i2s_dma_irq_handler(const struct device *dma_dev, void *arg, uint32_t channel,
+void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 				      int status) {
 	const struct device *dev = (const struct device *)arg;
 	const struct pio_i2s_config *config = dev->config;
@@ -313,6 +320,15 @@ void audio_i2s_dma_irq_handler(const struct device *dma_dev, void *arg, uint32_t
 	k_mem_slab_free(stream->cfg.mem_slab, stream->mem_block);
 	stream->mem_block = NULL;
 
+	// I2S_TRIGGER_STOP
+	if(stream->last_block) {
+		__ASSERT(stream->state == I2S_STATE_STOPPING, "Last block is true without stopping.");
+		dma_stop(stream->dev_dma, stream->dma_channel);
+		stream->state = I2S_STATE_READY;
+		return;
+	}
+
+	// I2S_TRIGGER_DRAIN
 	if(stream->state == I2S_STATE_STOPPING && queue_is_empty(stream->msgq)) {
 		stream->state = I2S_STATE_READY;
 		return;
@@ -446,8 +462,21 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 			return ret;
 		}
 		stream->state = I2S_STATE_RUNNING;
+		stream->last_block = false;
+		break;
+	case I2S_TRIGGER_STOP:
+		k_spinlock_key_t key = k_spin_lock(&stream->lock);
+		if (stream->state != I2S_STATE_RUNNING) {
+			k_spin_unlock(&stream->lock, key);
+			LOG_ERR("DRAIN trigger: invalid state %d",
+			         stream->state);
+			return -EIO;
+		}
+		stream->state = I2S_STATE_STOPPING;
+		k_spin_unlock(&stream->lock, key);
 		break;
 	case I2S_TRIGGER_DRAIN:
+		// TODO: spin lock here too?
 		if (stream->state != I2S_STATE_RUNNING) {
 			LOG_ERR("DRAIN trigger: invalid state %d",
 			         stream->state);
@@ -515,21 +544,22 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
             32, 4);			\
 	static struct pio_i2s_data pio_i2s##idx##_data = {                \
         .tx = {                                                        \
-            .msgq = &tx_##idx##_queue,                               \
-            .state = I2S_STATE_NOT_READY,                                \
-			.dev_dma = DEVICE_DT_GET(DT_INST_DMAS_CTLR_BY_NAME(idx, tx)),		\
-			.dma_channel = DT_INST_DMAS_CELL_BY_NAME(idx, tx, channel),  \
-			.dma_cfg = {							\
-				.block_count = 1, /* block_count > 1 not supported */	\
-				.channel_direction = MEMORY_TO_PERIPHERAL,		\
-				.source_data_size = 4,  /* 32bit hard coded */		\
-				.dest_data_size = 4,    /* TODO: 32bit hard coded */		\
-				/* single transfers (burst length = data size) */	\
-				.source_burst_length = 1, /* unused i think */			\
-				.dest_burst_length = 1,	/* unused i think */			\
-				.channel_priority = 1, /* TODO: hardcoded */		\
-				.dma_callback = audio_i2s_dma_irq_handler			\
-			},								\
+		.msgq = &tx_##idx##_queue,                               \
+		.state = I2S_STATE_NOT_READY,                                \
+		.last_block = false,                                         \
+		.dev_dma = DEVICE_DT_GET(DT_INST_DMAS_CTLR_BY_NAME(idx, tx)),		\
+		.dma_channel = DT_INST_DMAS_CELL_BY_NAME(idx, tx, channel),  \
+		.dma_cfg = {							\
+			.block_count = 1, /* block_count > 1 not supported */	\
+			.channel_direction = MEMORY_TO_PERIPHERAL,		\
+			.source_data_size = 4,  /* 32bit hard coded */		\
+			.dest_data_size = 4,    /* TODO: 32bit hard coded */		\
+			/* single transfers (burst length = data size) */	\
+			.source_burst_length = 1, /* unused i think */			\
+			.dest_burst_length = 1,	/* unused i think */			\
+			.channel_priority = 1, /* TODO: hardcoded */		\
+			.dma_callback = dma_tx_callback			\
+		},								\
         },                                             \
     };					\
 	DEVICE_DT_INST_DEFINE(idx, pio_i2s_init, NULL, &pio_i2s##idx##_data,			\
