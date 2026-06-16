@@ -5,8 +5,9 @@
  */
 
 /*
-	TOOO: 
+	TOOO:
 	 - Check that all errors are handled properly
+		- check that i2s_config->timeout is always respected.
 	 - Respect all properties of config
 	 - RX stream functionality
 	 - Support all trigger commands
@@ -71,7 +72,7 @@ struct pio_i2s_data {
 };
 
 // TODO: Do some experiments to tripple check that this is correct.
-void update_pio_frequency(PIO pio, uint32_t sm, uint32_t sample_freq) { 
+void update_pio_frequency(PIO pio, uint32_t sm, uint32_t sample_freq) {
     uint32_t system_clock_frequency = clock_get_hz(clk_sys);
     assert(system_clock_frequency < 0x40000000);
     uint32_t divider = system_clock_frequency * 4 / sample_freq; // avoid arithmetic overflow
@@ -82,21 +83,33 @@ void update_pio_frequency(PIO pio, uint32_t sm, uint32_t sample_freq) {
 static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 			       const struct i2s_config *i2s_cfg)
 {
-    const struct pio_i2s_config *config = dev->config;
-	struct pio_i2s_data *data = dev->data;
-    if (dir != I2S_DIR_TX) {
+	const struct pio_i2s_config *config = dev->config;
+	struct pio_i2s_data *dev_data = dev->data;
+
+	/* For words greater than 16-bit the channel length is considered 32-bit */
+	const uint32_t channel_length = i2s_cfg->word_size > 16U ? 32U : 16U;
+
+	uint8_t data_format = i2s_cfg->format & I2S_FMT_DATA_FORMAT_MASK;
+
+	if (data_format != I2S_FMT_DATA_FORMAT_I2S) {
+		LOG_DBG("Unsupported data format: %u", (unsigned int)data_format);
+		return -EINVAL;
+	}
+
+	/* Number of channels is always 2 for I2S data format */
+	const uint32_t num_channels = 2;
+
+	if (dir != I2S_DIR_TX) {
 		LOG_ERR("I2S direction is unsupported."); // TODO:
 		return -EINVAL;
-    }
+	}
 
-    if (i2s_cfg->word_size != 16) {
+	if (i2s_cfg->word_size != 16) {
 		LOG_ERR("I2S word size is unsupported.");
 		return -EINVAL;
-    }
+	}
 
-    // TODO: Handle the config better
-
-	struct stream *stream = &data->tx;
+	struct stream *stream = &dev_data->tx;
 
 	if (stream->state != I2S_STATE_NOT_READY &&
 	    stream->state != I2S_STATE_READY) {
@@ -104,10 +117,28 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 		return -EINVAL;
 	}
 
+	bool is_bit_clk_target = i2s_cfg->options & I2S_OPT_BIT_CLK_TARGET;
+	bool is_frame_clk_target = i2s_cfg->options & I2S_OPT_FRAME_CLK_TARGET;
+
+	if (is_bit_clk_target || is_frame_clk_target) {
+		LOG_ERR("I2S target mode unsupported.");
+		return -EINVAL;
+	}
+
+	if (i2s_cfg->options & I2S_OPT_LOOPBACK) {
+		LOG_ERR("I2S loopback mode unsupported.");
+		return -EINVAL;
+	}
+
+	if (i2s_cfg->options & I2S_OPT_PINGPONG) {
+		LOG_ERR("I2S_OPT_PINGPONG unsupported.");
+		return -EINVAL;
+	}
+
 	memcpy(&stream->cfg, i2s_cfg, sizeof(struct i2s_config));
 
 	PIO pio = pio_rpi_pico_get_pio(config->piodev);
-	update_pio_frequency(pio, data->tx.sm, i2s_cfg->frame_clk_freq);
+	update_pio_frequency(pio, dev_data->tx.sm, i2s_cfg->frame_clk_freq);
 
 	stream->state = I2S_STATE_READY;
 	return 0;
@@ -115,7 +146,7 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 
 static int i2s_rpi_pico_write(const struct device *dev, void *mem_block, size_t size)
 {
-    const struct pio_i2s_config *config = dev->config;
+	const struct pio_i2s_config *config = dev->config;
 	struct pio_i2s_data *data = dev->data;
 	const struct stream *stream = &data->tx;
 	enum i2s_state state = stream->state;
@@ -142,6 +173,16 @@ static int i2s_rpi_pico_write(const struct device *dev, void *mem_block, size_t 
 
     return 0;
 }
+
+
+/*
+ * TODO:
+ * Either build 3 different version of this code for the 16bit, 24 bit, 32 bit or
+ * find another way to make this program variable like that.
+ *
+ * Look at this other github project...
+ * this guy somehow does it without: malacalypse/rp2040_i2s_example
+ */
 
 RPI_PICO_PIO_DEFINE_PROGRAM(i2s_tx, 0, 3,
             //     .wrap_target
@@ -252,9 +293,9 @@ static int start_dma(const struct device *dev_dma, uint32_t channel,
 void audio_i2s_dma_irq_handler(const struct device *dma_dev, void *arg, uint32_t channel,
 				      int status) {
 	const struct device *dev = (const struct device *)arg;
-    const struct pio_i2s_config *config = dev->config;
+	const struct pio_i2s_config *config = dev->config;
 	struct pio_i2s_data *data = dev->data;
-    uint dma_channel = data->tx.dma_channel;
+	uint dma_channel = data->tx.dma_channel;
 	PIO pio = pio_rpi_pico_get_pio(config->piodev);
 	// TODO: Use a spinlock here?
 
@@ -265,11 +306,11 @@ void audio_i2s_dma_irq_handler(const struct device *dma_dev, void *arg, uint32_t
 	if (status < 0) {
 		LOG_ERR("Something went wrong with DMA. status=%d", status);
 		stream->state = I2S_STATE_ERROR;
-		return; // TODO: abort DMA? 
+		return; // TODO: abort DMA?
 	}
 
 	// TODO: Should we free only if no error or in all cases?
-	k_mem_slab_free(stream->cfg.mem_slab, stream->mem_block); 
+	k_mem_slab_free(stream->cfg.mem_slab, stream->mem_block);
 	stream->mem_block = NULL;
 
 	if(stream->state == I2S_STATE_STOPPING && queue_is_empty(stream->msgq)) {
@@ -286,8 +327,8 @@ void audio_i2s_dma_irq_handler(const struct device *dma_dev, void *arg, uint32_t
 		return; // TODO: abort DMA?
 	}
 
-	stream->mem_block = item.mem_block; 
-    mem_block_size = item.size;
+	stream->mem_block = item.mem_block;
+	mem_block_size = item.size;
 
 	retval = reload_dma(stream->dev_dma, stream->dma_channel,
 		&stream->dma_cfg,
@@ -327,16 +368,13 @@ static int pio_i2s_init(const struct device *dev)
 		return retval;
 	}
 
-
-
 	retval = pinctrl_apply_state(config->pcfg, PINCTRL_STATE_DEFAULT);
 	if (retval < 0) {
 		LOG_ERR("pinctrl_apply_state failed with ret = %d", retval);
         return retval;
 	}
 
-
-    uint8_t dma_channel = data->tx.dma_channel;
+	uint8_t dma_channel = data->tx.dma_channel;
 	retval = dma_config(data->tx.dev_dma, dma_channel, &data->tx.dma_cfg);
 	if (retval < 0) {
 		LOG_ERR("dma ctrl %p: dma_config failed with %d", data->tx.dev_dma, retval);
@@ -351,20 +389,21 @@ int audio_i2s_start(const struct device *dev) {
 	struct pio_i2s_data *data = dev->data;
 	PIO pio = pio_rpi_pico_get_pio(config->piodev);
 
-    pio_sm_set_enabled(pio, data->tx.sm, true);
+	pio_sm_set_enabled(pio, data->tx.sm, true);
 
-    struct stream *stream = &data->tx;
+	struct stream *stream = &data->tx;
 
 	size_t mem_block_size;
 	struct queue_item item;
 	int ret = k_msgq_get(stream->msgq, &item, SYS_TIMEOUT_MS(0));
-    if (ret < 0) {
+
+	if (ret < 0) {
 		LOG_ERR("Failed to get message from message queue");
 		return ret;
 	}
 
-	stream->mem_block = item.mem_block; 
-    mem_block_size = item.size;
+	stream->mem_block = item.mem_block;
+    	mem_block_size = item.size;
 
 	ret = start_dma(stream->dev_dma, stream->dma_channel,
 			&stream->dma_cfg,
@@ -383,14 +422,14 @@ int audio_i2s_start(const struct device *dev) {
 static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 			     enum i2s_trigger_cmd cmd)
 {
-    const struct pio_i2s_config *config = dev->config;
+	const struct pio_i2s_config *config = dev->config;
 	struct pio_i2s_data *data = dev->data;
 	int ret;
 
-    if (dir != I2S_DIR_TX) {
+	if (dir != I2S_DIR_TX) {
 		LOG_ERR("I2S direction is unsupported.");
 		return -EINVAL;
-    }
+	}
 
 	struct stream *stream = &data->tx;
 
@@ -401,7 +440,7 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 				    stream->state);
 			return -EIO;
 		}
-        ret = audio_i2s_start(dev);
+	        ret = audio_i2s_start(dev);
 		if (ret < 0) {
 			LOG_ERR("START trigger failed %d", ret);
 			return ret;
@@ -411,7 +450,7 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 	case I2S_TRIGGER_DRAIN:
 		if (stream->state != I2S_STATE_RUNNING) {
 			LOG_ERR("DRAIN trigger: invalid state %d",
-					stream->state);
+			         stream->state);
 			return -EIO;
 		}
 		stream->state = I2S_STATE_STOPPING;
@@ -454,6 +493,16 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 };
 
 // TODO: hardcoded queue size!
+/*  TODO:
+ *  The PIO program drives the bit clock (BCLK) and word select (WS/LRCLK) from a
+ * 2-bit sideset. Sideset pins are a contiguous range starting at a base pin, so
+ * the hardware forces WS == BCLK + 1. tx_pins is <DATA BCLK WS>; this asserts the
+ * overlay honours the adjacency rather than failing silently at runtime.
+ * Add a build assert such as possible this:
+ *  BUILD_ASSERT(PIO_I2S_WS_PIN(idx) == PIO_I2S_BCLK_PIN(idx) + 1,                             \
+         "I2S word-select pin must be bit-clock pin + 1 "                            \
+         "(PIO sideset pins are contiguous); fix tx_pins order in the overlay");\
+ */
 #define PIO_I2S_INIT(idx)									\
 	PINCTRL_DT_INST_DEFINE(idx);								\
 	static const struct pio_i2s_config pio_i2s##idx##_config = {				\
@@ -489,4 +538,3 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 			      &i2s_rpi_pico_driver_api);
 
 DT_INST_FOREACH_STATUS_OKAY(PIO_I2S_INIT)
-
