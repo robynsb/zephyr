@@ -57,7 +57,7 @@ struct pio_i2s_config {
 
 struct stream {
 	enum i2s_state state;
-	bool last_block;
+	bool tx_stop_for_drain;
 	struct k_msgq *msgq;
 	uint32_t dma_channel;
 	const struct device *dev_dma;
@@ -321,8 +321,9 @@ void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	stream->mem_block = NULL;
 
 	// I2S_TRIGGER_STOP
-	if(stream->last_block) {
-		__ASSERT(stream->state == I2S_STATE_STOPPING, "Last block is true without stopping.");
+	// TODO: combine the two if statements together?
+	if(stream->state == I2S_STATE_STOPPING && stream->tx_stop_for_drain) {
+		// TODO: dma_stop seems useless?!
 		dma_stop(stream->dev_dma, stream->dma_channel);
 		stream->state = I2S_STATE_READY;
 		return;
@@ -338,7 +339,7 @@ void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	size_t mem_block_size;
 	int ret = k_msgq_get(stream->msgq, &item, SYS_TIMEOUT_MS(0));
 	if (ret < 0) {
-		LOG_ERR("Failed to get message from message queue");
+		LOG_ERR("TX buffer underrun.");
 		stream->state = I2S_STATE_ERROR;
 		return; // TODO: abort DMA?
 	}
@@ -414,7 +415,7 @@ int audio_i2s_start(const struct device *dev) {
 	int ret = k_msgq_get(stream->msgq, &item, SYS_TIMEOUT_MS(0));
 
 	if (ret < 0) {
-		LOG_ERR("Failed to get message from message queue");
+		LOG_ERR("TX buffer is empty.");
 		return ret;
 	}
 
@@ -448,7 +449,9 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 	}
 
 	struct stream *stream = &data->tx;
+	k_spinlock_key_t key;
 
+	// TODO: Refactor this to avoid so much code duplication with taking locks
 	switch (cmd) {
 	case I2S_TRIGGER_START:
 		if (stream->state != I2S_STATE_READY) {
@@ -456,16 +459,31 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 				    stream->state);
 			return -EIO;
 		}
+		/* No spin lock because tx callback cannot be running while stream->state == I2S_STATE_READY. */
+		stream->tx_stop_for_drain = false;
 	        ret = audio_i2s_start(dev);
 		if (ret < 0) {
 			LOG_ERR("START trigger failed %d", ret);
 			return ret;
 		}
 		stream->state = I2S_STATE_RUNNING;
-		stream->last_block = false;
 		break;
 	case I2S_TRIGGER_STOP:
-		k_spinlock_key_t key = k_spin_lock(&stream->lock);
+		//TODO: what if DMA is not running?
+		key = k_spin_lock(&stream->lock);
+		if (stream->state != I2S_STATE_RUNNING) {
+			k_spin_unlock(&stream->lock, key);
+			LOG_ERR("STOP trigger: invalid state %d",
+			         stream->state);
+			return -EIO;
+		}
+		stream->state = I2S_STATE_STOPPING;
+		stream->tx_stop_for_drain = true;
+		k_spin_unlock(&stream->lock, key);
+		break;
+	case I2S_TRIGGER_DRAIN:
+		//TODO: what if queue already empty?
+		key = k_spin_lock(&stream->lock);
 		if (stream->state != I2S_STATE_RUNNING) {
 			k_spin_unlock(&stream->lock, key);
 			LOG_ERR("DRAIN trigger: invalid state %d",
@@ -475,15 +493,18 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 		stream->state = I2S_STATE_STOPPING;
 		k_spin_unlock(&stream->lock, key);
 		break;
-	case I2S_TRIGGER_DRAIN:
-		// TODO: spin lock here too?
-		if (stream->state != I2S_STATE_RUNNING) {
-			LOG_ERR("DRAIN trigger: invalid state %d",
+	case I2S_TRIGGER_PREPARE:
+		key = k_spin_lock(&stream->lock);
+		if (stream->state != I2S_STATE_ERROR) {
+			k_spin_unlock(&stream->lock, key);
+			LOG_ERR("PREPARE trigger: invalid state %d",
 			         stream->state);
 			return -EIO;
 		}
-		stream->state = I2S_STATE_STOPPING;
+		stream->state = I2S_STATE_READY;
+		k_spin_unlock(&stream->lock, key);
 		break;
+
 	default:
         //TODO: Handle all other trigger commands
 		LOG_ERR("Unsupported trigger command");
@@ -546,7 +567,7 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
         .tx = {                                                        \
 		.msgq = &tx_##idx##_queue,                               \
 		.state = I2S_STATE_NOT_READY,                                \
-		.last_block = false,                                         \
+		.tx_stop_for_drain = false,                                         \
 		.dev_dma = DEVICE_DT_GET(DT_INST_DMAS_CTLR_BY_NAME(idx, tx)),		\
 		.dma_channel = DT_INST_DMAS_CELL_BY_NAME(idx, tx, channel),  \
 		.dma_cfg = {							\
