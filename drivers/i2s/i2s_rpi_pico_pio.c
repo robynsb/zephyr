@@ -74,82 +74,29 @@ struct pio_i2s_data {
 };
 
 // TODO: Do some experiments to tripple check that this is correct.
-void update_pio_frequency(PIO pio, uint32_t sm, uint32_t sample_freq) {
-    uint32_t system_clock_frequency = clock_get_hz(clk_sys);
-    assert(system_clock_frequency < 0x40000000);
-    uint32_t divider = system_clock_frequency * 4 / sample_freq; // avoid arithmetic overflow
+/*
+ * f_sys = system_clock_frequency
+ * f_b = frequency of Bit CLK
+ * f_pio = frequency of PIO cycles
+ * f_s = sampling frequency
+ *
+ * f_b = f_s * channel_length * num_channels
+ * f_pio = f_sys / divider
+ * f_pio = 2 * f_b
+ *
+ * => 2 * f_b = f_sys / divider
+ * => divider = f_sys / (2 * f_b) = f_sys/(2 * f_s * channel_length * num_channels)
+
+ */
+void update_pio_frequency(PIO pio, uint32_t sm, uint32_t sample_freq, uint32_t channel_length, uint32_t num_channels) {
+    uint64_t system_clock_frequency = clock_get_hz(clk_sys);
+    /* 8.8 fixed-point divider: (f_sys << 8) / (2 * f_s * channel_length * num_channels) */
+    uint64_t divider = (system_clock_frequency << 8u) /
+		       (2u * sample_freq * channel_length * num_channels);
     assert(divider < 0x1000000); // TODO: These errors should be handled better
     pio_sm_set_clkdiv_int_frac(pio, sm, divider >> 8u, divider & 0xffu);
 }
 
-static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
-			       const struct i2s_config *i2s_cfg)
-{
-	const struct pio_i2s_config *config = dev->config;
-	struct pio_i2s_data *dev_data = dev->data;
-
-	/* For words greater than 16-bit the channel length is considered 32-bit */
-	const uint32_t channel_length = i2s_cfg->word_size > 16U ? 32U : 16U;
-
-	uint8_t data_format = i2s_cfg->format & I2S_FMT_DATA_FORMAT_MASK;
-
-	if (data_format != I2S_FMT_DATA_FORMAT_I2S) {
-		LOG_DBG("Unsupported data format: %u", (unsigned int)data_format);
-		return -EINVAL;
-	}
-
-	/* Number of channels is always 2 for I2S data format */
-	const uint32_t num_channels = 2;
-
-	if (dir != I2S_DIR_TX) {
-		LOG_ERR("I2S direction is unsupported."); // TODO:
-		return -EINVAL;
-	}
-
-	if (i2s_cfg->word_size != 16) {
-		LOG_ERR("I2S word size is unsupported.");
-		return -EINVAL;
-	}
-
-	struct stream *stream = &dev_data->tx;
-
-	if (stream->state != I2S_STATE_NOT_READY &&
-	    stream->state != I2S_STATE_READY) {
-		LOG_ERR("invalid state");
-		return -EINVAL;
-	}
-
-	bool is_bit_clk_target = i2s_cfg->options & I2S_OPT_BIT_CLK_TARGET;
-	bool is_frame_clk_target = i2s_cfg->options & I2S_OPT_FRAME_CLK_TARGET;
-
-	if (is_bit_clk_target || is_frame_clk_target) {
-		LOG_ERR("I2S target mode unsupported.");
-		return -EINVAL;
-	}
-
-	if (i2s_cfg->options & I2S_OPT_LOOPBACK) {
-		LOG_ERR("I2S loopback mode unsupported.");
-		return -EINVAL;
-	}
-
-	if (i2s_cfg->options & I2S_OPT_PINGPONG) {
-		LOG_ERR("I2S_OPT_PINGPONG unsupported.");
-		return -EINVAL;
-	}
-
-	if (!(i2s_cfg->options & I2S_OPT_BIT_CLK_GATED)) {
-		LOG_ERR("Continous bit clock is unsupported.");
-		return -EINVAL;
-	}
-
-	memcpy(&stream->cfg, i2s_cfg, sizeof(struct i2s_config));
-
-	PIO pio = pio_rpi_pico_get_pio(config->piodev);
-	update_pio_frequency(pio, dev_data->tx.sm, i2s_cfg->frame_clk_freq);
-
-	stream->state = I2S_STATE_READY;
-	return 0;
-}
 
 static int i2s_rpi_pico_write(const struct device *dev, void *mem_block, size_t size)
 {
@@ -191,48 +138,141 @@ static int i2s_rpi_pico_write(const struct device *dev, void *mem_block, size_t 
  * this guy somehow does it without: malacalypse/rp2040_i2s_example
  */
 
-RPI_PICO_PIO_DEFINE_PROGRAM(i2s_tx, 0, 3,
-            //     .wrap_target
-    0x7001, //  0: out    pins, 1         side 2
-    0x1840, //  1: jmp    x--, 0          side 3
-    0x6001, //  2: out    pins, 1         side 0
-    0xe82e, //  3: set    x, 14           side 1
-    0x6001, //  4: out    pins, 1         side 0
-    0x0844, //  5: jmp    x--, 4          side 1
-    0x7001, //  6: out    pins, 1         side 2
-    0xf82e, //  7: set    x, 14           side 3
-            //     .wrap
+RPI_PICO_PIO_DEFINE_PROGRAM(i2s_controller_tx, 0, 3,
+	        //     .wrap_target
+	0xb822, //  0: mov    x, y            side 3
+	0x7001, //  1: out    pins, 1         side 2
+	0x1841, //  2: jmp    x--, 1          side 3
+	0x6001, //  3: out    pins, 1         side 0
+	0xa822, //  4: mov    x, y            side 1
+	0x6001, //  5: out    pins, 1         side 0
+	0x0845, //  6: jmp    x--, 5          side 1
+	0x7001, //  7: out    pins, 1         side 2
+                //     .wrap
 );
 
-#define audio_i2s_wrap_target 0
-#define audio_i2s_wrap 7
-#define audio_i2s_offset_entry_point 7u
+#define i2s_controller_tx_wrap_target 0
+#define i2s_controller_tx_wrap 7
+#define i2s_controller_tx_offset_entry_point 0u
 
-static int pio_i2s_tx_init(PIO pio, uint32_t sm, uint32_t data_pin, uint32_t clock_pin_base)
+static int pio_i2s_tx_init(PIO pio, uint32_t sm, uint32_t data_pin, uint32_t clock_pin_base, uint32_t bit_depth)
 {
 	uint32_t offset;
 	pio_sm_config sm_config;
 
-	if (!pio_can_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(i2s_tx))) {
+	if (!pio_can_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(i2s_controller_tx))) {
 		return -EBUSY;
 	}
 
-	offset = pio_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(i2s_tx));
+	offset = pio_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(i2s_controller_tx));
 	sm_config = pio_get_default_sm_config();
-    sm_config_set_wrap(&sm_config, offset + audio_i2s_wrap_target, offset + audio_i2s_wrap);
-    sm_config_set_sideset(&sm_config, 2, false, false);
-    sm_config_set_out_pins(&sm_config, data_pin, 1);
-    sm_config_set_sideset_pins(&sm_config, clock_pin_base);
-    sm_config_set_out_shift(&sm_config, false, true, 32);
-    sm_config_set_fifo_join(&sm_config, PIO_FIFO_JOIN_TX);
-    pio_sm_init(pio, sm, offset, &sm_config);
-    uint32_t pin_mask = (1u << data_pin) | (3u << clock_pin_base);
-    pio_sm_set_pindirs_with_mask(pio, sm, pin_mask, pin_mask);
-    pio_sm_set_pins(pio, sm, 0); // clear pins
-    pio_sm_exec(pio, sm, pio_encode_jmp(offset + audio_i2s_offset_entry_point));
+	sm_config_set_wrap(&sm_config, offset + i2s_controller_tx_wrap_target, offset + i2s_controller_tx_wrap);
+	sm_config_set_sideset(&sm_config, 2, false, false);
+	sm_config_set_out_pins(&sm_config, data_pin, 1);
+	sm_config_set_sideset_pins(&sm_config, clock_pin_base);
+	sm_config_set_out_shift(&sm_config, false, true, 32);
+	sm_config_set_fifo_join(&sm_config, PIO_FIFO_JOIN_TX);
+	pio_sm_init(pio, sm, offset, &sm_config);
+	uint32_t pin_mask = (1u << data_pin) | (3u << clock_pin_base);
+	pio_sm_set_pindirs_with_mask(pio, sm, pin_mask, pin_mask);
+	pio_sm_set_pins(pio, sm, 0); // clear pins
+	pio_sm_exec(pio, sm, pio_encode_set(pio_y, bit_depth-2));
+	pio_sm_exec(pio, sm, pio_encode_jmp(offset + i2s_controller_tx_offset_entry_point));
+
 
 	return 0;
 }
+
+static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
+			       const struct i2s_config *i2s_cfg)
+{
+	const struct pio_i2s_config *dev_config = dev->config;
+	struct pio_i2s_data *dev_data = dev->data;
+
+
+	uint8_t data_format = i2s_cfg->format & I2S_FMT_DATA_FORMAT_MASK;
+
+	if (data_format != I2S_FMT_DATA_FORMAT_I2S) {
+		LOG_DBG("Unsupported data format: %u", (unsigned int)data_format);
+		return -EINVAL;
+	}
+
+	/* Number of channels is always 2 for I2S data format */
+	const uint32_t num_channels = 2;
+
+	if (dir != I2S_DIR_TX) {
+		LOG_ERR("I2S direction is unsupported."); // TODO:
+		return -EINVAL;
+	}
+
+	if (16 <= i2s_cfg->word_size && 32 <= i2s_cfg->word_size) {
+		LOG_ERR("I2S word size is unsupported.");
+		return -EINVAL;
+	}
+
+	/* For words greater than 16-bit the channel length is considered 32-bit */
+	const uint32_t channel_length = i2s_cfg->word_size > 16U ? 32U : 16U;
+
+	struct stream *stream = &dev_data->tx;
+
+	if (stream->state != I2S_STATE_NOT_READY &&
+	    stream->state != I2S_STATE_READY) {
+		LOG_ERR("invalid state");
+		return -EINVAL;
+	}
+
+	bool is_bit_clk_target = i2s_cfg->options & I2S_OPT_BIT_CLK_TARGET;
+	bool is_frame_clk_target = i2s_cfg->options & I2S_OPT_FRAME_CLK_TARGET;
+
+	if (is_bit_clk_target || is_frame_clk_target) {
+		LOG_ERR("I2S target mode unsupported.");
+		return -EINVAL;
+	}
+
+	if (i2s_cfg->options & I2S_OPT_LOOPBACK) {
+		LOG_ERR("I2S loopback mode unsupported.");
+		return -EINVAL;
+	}
+
+	if (i2s_cfg->options & I2S_OPT_PINGPONG) {
+		LOG_ERR("I2S_OPT_PINGPONG unsupported.");
+		return -EINVAL;
+	}
+
+	if (!(i2s_cfg->options & I2S_OPT_BIT_CLK_GATED)) {
+		LOG_ERR("Continous bit clock is unsupported.");
+		return -EINVAL;
+	}
+
+	memcpy(&stream->cfg, i2s_cfg, sizeof(struct i2s_config));
+
+
+	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
+
+	size_t tx_sm;
+	int retval;
+	retval = pio_rpi_pico_allocate_sm(dev_config->piodev, &tx_sm);
+	if (retval < 0) {
+		LOG_ERR("pio_rpi_pico_allocate_sm failed with ret = %d", retval);
+		return retval;
+	}
+
+	dev_data->tx.sm = tx_sm;
+	dev_data->tx.dma_cfg.user_data = (void*) dev;
+	dev_data->tx.dma_cfg.dma_slot = RPI_PICO_DMA_DREQ_TO_SLOT(pio_get_dreq(pio, dev_data->tx.sm, true));
+
+	retval = pio_i2s_tx_init(pio, tx_sm, dev_config->data_pin, dev_config->clock_pin_base, channel_length);
+	if (retval < 0) {
+		LOG_ERR("pio_i2s_tx_init failed with ret = %d", retval);
+		return retval;
+	}
+
+	update_pio_frequency(pio, dev_data->tx.sm, i2s_cfg->frame_clk_freq, channel_length, num_channels);
+
+	stream->state = I2S_STATE_READY;
+	return 0;
+}
+
 
 static int reload_dma(const struct device *dev_dma, uint32_t channel,
 		      struct dma_config *dcfg, void *src, void *dst,
@@ -361,40 +401,20 @@ void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 
 static int pio_i2s_init(const struct device *dev)
 {
-	const struct pio_i2s_config *config = dev->config;
-	struct pio_i2s_data *data = dev->data;
-	size_t tx_sm;
+	const struct pio_i2s_config *dev_config = dev->config;
+	struct pio_i2s_data *dev_data = dev->data;
 	int retval;
-	PIO pio;
 
-	pio = pio_rpi_pico_get_pio(config->piodev);
-
-	retval = pio_rpi_pico_allocate_sm(config->piodev, &tx_sm);
-	if (retval < 0) {
-		LOG_ERR("pio_rpi_pico_allocate_sm failed with ret = %d", retval);
-		return retval;
-	}
-
-	data->tx.sm = tx_sm;
-	data->tx.dma_cfg.user_data = (void*) dev;
-	data->tx.dma_cfg.dma_slot = RPI_PICO_DMA_DREQ_TO_SLOT(pio_get_dreq(pio, data->tx.sm, true));
-
-	retval = pio_i2s_tx_init(pio, tx_sm, config->data_pin, config->clock_pin_base);
-	if (retval < 0) {
-		LOG_ERR("pio_i2s_tx_init failed with ret = %d", retval);
-		return retval;
-	}
-
-	retval = pinctrl_apply_state(config->pcfg, PINCTRL_STATE_DEFAULT);
+	retval = pinctrl_apply_state(dev_config->pcfg, PINCTRL_STATE_DEFAULT);
 	if (retval < 0) {
 		LOG_ERR("pinctrl_apply_state failed with ret = %d", retval);
-        return retval;
+        	return retval;
 	}
 
-	uint8_t dma_channel = data->tx.dma_channel;
-	retval = dma_config(data->tx.dev_dma, dma_channel, &data->tx.dma_cfg);
+	uint8_t dma_channel = dev_data->tx.dma_channel;
+	retval = dma_config(dev_data->tx.dev_dma, dma_channel, &dev_data->tx.dma_cfg);
 	if (retval < 0) {
-		LOG_ERR("dma ctrl %p: dma_config failed with %d", data->tx.dev_dma, retval);
+		LOG_ERR("dma ctrl %p: dma_config failed with %d", dev_data->tx.dev_dma, retval);
 		return retval;
 	}
 	return 0;
