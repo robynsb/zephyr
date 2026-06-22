@@ -142,7 +142,7 @@ static int i2s_rpi_pico_write(const struct device *dev, void *mem_block, size_t 
  * this guy somehow does it without: malacalypse/rp2040_i2s_example
  */
 
-RPI_PICO_PIO_DEFINE_PROGRAM(i2s_controller_tx, 0, 3,
+RPI_PICO_PIO_DEFINE_PROGRAM(i2s_controller_tx, 0, 7,
 	        //     .wrap_target
 	0xb822, //  0: mov    x, y            side 3
 	0x7001, //  1: out    pins, 1         side 2
@@ -155,8 +155,6 @@ RPI_PICO_PIO_DEFINE_PROGRAM(i2s_controller_tx, 0, 3,
                 //     .wrap
 );
 
-#define i2s_controller_tx_wrap_target 0
-#define i2s_controller_tx_wrap 7
 #define i2s_controller_tx_offset_entry_point 0u
 
 static int pio_i2s_tx_init(PIO pio, uint32_t sm, uint32_t data_pin, uint32_t clock_pin_base, uint32_t bit_depth)
