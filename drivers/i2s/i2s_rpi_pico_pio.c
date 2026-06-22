@@ -12,7 +12,9 @@
 	 - RX stream functionality
 	 - Support all trigger commands
 	 - Change LOG statements to be more inline with the rest of zephyr
-	 - Think about syncronisation primitives
+	 - When there are multiple PIO programs written, make static KConfig options for
+	      enabling support for various PIO programs. Only the statically enabled ones
+	      can be used in the configure function.
 */
 
 
@@ -51,7 +53,6 @@ struct queue_item {
 struct pio_i2s_config {
 	const struct device *piodev;
 	const struct pinctrl_dev_config *pcfg;
-	const uint32_t data_pin;
 	const uint32_t clock_pin_base;
 };
 
@@ -67,10 +68,13 @@ struct stream {
 
 	struct i2s_config cfg;
 	void *mem_block;
+
+	const uint32_t data_pin;
 };
 
 struct pio_i2s_data {
     struct stream tx;
+    struct stream rx;
 };
 
 // TODO: Do some experiments to tripple check that this is correct.
@@ -205,8 +209,8 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 		return -EINVAL;
 	}
 
-	if (16 <= i2s_cfg->word_size && 32 <= i2s_cfg->word_size) {
-		LOG_ERR("I2S word size is unsupported.");
+	if (!(16 <= i2s_cfg->word_size && i2s_cfg->word_size <= 32)) {
+		LOG_ERR("I2S word size (%d) is unsupported.", i2s_cfg->word_size);
 		return -EINVAL;
 	}
 
@@ -261,7 +265,13 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 	dev_data->tx.dma_cfg.user_data = (void*) dev;
 	dev_data->tx.dma_cfg.dma_slot = RPI_PICO_DMA_DREQ_TO_SLOT(pio_get_dreq(pio, dev_data->tx.sm, true));
 
-	retval = pio_i2s_tx_init(pio, tx_sm, dev_config->data_pin, dev_config->clock_pin_base, channel_length);
+	// uint32_t data_pin = DT_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, tx_pins, 0),	\
+	// clock_pin_base = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, tx_pins, 1),	\
+	// DT_RPI_PICO_PIO_PIN_BY_NAME(node, default, 0, tx_gpio, 0)
+
+	// uint32_t data_pin = DT_RPI_PICO_PIO_PIN_BY_NAME(dev, default, 0, tx_pins, 0);
+
+	retval = pio_i2s_tx_init(pio, tx_sm, dev_data->tx.data_pin, dev_config->clock_pin_base, channel_length);
 	if (retval < 0) {
 		LOG_ERR("pio_i2s_tx_init failed with ret = %d", retval);
 		return retval;
@@ -399,6 +409,11 @@ void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	}
 }
 
+void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
+				      int status) {
+	// do stuff
+	return;
+}
 static int pio_i2s_init(const struct device *dev)
 {
 	const struct pio_i2s_config *dev_config = dev->config;
@@ -471,7 +486,7 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 	struct stream *stream = &data->tx;
 	k_spinlock_key_t key;
 
-	// TODO: Refactor this to avoid so much code duplication with taking locks
+	// TODO: Maybe refactor this to avoid so much code duplication with taking locks
 	switch (cmd) {
 	case I2S_TRIGGER_START:
 		if (stream->state != I2S_STATE_READY) {
@@ -578,11 +593,12 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 	static const struct pio_i2s_config pio_i2s##idx##_config = {				\
 		.piodev = DEVICE_DT_GET(DT_INST_PARENT(idx)),					\
 		.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(idx),					\
-		.data_pin = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, tx_pins, 0),	\
-		.clock_pin_base = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, tx_pins, 1),	\
+		.clock_pin_base = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, clks, 0)	\
 	};                                                  \
-    K_MSGQ_DEFINE(tx_##idx##_queue, sizeof(struct queue_item),		\
-            32, 4);			\
+	K_MSGQ_DEFINE(tx_##idx##_queue, sizeof(struct queue_item),		\
+	        32, 4);			\
+	K_MSGQ_DEFINE(rx_##idx##_queue, sizeof(struct queue_item),		\
+	        32, 4);			\
 	static struct pio_i2s_data pio_i2s##idx##_data = {                \
         .tx = {                                                        \
 		.msgq = &tx_##idx##_queue,                               \
@@ -590,6 +606,7 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 		.tx_stop_for_drain = false,                                         \
 		.dev_dma = DEVICE_DT_GET(DT_INST_DMAS_CTLR_BY_NAME(idx, tx)),		\
 		.dma_channel = DT_INST_DMAS_CELL_BY_NAME(idx, tx, channel),  \
+		.data_pin = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, tx_data, 0),	\
 		.dma_cfg = {							\
 			.block_count = 1, /* block_count > 1 not supported */	\
 			.channel_direction = MEMORY_TO_PERIPHERAL,		\
@@ -600,6 +617,25 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 			.dest_burst_length = 1,	/* unused i think */			\
 			.channel_priority = 1, /* TODO: hardcoded */		\
 			.dma_callback = dma_tx_callback			\
+		},								\
+        },                                             \
+        .rx = {                                                        \
+		.msgq = &rx_##idx##_queue,                               \
+		.state = I2S_STATE_NOT_READY,                                \
+		.tx_stop_for_drain = false,                                         \
+		.dev_dma = DEVICE_DT_GET(DT_INST_DMAS_CTLR_BY_NAME(idx, rx)),		\
+		.dma_channel = DT_INST_DMAS_CELL_BY_NAME(idx, rx, channel),  \
+		.data_pin = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, rx_data, 0),	\
+		.dma_cfg = {							\
+			.block_count = 1, /* block_count > 1 not supported */	\
+			.channel_direction = PERIPHERAL_TO_MEMORY,		\
+			.source_data_size = 4,  /* 32bit hard coded */		\
+			.dest_data_size = 4,    /* TODO: 32bit hard coded */		\
+			/* single transfers (burst length = data size) */	\
+			.source_burst_length = 1, /* unused i think */			\
+			.dest_burst_length = 1,	/* unused i think */			\
+			.channel_priority = 1, /* TODO: hardcoded */		\
+			.dma_callback = dma_rx_callback			\
 		},								\
         },                                             \
     };					\
