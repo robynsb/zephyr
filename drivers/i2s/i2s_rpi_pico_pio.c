@@ -197,18 +197,6 @@ static int pio_i2s_controller_tx_setup(const struct device *dev)
 	return 0;
 }
 
-static void pio_i2s_tx_start(const struct device *dev)
-{
-	const struct pio_i2s_config *dev_config = dev->config;
-	struct pio_i2s_data *dev_data = dev->data;
-	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
-	uint32_t sm = dev_data->sm;
-	uint32_t channel_length = pio_i2s_channel_length(dev_data);
-
-	pio_sm_exec(pio, sm, pio_encode_set(pio_y, channel_length - 2));
-	pio_sm_set_enabled(pio, sm, true);
-}
-
 // TODO: Convert nops to delays
 RPI_PICO_PIO_DEFINE_PROGRAM(i2s_controller_bidirectional, 0, 15,
 		//     .wrap_target
@@ -269,7 +257,7 @@ static int pio_i2s_controller_bidirectional_setup(const struct device *dev)
 	return 0;
 }
 
-static void pio_i2s_controller_bidirectional_start(const struct device *dev)
+static void pio_i2s_controller_start(const struct device *dev)
 {
 	const struct pio_i2s_config *dev_config = dev->config;
 	struct pio_i2s_data *dev_data = dev->data;
@@ -378,7 +366,6 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 				return retval;
 			}
 
-			pio_i2s_tx_start(dev);
 			dev_data->tx.state = I2S_STATE_READY;
 			break;
 		case I2S_DIR_BOTH:
@@ -391,7 +378,6 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 				return retval;
 			}
 
-			pio_i2s_controller_bidirectional_start(dev);
 			dev_data->tx.state = I2S_STATE_READY;
 			dev_data->rx.state = I2S_STATE_READY;
 			break;
@@ -547,12 +533,12 @@ static int pio_i2s_init(const struct device *dev)
 }
 
 
-int audio_i2s_start(const struct device *dev) {
+int i2s_start_stream_dma(const struct device *dev, struct stream *stream) {
 	const struct pio_i2s_config *config = dev->config;
 	struct pio_i2s_data *data = dev->data;
 	PIO pio = pio_rpi_pico_get_pio(config->piodev);
 
-	struct stream *stream = &data->tx;
+	// struct stream *stream = &data->tx;
 
 	size_t mem_block_size;
 	struct queue_item item;
@@ -580,6 +566,63 @@ int audio_i2s_start(const struct device *dev) {
 
 }
 
+static int i2s_start_stream(const struct device *dev, struct stream *stream) {
+	if (stream->state != I2S_STATE_READY) {
+		LOG_ERR("START trigger: invalid state %d",
+			    stream->state);
+		return -EIO;
+	}
+	stream->tx_stop_for_drain = false;
+        int retval = i2s_start_stream_dma(dev, stream);
+	if (retval < 0) {
+		LOG_ERR("START trigger failed %d", retval);
+		return retval;
+	}
+	pio_i2s_controller_start(dev);
+	stream->state = I2S_STATE_RUNNING;
+	return 0;
+}
+
+static int i2s_stop_stream(const struct device *dev, struct stream *stream) {
+	k_spinlock_key_t key = k_spin_lock(&stream->lock);
+	if (stream->state != I2S_STATE_RUNNING) {
+		k_spin_unlock(&stream->lock, key);
+		LOG_ERR("STOP trigger: invalid state %d", stream->state);
+		return -EIO;
+	}
+	stream->state = I2S_STATE_STOPPING;
+	stream->tx_stop_for_drain = true;
+	k_spin_unlock(&stream->lock, key);
+	return 0;
+}
+
+static int i2s_drain_stream(const struct device *dev, struct stream *stream) {
+	k_spinlock_key_t key = k_spin_lock(&stream->lock);
+	if (stream->state != I2S_STATE_RUNNING) {
+		k_spin_unlock(&stream->lock, key);
+		LOG_ERR("DRAIN trigger: invalid state %d",
+		         stream->state);
+		return -EIO;
+	}
+	stream->state = I2S_STATE_STOPPING;
+	k_spin_unlock(&stream->lock, key);
+	return 0;
+}
+
+static int i2s_drain_prepare(const struct device *dev, struct stream *stream) {
+	k_spinlock_key_t key = k_spin_lock(&stream->lock);
+	if (stream->state != I2S_STATE_ERROR) {
+		k_spin_unlock(&stream->lock, key);
+		LOG_ERR("PREPARE trigger: invalid state %d",
+		         stream->state);
+		return -EIO;
+	}
+	stream->state = I2S_STATE_READY;
+	k_spin_unlock(&stream->lock, key);
+	return 0;
+}
+
+
 static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 			     enum i2s_trigger_cmd cmd)
 {
@@ -587,66 +630,77 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 	struct pio_i2s_data *data = dev->data;
 	int ret;
 
-	if (dir != I2S_DIR_TX) {
+	if (!(dir == I2S_DIR_TX || dir == I2S_DIR_BOTH)) {
 		LOG_ERR("I2S direction is unsupported.");
 		return -EINVAL;
 	}
 
 	// struct stream *stream = &data->tx;
+	struct stream *stream_tx = &data->tx;
+	struct stream *stream_rx = &data->rx;
 	k_spinlock_key_t key;
+
+	bool is_dir_tx = dir == I2S_DIR_TX || dir == I2S_DIR_BOTH;
+	bool is_dir_rx = dir == I2S_DIR_RX || dir == I2S_DIR_BOTH;
+
 
 	// TODO: Maybe refactor this to avoid so much code duplication with taking locks
 	switch (cmd) {
 	case I2S_TRIGGER_START:
-		if (stream->state != I2S_STATE_READY) {
-			LOG_ERR("START trigger: invalid state %d",
-				    stream->state);
-			return -EIO;
+		if (is_dir_tx) {
+			ret = i2s_start_stream(dev, stream_tx);
+			if (ret < 0) {
+				return ret;
+			}
+			// if (stream_tx->state != I2S_STATE_READY) {
+			// 	LOG_ERR("START trigger: invalid state %d",
+			// 		    stream_tx->state);
+			// 	return -EIO;
+			// }
+			// stream->tx_stop_for_drain = false;
+		 //        ret = i2s_start_stream_dma(dev, stream_tx);
+			// if (ret < 0) {
+			// 	LOG_ERR("START trigger failed %d", ret);
+			// 	return ret;
+			// }
+			// pio_i2s_controller_start(dev);
+			// stream_tx->state = I2S_STATE_RUNNING;
 		}
-		/* No spin lock because tx callback cannot be running while stream->state == I2S_STATE_READY. */
-		stream->tx_stop_for_drain = false;
-	        ret = audio_i2s_start(dev);
-		if (ret < 0) {
-			LOG_ERR("START trigger failed %d", ret);
-			return ret;
+		if (is_dir_rx) {
+			ret = i2s_start_stream(dev, stream_rx);
+			if (ret < 0) {
+				return ret;
+			}
+			// if (stream_rx->state != I2S_STATE_READY) {
+			// 	LOG_ERR("START trigger: invalid state %d",
+			// 		    stream_rx->state);
+			// 	return -EIO;
+			// }
+		 //        ret = i2s_start_stream_dma(dev, stream_rx);
+			// if (ret < 0) {
+			// 	LOG_ERR("START trigger failed %d", ret);
+			// 	return ret;
+			// }
+			// pio_i2s_controller_start(dev);
+			// stream_rx->state = I2S_STATE_RUNNING;
 		}
-		stream->state = I2S_STATE_RUNNING;
 		break;
 	case I2S_TRIGGER_STOP:
 		//TODO: what if DMA is not running?
-		key = k_spin_lock(&stream->lock);
-		if (stream->state != I2S_STATE_RUNNING) {
-			k_spin_unlock(&stream->lock, key);
-			LOG_ERR("STOP trigger: invalid state %d",
-			         stream->state);
-			return -EIO;
+		if(is_dir_tx) {
+			i2s_stop_stream(dev, stream_tx);
 		}
-		stream->state = I2S_STATE_STOPPING;
-		stream->tx_stop_for_drain = true;
-		k_spin_unlock(&stream->lock, key);
 		break;
 	case I2S_TRIGGER_DRAIN:
 		//TODO: what if queue already empty?
-		key = k_spin_lock(&stream->lock);
-		if (stream->state != I2S_STATE_RUNNING) {
-			k_spin_unlock(&stream->lock, key);
-			LOG_ERR("DRAIN trigger: invalid state %d",
-			         stream->state);
-			return -EIO;
+		if(is_dir_tx) {
+			i2s_drain_stream(dev, stream_tx);
 		}
-		stream->state = I2S_STATE_STOPPING;
-		k_spin_unlock(&stream->lock, key);
 		break;
 	case I2S_TRIGGER_PREPARE:
-		key = k_spin_lock(&stream->lock);
-		if (stream->state != I2S_STATE_ERROR) {
-			k_spin_unlock(&stream->lock, key);
-			LOG_ERR("PREPARE trigger: invalid state %d",
-			         stream->state);
-			return -EIO;
+		if(is_dir_tx) {
+			i2s_drain_prepare(dev, stream_tx);
 		}
-		stream->state = I2S_STATE_READY;
-		k_spin_unlock(&stream->lock, key);
 		break;
 
 	default:
