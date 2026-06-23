@@ -18,6 +18,7 @@
 */
 
 
+#include "zephyr/sys/__assert.h"
 #define DT_DRV_COMPAT raspberrypi_pico_i2s_pio
 
 #include <zephyr/drivers/pinctrl.h>
@@ -63,7 +64,6 @@ struct stream {
 	uint32_t dma_channel;
 	const struct device *dev_dma;
 	struct dma_config dma_cfg;
-	uint8_t sm;
 	struct k_spinlock lock;
 
 	struct i2s_config cfg;
@@ -75,6 +75,7 @@ struct stream {
 struct pio_i2s_data {
     struct stream tx;
     struct stream rx;
+    uint8_t sm;
 };
 
 /* For words greater than 16-bit the channel length is considered 32-bit */
@@ -104,7 +105,7 @@ void update_pio_frequency(const struct device *dev, uint32_t cycles_factor) {
     const struct pio_i2s_config *dev_config = dev->config;
     struct pio_i2s_data *dev_data = dev->data;
     PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
-    uint32_t sm = dev_data->tx.sm;
+    uint32_t sm = dev_data->sm;
     uint32_t sample_freq = dev_data->tx.cfg.frame_clk_freq;
     uint32_t channel_length = pio_i2s_channel_length(dev_data);
     /* Number of channels is always 2 for I2S data format */
@@ -162,12 +163,12 @@ RPI_PICO_PIO_DEFINE_PROGRAM(i2s_controller_tx, 0, 7,
 );
 #define i2s_controller_tx_cycles_factor 2u
 
-static int pio_i2s_tx_setup(const struct device *dev)
+static int pio_i2s_controller_tx_setup(const struct device *dev)
 {
 	const struct pio_i2s_config *dev_config = dev->config;
 	struct pio_i2s_data *dev_data = dev->data;
 	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
-	uint32_t sm = dev_data->tx.sm;
+	uint32_t sm = dev_data->sm;
 	uint32_t data_pin = dev_data->tx.data_pin;
 	uint32_t clock_pin_base = dev_config->clock_pin_base;
 	uint32_t channel_length = pio_i2s_channel_length(dev_data);
@@ -201,7 +202,7 @@ static void pio_i2s_tx_start(const struct device *dev)
 	const struct pio_i2s_config *dev_config = dev->config;
 	struct pio_i2s_data *dev_data = dev->data;
 	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
-	uint32_t sm = dev_data->tx.sm;
+	uint32_t sm = dev_data->sm;
 	uint32_t channel_length = pio_i2s_channel_length(dev_data);
 
 	pio_sm_exec(pio, sm, pio_encode_set(pio_y, channel_length - 2));
@@ -237,7 +238,7 @@ static int pio_i2s_controller_bidirectional_setup(const struct device *dev)
 	const struct pio_i2s_config *dev_config = dev->config;
 	struct pio_i2s_data *dev_data = dev->data;
 	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
-	uint32_t sm = dev_data->tx.sm;
+	uint32_t sm = dev_data->sm;
 	uint32_t rx_data_pin = dev_data->rx.data_pin;
 	uint32_t tx_data_pin = dev_data->tx.data_pin;
 	uint32_t clock_pin_base = dev_config->clock_pin_base;
@@ -273,11 +274,37 @@ static void pio_i2s_controller_bidirectional_start(const struct device *dev)
 	const struct pio_i2s_config *dev_config = dev->config;
 	struct pio_i2s_data *dev_data = dev->data;
 	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
-	uint32_t sm = dev_data->tx.sm;
+	uint32_t sm = dev_data->sm;
 	uint32_t channel_length = pio_i2s_channel_length(dev_data);
 
 	pio_sm_exec(pio, sm, pio_encode_set(pio_y, channel_length - 2));
 	pio_sm_set_enabled(pio, sm, true);
+}
+
+static int setup_stream(const struct device *dev, enum i2s_dir dir,
+			    const struct i2s_config *i2s_cfg) {
+
+	struct pio_i2s_config *dev_config = dev->config;
+	struct pio_i2s_data *dev_data = dev->data;
+	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
+	uint32_t sm = dev_data->sm;
+
+	__ASSERT_NO_MSG(dir == I2S_DIR_TX || dir == I2S_DIR_RX);
+
+	bool dir_is_tx = dir == I2S_DIR_TX;
+	struct stream *stream = dir_is_tx ? &dev_data->tx : &dev_data->rx;
+
+	if (stream->state != I2S_STATE_NOT_READY &&
+	    stream->state != I2S_STATE_READY) {
+		LOG_ERR("stream in invalid state (%d)", stream->state);
+		return -EINVAL;
+	}
+
+	stream->dma_cfg.user_data = (void*) dev;
+	stream->dma_cfg.dma_slot = RPI_PICO_DMA_DREQ_TO_SLOT(pio_get_dreq(pio, sm, dir_is_tx));
+	memcpy(&stream->cfg, i2s_cfg, sizeof(struct i2s_config));
+
+	return 0;
 }
 
 static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
@@ -304,14 +331,6 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 		return -EINVAL;
 	}
 
-	struct stream *stream = &dev_data->tx;
-
-	if (stream->state != I2S_STATE_NOT_READY &&
-	    stream->state != I2S_STATE_READY) {
-		LOG_ERR("invalid state");
-		return -EINVAL;
-	}
-
 	bool is_bit_clk_target = i2s_cfg->options & I2S_OPT_BIT_CLK_TARGET;
 	bool is_frame_clk_target = i2s_cfg->options & I2S_OPT_FRAME_CLK_TARGET;
 
@@ -326,7 +345,7 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 	}
 
 	if (i2s_cfg->options & I2S_OPT_PINGPONG) {
-		LOG_ERR("I2S_OPT_PINGPONG unsupported.");
+		LOG_ERR("I2S_OPT_PINGPONG is unsupported.");
 		return -EINVAL;
 	}
 
@@ -335,34 +354,37 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 		return -EINVAL;
 	}
 
-	memcpy(&stream->cfg, i2s_cfg, sizeof(struct i2s_config));
-
 
 	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
 
-	size_t tx_sm;
+	size_t sm;
 	int retval;
-	retval = pio_rpi_pico_allocate_sm(dev_config->piodev, &tx_sm);
+	retval = pio_rpi_pico_allocate_sm(dev_config->piodev, &sm);
+
 	if (retval < 0) {
 		LOG_ERR("pio_rpi_pico_allocate_sm failed with ret = %d", retval);
 		return retval;
 	}
 
-	dev_data->tx.sm = tx_sm;
-	dev_data->tx.dma_cfg.user_data = (void*) dev;
-	dev_data->tx.dma_cfg.dma_slot = RPI_PICO_DMA_DREQ_TO_SLOT(pio_get_dreq(pio, dev_data->tx.sm, true));
+	dev_data->sm = sm;
 
 	switch (dir) {
 		case I2S_DIR_TX:
-			retval = pio_i2s_tx_setup(dev);
+			setup_stream(dev, I2S_DIR_TX, i2s_cfg);
+
+			retval = pio_i2s_controller_tx_setup(dev);
 			if (retval < 0) {
-				LOG_ERR("pio_i2s_tx_setup failed with ret = %d", retval);
+				LOG_ERR("pio_i2s_controller_tx_setup failed with ret = %d", retval);
 				return retval;
 			}
 
 			pio_i2s_tx_start(dev);
+			dev_data->tx.state = I2S_STATE_READY;
 			break;
 		case I2S_DIR_BOTH:
+			setup_stream(dev, I2S_DIR_TX, i2s_cfg);
+			setup_stream(dev, I2S_DIR_RX, i2s_cfg);
+
 			retval = pio_i2s_controller_bidirectional_setup(dev);
 			if (retval < 0) {
 				LOG_ERR("pio_i2s_controller_bidirectional_setup failed with ret = %d", retval);
@@ -370,11 +392,12 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 			}
 
 			pio_i2s_controller_bidirectional_start(dev);
+			dev_data->tx.state = I2S_STATE_READY;
+			dev_data->rx.state = I2S_STATE_READY;
 			break;
 
 	}
 
-	stream->state = I2S_STATE_READY;
 	return 0;
 }
 
@@ -495,7 +518,7 @@ void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	retval = reload_dma(stream->dev_dma, stream->dma_channel,
 		&stream->dma_cfg,
 		stream->mem_block,
-		(void *)&pio->txf[data->tx.sm],
+		(void *)&pio->txf[data->sm],
 		mem_block_size);
 
 	if (retval < 0) {
@@ -509,6 +532,7 @@ void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	// do stuff
 	return;
 }
+
 static int pio_i2s_init(const struct device *dev)
 {
 	const struct pio_i2s_config *dev_config = dev->config;
@@ -520,14 +544,6 @@ static int pio_i2s_init(const struct device *dev)
 		LOG_ERR("pinctrl_apply_state failed with ret = %d", retval);
         	return retval;
 	}
-
-	uint8_t dma_channel = dev_data->tx.dma_channel;
-	retval = dma_config(dev_data->tx.dev_dma, dma_channel, &dev_data->tx.dma_cfg);
-	if (retval < 0) {
-		LOG_ERR("dma ctrl %p: dma_config failed with %d", dev_data->tx.dev_dma, retval);
-		return retval;
-	}
-	return 0;
 }
 
 
@@ -553,7 +569,7 @@ int audio_i2s_start(const struct device *dev) {
 	ret = start_dma(stream->dev_dma, stream->dma_channel,
 			&stream->dma_cfg,
 			stream->mem_block, true, /* TODO: scr addr increment setting? */
-			(void *)&pio->txf[data->tx.sm],
+			(void *)&pio->txf[data->sm],
 			false,
 			mem_block_size);
 	if (ret < 0) {
@@ -576,7 +592,7 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 		return -EINVAL;
 	}
 
-	struct stream *stream = &data->tx;
+	// struct stream *stream = &data->tx;
 	k_spinlock_key_t key;
 
 	// TODO: Maybe refactor this to avoid so much code duplication with taking locks
