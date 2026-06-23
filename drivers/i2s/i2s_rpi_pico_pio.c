@@ -77,26 +77,42 @@ struct pio_i2s_data {
     struct stream rx;
 };
 
+/* For words greater than 16-bit the channel length is considered 32-bit */
+static uint32_t pio_i2s_channel_length(const struct pio_i2s_data *dev_data)
+{
+	return dev_data->tx.cfg.word_size > 16U ? 32U : 16U;
+}
+
 // TODO: Do some experiments to tripple check that this is correct.
 /*
  * f_sys = system_clock_frequency
  * f_b = frequency of Bit CLK
  * f_pio = frequency of PIO cycles
  * f_s = sampling frequency
+ * k = 2 for i2s_controller_tx program,
+ * k = 4 for i2s_controller_bidirectional program
  *
  * f_b = f_s * channel_length * num_channels
  * f_pio = f_sys / divider
- * f_pio = 2 * f_b
+ * f_pio = k * f_b
  *
- * => 2 * f_b = f_sys / divider
- * => divider = f_sys / (2 * f_b) = f_sys/(2 * f_s * channel_length * num_channels)
+ * => k * f_b = f_sys / divider
+ * => divider = f_sys / (k * f_b) = f_sys/(k * f_s * channel_length * num_channels)
 
  */
-void update_pio_frequency(PIO pio, uint32_t sm, uint32_t sample_freq, uint32_t channel_length, uint32_t num_channels) {
+void update_pio_frequency(const struct device *dev, uint32_t cycles_factor) {
+    const struct pio_i2s_config *dev_config = dev->config;
+    struct pio_i2s_data *dev_data = dev->data;
+    PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
+    uint32_t sm = dev_data->tx.sm;
+    uint32_t sample_freq = dev_data->tx.cfg.frame_clk_freq;
+    uint32_t channel_length = pio_i2s_channel_length(dev_data);
+    /* Number of channels is always 2 for I2S data format */
+    const uint32_t num_channels = 2;
     uint64_t system_clock_frequency = clock_get_hz(clk_sys);
     /* 8.8 fixed-point divider: (f_sys << 8) / (2 * f_s * channel_length * num_channels) */
     uint64_t divider = (system_clock_frequency << 8u) /
-		       (2u * sample_freq * channel_length * num_channels);
+		       (cycles_factor * sample_freq * channel_length * num_channels);
     assert(divider < 0x1000000); // TODO: These errors should be handled better
     pio_sm_set_clkdiv_int_frac(pio, sm, divider >> 8u, divider & 0xffu);
 }
@@ -144,10 +160,17 @@ RPI_PICO_PIO_DEFINE_PROGRAM(i2s_controller_tx, 0, 7,
 	0x7001, //  7: out    pins, 1         side 2
                 //     .wrap
 );
-#define i2s_controller_tx_offset_entry_point 0u
+#define i2s_controller_tx_cycles_factor 2u
 
-static int pio_i2s_tx_init(PIO pio, uint32_t sm, uint32_t data_pin, uint32_t clock_pin_base, uint32_t channel_length)
+static int pio_i2s_tx_setup(const struct device *dev)
 {
+	const struct pio_i2s_config *dev_config = dev->config;
+	struct pio_i2s_data *dev_data = dev->data;
+	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
+	uint32_t sm = dev_data->tx.sm;
+	uint32_t data_pin = dev_data->tx.data_pin;
+	uint32_t clock_pin_base = dev_config->clock_pin_base;
+	uint32_t channel_length = pio_i2s_channel_length(dev_data);
 	uint32_t offset;
 	pio_sm_config sm_config;
 
@@ -167,10 +190,22 @@ static int pio_i2s_tx_init(PIO pio, uint32_t sm, uint32_t data_pin, uint32_t clo
 	uint32_t pin_mask = (0b1 << data_pin) | (0b11 << clock_pin_base);
 	pio_sm_set_pindirs_with_mask(pio, sm, pin_mask, pin_mask);
 	pio_sm_set_pins(pio, sm, 0); // clear pins
-	pio_sm_exec(pio, sm, pio_encode_set(pio_y, channel_length - 2));
-	pio_sm_exec(pio, sm, pio_encode_jmp(offset + i2s_controller_tx_offset_entry_point)); // TODO: probably get rid of this and just do enable.
+
+	update_pio_frequency(dev, i2s_controller_tx_cycles_factor);
 
 	return 0;
+}
+
+static void pio_i2s_tx_start(const struct device *dev)
+{
+	const struct pio_i2s_config *dev_config = dev->config;
+	struct pio_i2s_data *dev_data = dev->data;
+	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
+	uint32_t sm = dev_data->tx.sm;
+	uint32_t channel_length = pio_i2s_channel_length(dev_data);
+
+	pio_sm_exec(pio, sm, pio_encode_set(pio_y, channel_length - 2));
+	pio_sm_set_enabled(pio, sm, true);
 }
 
 // TODO: Convert nops to delays
@@ -195,10 +230,18 @@ RPI_PICO_PIO_DEFINE_PROGRAM(i2s_controller_bidirectional, 0, 15,
 	        //     .wrap
 );
 
-static int pio_i2s_controller_bidirectional_init(
-	PIO pio, uint32_t sm, uint32_t rx_data_pin, uint32_t tx_data_pin,
-	uint32_t clock_pin_base, uint32_t channel_length)
+#define i2s_controller_bidirectional_cycles_factor 4u
+
+static int pio_i2s_controller_bidirectional_setup(const struct device *dev)
 {
+	const struct pio_i2s_config *dev_config = dev->config;
+	struct pio_i2s_data *dev_data = dev->data;
+	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
+	uint32_t sm = dev_data->tx.sm;
+	uint32_t rx_data_pin = dev_data->rx.data_pin;
+	uint32_t tx_data_pin = dev_data->tx.data_pin;
+	uint32_t clock_pin_base = dev_config->clock_pin_base;
+	uint32_t channel_length = pio_i2s_channel_length(dev_data);
 	uint32_t offset;
 	pio_sm_config sm_config;
 
@@ -219,10 +262,22 @@ static int pio_i2s_controller_bidirectional_init(
 	uint32_t pin_mask = (0b1 << tx_data_pin) | (0b1 << rx_data_pin) | (0b11 << clock_pin_base);
 	pio_sm_set_pindirs_with_mask(pio, sm, pin_mask, pin_mask);
 	pio_sm_set_pins(pio, sm, 0); // clear pins
-	pio_sm_exec(pio, sm, pio_encode_set(pio_y, channel_length-2));
-	pio_sm_exec(pio, sm, pio_encode_jmp(offset + 0)); // TODO: probably get rid of this and just do enable.
+
+	update_pio_frequency(dev, i2s_controller_bidirectional_cycles_factor);
 
 	return 0;
+}
+
+static void pio_i2s_controller_bidirectional_start(const struct device *dev)
+{
+	const struct pio_i2s_config *dev_config = dev->config;
+	struct pio_i2s_data *dev_data = dev->data;
+	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
+	uint32_t sm = dev_data->tx.sm;
+	uint32_t channel_length = pio_i2s_channel_length(dev_data);
+
+	pio_sm_exec(pio, sm, pio_encode_set(pio_y, channel_length - 2));
+	pio_sm_set_enabled(pio, sm, true);
 }
 
 static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
@@ -239,9 +294,6 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 		return -EINVAL;
 	}
 
-	/* Number of channels is always 2 for I2S data format */
-	const uint32_t num_channels = 2;
-
 	if (!(dir == I2S_DIR_TX || dir == I2S_DIR_BOTH)) {
 		LOG_ERR("I2S direction (%d) is unsupported.", dir); // TODO
 		return -EINVAL;
@@ -251,9 +303,6 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 		LOG_ERR("I2S word size (%d) is unsupported.", i2s_cfg->word_size);
 		return -EINVAL;
 	}
-
-	/* For words greater than 16-bit the channel length is considered 32-bit */
-	const uint32_t channel_length = i2s_cfg->word_size > 16U ? 32U : 16U;
 
 	struct stream *stream = &dev_data->tx;
 
@@ -305,22 +354,22 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 
 	switch (dir) {
 		case I2S_DIR_TX:
-			retval = pio_i2s_tx_init(pio, tx_sm, dev_data->tx.data_pin, dev_config->clock_pin_base, channel_length);
+			retval = pio_i2s_tx_setup(dev);
 			if (retval < 0) {
-				LOG_ERR("pio_i2s_tx_init failed with ret = %d", retval);
+				LOG_ERR("pio_i2s_tx_setup failed with ret = %d", retval);
 				return retval;
 			}
 
-			update_pio_frequency(pio, dev_data->tx.sm, i2s_cfg->frame_clk_freq, channel_length, num_channels);
+			pio_i2s_tx_start(dev);
 			break;
 		case I2S_DIR_BOTH:
-			retval = pio_i2s_controller_bidirectional_init(pio, tx_sm, dev_data->rx.data_pin, dev_data->tx.data_pin, dev_config->clock_pin_base, channel_length);
+			retval = pio_i2s_controller_bidirectional_setup(dev);
 			if (retval < 0) {
-				LOG_ERR("pio_i2s_tx_init failed with ret = %d", retval);
+				LOG_ERR("pio_i2s_controller_bidirectional_setup failed with ret = %d", retval);
 				return retval;
 			}
 
-			update_pio_frequency(pio, dev_data->tx.sm, i2s_cfg->frame_clk_freq, channel_length, num_channels);
+			pio_i2s_controller_bidirectional_start(dev);
 			break;
 
 	}
@@ -486,8 +535,6 @@ int audio_i2s_start(const struct device *dev) {
 	const struct pio_i2s_config *config = dev->config;
 	struct pio_i2s_data *data = dev->data;
 	PIO pio = pio_rpi_pico_get_pio(config->piodev);
-
-	pio_sm_set_enabled(pio, data->tx.sm, true);
 
 	struct stream *stream = &data->tx;
 
