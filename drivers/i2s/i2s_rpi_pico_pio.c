@@ -132,16 +132,6 @@ static int i2s_rpi_pico_write(const struct device *dev, void *mem_block, size_t 
     return 0;
 }
 
-
-/*
- * TODO:
- * Either build 3 different version of this code for the 16bit, 24 bit, 32 bit or
- * find another way to make this program variable like that.
- *
- * Look at this other github project...
- * this guy somehow does it without: malacalypse/rp2040_i2s_example
- */
-
 RPI_PICO_PIO_DEFINE_PROGRAM(i2s_controller_tx, 0, 7,
 	        //     .wrap_target
 	0xb822, //  0: mov    x, y            side 3
@@ -154,10 +144,9 @@ RPI_PICO_PIO_DEFINE_PROGRAM(i2s_controller_tx, 0, 7,
 	0x7001, //  7: out    pins, 1         side 2
                 //     .wrap
 );
-
 #define i2s_controller_tx_offset_entry_point 0u
 
-static int pio_i2s_tx_init(PIO pio, uint32_t sm, uint32_t data_pin, uint32_t clock_pin_base, uint32_t bit_depth)
+static int pio_i2s_tx_init(PIO pio, uint32_t sm, uint32_t data_pin, uint32_t clock_pin_base, uint32_t channel_length)
 {
 	uint32_t offset;
 	pio_sm_config sm_config;
@@ -172,15 +161,66 @@ static int pio_i2s_tx_init(PIO pio, uint32_t sm, uint32_t data_pin, uint32_t clo
 	sm_config_set_sideset(&sm_config, 2, false, false);
 	sm_config_set_out_pins(&sm_config, data_pin, 1);
 	sm_config_set_sideset_pins(&sm_config, clock_pin_base);
-	sm_config_set_out_shift(&sm_config, false, true, 32);
+	sm_config_set_out_shift(&sm_config, false, true, channel_length);
 	sm_config_set_fifo_join(&sm_config, PIO_FIFO_JOIN_TX);
 	pio_sm_init(pio, sm, offset, &sm_config);
-	uint32_t pin_mask = (1u << data_pin) | (3u << clock_pin_base);
+	uint32_t pin_mask = (0b1 << data_pin) | (0b11 << clock_pin_base);
 	pio_sm_set_pindirs_with_mask(pio, sm, pin_mask, pin_mask);
 	pio_sm_set_pins(pio, sm, 0); // clear pins
-	pio_sm_exec(pio, sm, pio_encode_set(pio_y, bit_depth-2));
-	pio_sm_exec(pio, sm, pio_encode_jmp(offset + i2s_controller_tx_offset_entry_point));
+	pio_sm_exec(pio, sm, pio_encode_set(pio_y, channel_length - 2));
+	pio_sm_exec(pio, sm, pio_encode_jmp(offset + i2s_controller_tx_offset_entry_point)); // TODO: probably get rid of this and just do enable.
 
+	return 0;
+}
+
+// TODO: Convert nops to delays
+RPI_PICO_PIO_DEFINE_PROGRAM(i2s_controller_bidirectional, 0, 15,
+		//     .wrap_target
+	0x5801, //  0: in     pins, 1         side 3
+	0xb842, //  1: nop                    side 3
+	0x6001, //  2: out    pins, 1         side 0
+	0xa022, //  3: mov    x, y            side 0
+	0x4801, //  4: in     pins, 1         side 1
+	0xa842, //  5: nop                    side 1
+	0x6001, //  6: out    pins, 1         side 0
+	0x0044, //  7: jmp    x--, 4          side 0
+	0x4801, //  8: in     pins, 1         side 1
+	0xa822, //  9: mov    x, y            side 1
+	0x7001, // 10: out    pins, 1         side 2
+	0xb042, // 11: nop                    side 2
+	0x5801, // 12: in     pins, 1         side 3
+	0xb842, // 13: nop                    side 3
+	0x7001, // 14: out    pins, 1         side 2
+	0x104c, // 15: jmp    x--, 12         side 2
+	        //     .wrap
+);
+
+static int pio_i2s_controller_bidirectional_init(
+	PIO pio, uint32_t sm, uint32_t rx_data_pin, uint32_t tx_data_pin,
+	uint32_t clock_pin_base, uint32_t channel_length)
+{
+	uint32_t offset;
+	pio_sm_config sm_config;
+
+	if (!pio_can_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(i2s_controller_bidirectional))) {
+		return -EBUSY;
+	}
+
+	offset = pio_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(i2s_controller_bidirectional));
+	sm_config = pio_get_default_sm_config();
+	sm_config_set_wrap(&sm_config, offset + i2s_controller_bidirectional_wrap_target, offset + i2s_controller_bidirectional_wrap);
+	sm_config_set_in_pins(&sm_config, rx_data_pin);
+	sm_config_set_out_pins(&sm_config, tx_data_pin, 1);
+	sm_config_set_out_shift(&sm_config, false, true, channel_length);
+	sm_config_set_in_shift(&sm_config, false, true, channel_length);
+	sm_config_set_sideset_pin_base(&sm_config, clock_pin_base);
+	sm_config_set_sideset(&sm_config, 2, false, false);
+	pio_sm_init(pio, sm, offset, &sm_config);
+	uint32_t pin_mask = (0b1 << tx_data_pin) | (0b1 << rx_data_pin) | (0b11 << clock_pin_base);
+	pio_sm_set_pindirs_with_mask(pio, sm, pin_mask, pin_mask);
+	pio_sm_set_pins(pio, sm, 0); // clear pins
+	pio_sm_exec(pio, sm, pio_encode_set(pio_y, channel_length-2));
+	pio_sm_exec(pio, sm, pio_encode_jmp(offset + 0)); // TODO: probably get rid of this and just do enable.
 
 	return 0;
 }
@@ -202,8 +242,8 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 	/* Number of channels is always 2 for I2S data format */
 	const uint32_t num_channels = 2;
 
-	if (dir != I2S_DIR_TX) {
-		LOG_ERR("I2S direction is unsupported."); // TODO:
+	if (!(dir == I2S_DIR_TX || dir == I2S_DIR_BOTH)) {
+		LOG_ERR("I2S direction (%d) is unsupported.", dir); // TODO
 		return -EINVAL;
 	}
 
@@ -263,19 +303,27 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 	dev_data->tx.dma_cfg.user_data = (void*) dev;
 	dev_data->tx.dma_cfg.dma_slot = RPI_PICO_DMA_DREQ_TO_SLOT(pio_get_dreq(pio, dev_data->tx.sm, true));
 
-	// uint32_t data_pin = DT_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, tx_pins, 0),	\
-	// clock_pin_base = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, tx_pins, 1),	\
-	// DT_RPI_PICO_PIO_PIN_BY_NAME(node, default, 0, tx_gpio, 0)
+	switch (dir) {
+		case I2S_DIR_TX:
+			retval = pio_i2s_tx_init(pio, tx_sm, dev_data->tx.data_pin, dev_config->clock_pin_base, channel_length);
+			if (retval < 0) {
+				LOG_ERR("pio_i2s_tx_init failed with ret = %d", retval);
+				return retval;
+			}
 
-	// uint32_t data_pin = DT_RPI_PICO_PIO_PIN_BY_NAME(dev, default, 0, tx_pins, 0);
+			update_pio_frequency(pio, dev_data->tx.sm, i2s_cfg->frame_clk_freq, channel_length, num_channels);
+			break;
+		case I2S_DIR_BOTH:
+			retval = pio_i2s_controller_bidirectional_init(pio, tx_sm, dev_data->rx.data_pin, dev_data->tx.data_pin, dev_config->clock_pin_base, channel_length);
+			if (retval < 0) {
+				LOG_ERR("pio_i2s_tx_init failed with ret = %d", retval);
+				return retval;
+			}
 
-	retval = pio_i2s_tx_init(pio, tx_sm, dev_data->tx.data_pin, dev_config->clock_pin_base, channel_length);
-	if (retval < 0) {
-		LOG_ERR("pio_i2s_tx_init failed with ret = %d", retval);
-		return retval;
+			update_pio_frequency(pio, dev_data->tx.sm, i2s_cfg->frame_clk_freq, channel_length, num_channels);
+			break;
+
 	}
-
-	update_pio_frequency(pio, dev_data->tx.sm, i2s_cfg->frame_clk_freq, channel_length, num_channels);
 
 	stream->state = I2S_STATE_READY;
 	return 0;
