@@ -76,6 +76,7 @@ struct pio_i2s_data {
     struct stream tx;
     struct stream rx;
     uint8_t sm;
+    uint32_t offset;
 };
 
 /* For words greater than 16-bit the channel length is considered 32-bit */
@@ -149,6 +150,29 @@ static int i2s_rpi_pico_write(const struct device *dev, void *mem_block, size_t 
     return 0;
 }
 
+static int i2s_rpi_pico_read(const struct device *dev, void **mem_block, size_t *size)
+{
+	const struct pio_i2s_config *dev_config = dev->config;
+	struct pio_i2s_data *dev_data = dev->data;
+	const struct stream *stream = &dev_data->rx;
+	enum i2s_state state = stream->state;
+
+	if (state == I2S_STATE_NOT_READY) {
+		LOG_DBG("Invalid state: %d", (int)state);
+		return -EIO;
+	}
+
+	struct queue_item item;
+	int retval = k_msgq_get(stream->msgq, &item, K_MSEC(stream->cfg.timeout));
+	if (retval < 0) {
+		return -EIO;
+	}
+	*mem_block = item.mem_block;
+	*size = item.size;
+
+	return 0;
+}
+
 RPI_PICO_PIO_DEFINE_PROGRAM(i2s_controller_tx, 0, 7,
 	        //     .wrap_target
 	0xb822, //  0: mov    x, y            side 3
@@ -172,22 +196,21 @@ static int pio_i2s_controller_tx_setup(const struct device *dev)
 	uint32_t data_pin = dev_data->tx.data_pin;
 	uint32_t clock_pin_base = dev_config->clock_pin_base;
 	uint32_t channel_length = pio_i2s_channel_length(dev_data);
-	uint32_t offset;
 	pio_sm_config sm_config;
 
 	if (!pio_can_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(i2s_controller_tx))) {
 		return -EBUSY;
 	}
 
-	offset = pio_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(i2s_controller_tx));
+	dev_data->offset = pio_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(i2s_controller_tx));
 	sm_config = pio_get_default_sm_config();
-	sm_config_set_wrap(&sm_config, offset + i2s_controller_tx_wrap_target, offset + i2s_controller_tx_wrap);
+	sm_config_set_wrap(&sm_config, dev_data->offset + i2s_controller_tx_wrap_target, dev_data->offset + i2s_controller_tx_wrap);
 	sm_config_set_sideset(&sm_config, 2, false, false);
 	sm_config_set_out_pins(&sm_config, data_pin, 1);
 	sm_config_set_sideset_pins(&sm_config, clock_pin_base);
 	sm_config_set_out_shift(&sm_config, false, true, channel_length);
 	sm_config_set_fifo_join(&sm_config, PIO_FIFO_JOIN_TX);
-	pio_sm_init(pio, sm, offset, &sm_config);
+	pio_sm_init(pio, sm, dev_data->offset, &sm_config);
 	uint32_t pin_mask = (0b1 << data_pin) | (0b11 << clock_pin_base);
 	pio_sm_set_pindirs_with_mask(pio, sm, pin_mask, pin_mask);
 	pio_sm_set_pins(pio, sm, 0); // clear pins
@@ -200,7 +223,7 @@ static int pio_i2s_controller_tx_setup(const struct device *dev)
 // TODO: Convert nops to delays
 RPI_PICO_PIO_DEFINE_PROGRAM(i2s_controller_bidirectional, 0, 15,
 		//     .wrap_target
-	0x5801, //  0: in     pins, 1         side 3
+	0x5801, //  0: in     pins, 1         side 3 // Im pretty sure this `in` instruction is off-by-one and should be adjusted with some kind of autopush
 	0xb842, //  1: nop                    side 3
 	0x7001, //  2: out    pins, 1         side 2
 	0x1040, //  3: jmp    x--, 0          side 2
@@ -231,25 +254,25 @@ static int pio_i2s_controller_bidirectional_setup(const struct device *dev)
 	uint32_t tx_data_pin = dev_data->tx.data_pin;
 	uint32_t clock_pin_base = dev_config->clock_pin_base;
 	uint32_t channel_length = pio_i2s_channel_length(dev_data);
-	uint32_t offset;
 	pio_sm_config sm_config;
 
 	if (!pio_can_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(i2s_controller_bidirectional))) {
 		return -EBUSY;
 	}
 
-	offset = pio_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(i2s_controller_bidirectional));
+	dev_data->offset = pio_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(i2s_controller_bidirectional));
 	sm_config = pio_get_default_sm_config();
-	sm_config_set_wrap(&sm_config, offset + i2s_controller_bidirectional_wrap_target, offset + i2s_controller_bidirectional_wrap);
+	sm_config_set_wrap(&sm_config, dev_data->offset + i2s_controller_bidirectional_wrap_target, dev_data->offset + i2s_controller_bidirectional_wrap);
 	sm_config_set_in_pins(&sm_config, rx_data_pin);
 	sm_config_set_out_pins(&sm_config, tx_data_pin, 1);
 	sm_config_set_out_shift(&sm_config, false, true, channel_length);
-	sm_config_set_in_shift(&sm_config, false, false, channel_length); //TODO: set to autopush to true again DEBUG
+	sm_config_set_in_shift(&sm_config, false, true, channel_length);
 	sm_config_set_sideset_pin_base(&sm_config, clock_pin_base);
 	sm_config_set_sideset(&sm_config, 2, false, false);
-	pio_sm_init(pio, sm, offset, &sm_config);
+	pio_sm_init(pio, sm, dev_data->offset, &sm_config);
 	uint32_t pin_mask = (0b1 << tx_data_pin) | (0b1 << rx_data_pin) | (0b11 << clock_pin_base);
-	pio_sm_set_pindirs_with_mask(pio, sm, pin_mask, pin_mask);
+	uint32_t pin_dirs = (0b1 << tx_data_pin) | (0b11 << clock_pin_base);
+	pio_sm_set_pindirs_with_mask(pio, sm, pin_dirs, pin_mask);
 	pio_sm_set_pins(pio, sm, 0); // clear pins
 
 	update_pio_frequency(dev, i2s_controller_bidirectional_cycles_factor);
@@ -267,7 +290,18 @@ static void pio_i2s_controller_start(const struct device *dev)
 
 	pio_sm_exec(pio, sm, pio_encode_set(pio_x, channel_length - 2));
 	pio_sm_exec(pio, sm, pio_encode_set(pio_y, channel_length - 2));
+	pio_sm_exec(pio, sm, pio_encode_jmp(dev_data->offset));
 	pio_sm_set_enabled(pio, sm, true);
+}
+
+static void pio_i2s_controller_stop(const struct device *dev)
+{
+	const struct pio_i2s_config *dev_config = dev->config;
+	struct pio_i2s_data *dev_data = dev->data;
+	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
+	uint32_t sm = dev_data->sm;
+
+	pio_sm_set_enabled(pio, sm, false);
 }
 
 static int setup_stream(const struct device *dev, enum i2s_dir dir,
@@ -479,16 +513,29 @@ void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	// TODO: combine the two if statements together?
 	if(stream->state == I2S_STATE_STOPPING && stream->tx_stop_for_drain) {
 		// TODO: dma_stop seems useless?!
-		dma_stop(stream->dev_dma, stream->dma_channel);
+		retval = dma_stop(stream->dev_dma, stream->dma_channel);
+		if(retval < 0) {
+			stream->state = I2S_STATE_ERROR;
+			return;
+		}
 		stream->state = I2S_STATE_READY;
 		return;
 	}
 
 	// I2S_TRIGGER_DRAIN
 	if(stream->state == I2S_STATE_STOPPING && queue_is_empty(stream->msgq)) {
+		retval = dma_stop(stream->dev_dma, stream->dma_channel);
+		if(retval < 0) {
+			stream->state = I2S_STATE_ERROR;
+			return;
+		}
 		stream->state = I2S_STATE_READY;
+		if(!(data->rx.state == I2S_STATE_STOPPING || data->rx.state == I2S_STATE_RUNNING)) {
+			pio_i2s_controller_stop(dev);
+		}
 		return;
 	}
+
 
 	struct queue_item item;
 	size_t mem_block_size;
@@ -516,7 +563,75 @@ void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 
 void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 				      int status) {
-	// do stuff
+	const struct device *dev = (const struct device *)arg;
+	const struct pio_i2s_config *dev_config = dev->config;
+	struct pio_i2s_data *dev_data = dev->data;
+	uint dma_channel = dev_data->rx.dma_channel;
+	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
+	// TODO: Use a spinlock here?
+
+	int retval;
+
+	struct stream *stream = &dev_data->rx;
+
+	if (status < 0) {
+		LOG_ERR("Something went wrong with DMA. status=%d", status);
+		stream->state = I2S_STATE_ERROR;
+		return; // TODO: abort DMA?
+	}
+
+	if (stream->state == I2S_STATE_ERROR) {
+		return;
+	}
+
+	void *mblk_tmp = stream->mem_block;
+
+	/* Prepare to receive the next data block */
+	retval = k_mem_slab_alloc(stream->cfg.mem_slab, &stream->mem_block,
+			       K_NO_WAIT);
+	if (retval < 0) {
+		stream->state = I2S_STATE_ERROR;
+		return;
+	}
+
+
+	// struct queue_item item;
+	// size_t mem_block_size;
+	// int ret = k_msgq_get(stream->msgq, &item, SYS_TIMEOUT_MS(0));
+	struct queue_item item = {.mem_block = mblk_tmp, .size = stream->cfg.block_size};
+
+	retval = k_msgq_put(stream->msgq, &item, K_NO_WAIT);
+	if (retval < 0) {
+		LOG_ERR("RX overrun");
+		stream->state = I2S_STATE_ERROR;
+		return;
+	}
+
+	if(stream->state == I2S_STATE_STOPPING && dev_data->tx.state != I2S_STATE_STOPPING) {
+		retval = dma_stop(stream->dev_dma, stream->dma_channel);
+		if(retval < 0) {
+			stream->state = I2S_STATE_ERROR;
+			return;
+		}
+
+		pio_i2s_controller_stop(dev);
+		stream->state = I2S_STATE_READY;
+
+		return;
+	}
+
+	retval = reload_dma(stream->dev_dma, stream->dma_channel,
+			&stream->dma_cfg,
+			(void *)&pio->rxf[dev_data->sm],
+			stream->mem_block,
+			stream->cfg.block_size);
+
+	if (retval < 0) {
+		LOG_ERR("Failed to start RX DMA transfer: %d", retval);
+		stream->state = I2S_STATE_ERROR;
+		return;
+	}
+
 	return;
 }
 
@@ -533,38 +648,51 @@ static int pio_i2s_init(const struct device *dev)
 	}
 }
 
-// int i2s_start_rx_stream_dma(const struct device *dev, struct stream *stream) {
-// 	const struct pio_i2s_config *config = dev->config;
-// 	struct pio_i2s_data *data = dev->data;
-// 	PIO pio = pio_rpi_pico_get_pio(config->piodev);
+int i2s_start_rx_stream_dma(const struct device *dev, struct stream *stream) {
+	const struct pio_i2s_config *config = dev->config;
+	struct pio_i2s_data *data = dev->data;
+	PIO pio = pio_rpi_pico_get_pio(config->piodev);
 
-// 	// struct stream *stream = &data->tx;
+	// struct stream *stream = &data->tx;
+	int retval;
 
-// 	size_t mem_block_size;
-// 	struct queue_item item;
-// 	int ret = k_msgq_get(stream->msgq, &item, SYS_TIMEOUT_MS(0));
+	retval = k_mem_slab_alloc(stream->cfg.mem_slab, &stream->mem_block,
+			       K_NO_WAIT);
+	if (retval < 0) {
+		return retval;
+	}
 
-// 	if (ret < 0) {
-// 		LOG_ERR("TX buffer is empty.");
-// 		return ret;
-// 	}
 
-// 	stream->mem_block = item.mem_block;
-//     	mem_block_size = item.size;
+	// size_t mem_block_size;
+	// struct queue_item item;
+	// int ret = k_msgq_get(stream->msgq, &item, SYS_TIMEOUT_MS(0));
 
-// 	ret = start_dma(stream->dev_dma, stream->dma_channel,
-// 			&stream->dma_cfg,
-// 			stream->mem_block, true, /* TODO: scr addr increment setting? */
-// 			(void *)&pio->txf[data->sm],
-// 			false,
-// 			mem_block_size);
-// 	if (ret < 0) {
-// 		LOG_ERR("Failed to start TX DMA transfer: %d", ret);
-// 		return ret;
-// 	}
-// 	return 0;
+	// if (ret < 0) {
+	// 	LOG_ERR("TX buffer is empty.");
+	// 	return ret;
+	// }
 
-// }
+    	// mem_block_size = item.size;
+	retval = start_dma(stream->dev_dma, stream->dma_channel,
+			&stream->dma_cfg,
+			(void *)&pio->rxf[data->sm],
+			false, stream->mem_block,
+			true, stream->cfg.block_size
+	);
+
+	// ret = start_dma(stream->dev_dma, stream->dma_channel,
+	// 		&stream->dma_cfg,
+	// 		stream->mem_block, true, /* TODO: scr addr increment setting? */
+	// 		(void *)&pio->txf[data->sm],
+	// 		false,
+	// 		mem_block_size);
+	if (retval < 0) {
+		LOG_ERR("Failed to start RX DMA transfer: %d", retval);
+		return retval;
+	}
+	return 0;
+
+}
 
 int i2s_start_stream_dma(const struct device *dev, struct stream *stream) {
 	const struct pio_i2s_config *config = dev->config;
@@ -606,7 +734,7 @@ static int i2s_start_stream_tx(const struct device *dev, struct stream *stream) 
 		return -EIO;
 	}
 	stream->tx_stop_for_drain = false;
-        int retval = i2s_start_stream_dma(dev, stream);
+	int retval = i2s_start_stream_dma(dev, stream);
 	if (retval < 0) {
 		LOG_ERR("START trigger failed %d", retval);
 		return retval;
@@ -616,22 +744,22 @@ static int i2s_start_stream_tx(const struct device *dev, struct stream *stream) 
 	return 0;
 }
 
-// static int i2s_start_stream_rx(const struct device *dev, struct stream *stream) {
-// 	if (stream->state != I2S_STATE_READY) {
-// 		LOG_ERR("START trigger: invalid state %d",
-// 			    stream->state);
-// 		return -EIO;
-// 	}
+static int i2s_start_stream_rx(const struct device *dev, struct stream *stream) {
+	if (stream->state != I2S_STATE_READY) {
+		LOG_ERR("START trigger: invalid state %d",
+			    stream->state);
+		return -EIO;
+	}
 
-//         int retval = i2s_start_rx_stream_dma(dev, stream);
-// 	if (retval < 0) {
-// 		LOG_ERR("START trigger failed %d", retval);
-// 		return retval;
-// 	}
-// 	// pio_i2s_controller_start(dev);
-// 	stream->state = I2S_STATE_RUNNING;
-// 	return 0;
-// }
+        int retval = i2s_start_rx_stream_dma(dev, stream);
+	if (retval < 0) {
+		LOG_ERR("START trigger failed %d", retval);
+		return retval;
+	}
+	// pio_i2s_controller_start(dev);
+	stream->state = I2S_STATE_RUNNING;
+	return 0;
+}
 
 static int i2s_stop_stream(const struct device *dev, struct stream *stream) {
 	k_spinlock_key_t key = k_spin_lock(&stream->lock);
@@ -703,6 +831,12 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 				return ret;
 			}
 		}
+		if (is_dir_rx) {
+			ret = i2s_start_stream_rx(dev, stream_rx);
+			if (ret < 0) {
+				return ret;
+			}
+		}
 		// TODO: make i2s start stream rx
 		// if (is_dir_rx) {
 		// 	ret = i2s_start_stream(dev, stream_rx);
@@ -717,11 +851,17 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 		if(is_dir_tx) {
 			i2s_stop_stream(dev, stream_tx);
 		}
+		if(is_dir_rx) {
+			i2s_stop_stream(dev, stream_rx);
+		}
 		break;
 	case I2S_TRIGGER_DRAIN:
 		//TODO: what if queue already empty?
 		if(is_dir_tx) {
 			i2s_drain_stream(dev, stream_tx);
+		}
+		if(is_dir_rx) {
+			i2s_drain_stream(dev, stream_rx);
 		}
 		break;
 	case I2S_TRIGGER_PREPARE:
@@ -762,7 +902,7 @@ static const struct i2s_config *i2s_rpi_pico_config_get(const struct device *dev
 static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 	.configure = i2s_rpi_pico_configure,
 	.config_get = i2s_rpi_pico_config_get,
-	.read = NULL,
+	.read = i2s_rpi_pico_read,
 	.write = i2s_rpi_pico_write,
 	.trigger = i2s_rpi_pico_trigger,
 };
