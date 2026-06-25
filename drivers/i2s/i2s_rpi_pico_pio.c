@@ -252,45 +252,72 @@ static void pio_i2s_controller_start(const struct device *dev)
 	pio_sm_set_enabled(pio, sm, true);
 }
 
-static void pio_i2s_controller_stop(const struct device *dev)
-{
-	const struct pio_i2s_config *dev_config = dev->config;
-	struct pio_i2s_data *dev_data = dev->data;
-	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
-	uint32_t sm = dev_data->sm;
-
-	pio_sm_set_enabled(pio, sm, false);
-}
-
-static void setup_stream(const struct device *dev, enum i2s_dir dir,
-			    const struct i2s_config *i2s_cfg) {
-
-	struct pio_i2s_config *dev_config = dev->config;
-	struct pio_i2s_data *dev_data = dev->data;
-	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
-	uint32_t sm = dev_data->sm;
-
-	__ASSERT_NO_MSG(dir == I2S_DIR_TX || dir == I2S_DIR_RX);
-
-	bool dir_is_tx = dir == I2S_DIR_TX;
-	struct stream *stream = dir_is_tx ? &dev_data->tx : &dev_data->rx;
-
-	stream->dma_cfg.user_data = (void*) dev;
-	stream->dma_cfg.dma_slot = RPI_PICO_DMA_DREQ_TO_SLOT(pio_get_dreq(pio, sm, dir_is_tx));
-	memcpy(&stream->cfg, i2s_cfg, sizeof(struct i2s_config));
-}
-
 static void drop_queue(struct stream *stream) {
 	struct queue_item item;
 	while (k_msgq_get(stream->msgq, &item, K_NO_WAIT) == 0) {
 		k_mem_slab_free(stream->cfg.mem_slab, item.mem_block);
 	}
 }
-// static int i2s_rpi_pico_configure_single(const struct device *dev, enum i2s_dir dir,
-// 			       const struct i2s_config *i2s_cfg)
-// {
 
-// }
+// TODO: make stream->state a per-device
+static int i2s_rpi_pico_configure_single(const struct device *dev, enum i2s_dir dir,
+			       const struct i2s_config *i2s_cfg)
+{
+	const struct pio_i2s_config *dev_config = dev->config;
+	struct pio_i2s_data *dev_data = dev->data;
+	int retval;
+
+	__ASSERT_NO_MSG(dir == I2S_DIR_RX || dir == I2S_DIR_TX);
+
+	struct stream *stream = dir == I2S_DIR_RX ? &dev_data->rx : &dev_data->tx;
+
+	if (stream->state != I2S_STATE_NOT_READY && stream->state != I2S_STATE_READY) {
+		LOG_ERR("stream in invalid state (%d)", stream->state);
+		return -EINVAL;
+	}
+
+	if (i2s_cfg->frame_clk_freq == 0U) {
+		memset(&stream->cfg, 0, sizeof(struct i2s_config));
+		drop_queue(stream);
+		stream->state = I2S_STATE_NOT_READY;
+		return 0;
+	}
+
+	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
+
+	size_t sm;
+	if(!dev_data->sm_allocated) {
+		retval = pio_rpi_pico_allocate_sm(dev_config->piodev, &sm);
+
+		if (retval < 0) {
+			LOG_ERR("pio_rpi_pico_allocate_sm failed with ret = %d", retval);
+			return retval;
+		}
+		dev_data->sm = sm;
+		dev_data->sm_allocated = true;
+	} else {
+		sm = dev_data->sm;
+	}
+
+	stream->dma_cfg.user_data = (void*) dev;
+	stream->dma_cfg.dma_slot = RPI_PICO_DMA_DREQ_TO_SLOT(pio_get_dreq(pio, sm, dir == I2S_DIR_TX));
+	memcpy(&stream->cfg, i2s_cfg, sizeof(struct i2s_config));
+
+	if (dev_data->loaded_program != NULL) {
+		pio_remove_program(pio, dev_data->loaded_program, dev_data->offset);
+	}
+
+	retval = pio_i2s_controller_setup(dev);
+
+	if (retval < 0) {
+		return retval;
+	}
+
+	stream->state = I2S_STATE_READY;
+
+	return 0;
+
+}
 
 // TODO: Verify that sampling frequency is the same between tx and rx.
 static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
@@ -336,75 +363,20 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 	}
 
 	if (dir == I2S_DIR_RX || dir == I2S_DIR_BOTH) {
-		if (dev_data->rx.state != I2S_STATE_NOT_READY &&
-		    dev_data->rx.state != I2S_STATE_READY) {
-			LOG_ERR("stream in invalid state (%d)", dev_data->rx.state);
-			return -EINVAL;
-		}
-	}
-
-	if (dir == I2S_DIR_TX || dir == I2S_DIR_BOTH) {
-		if (dev_data->tx.state != I2S_STATE_NOT_READY &&
-		    dev_data->tx.state != I2S_STATE_READY) {
-			LOG_ERR("stream in invalid state (%d)", dev_data->tx.state);
-			return -EINVAL;
-		}
-	}
-
-	if (i2s_cfg->frame_clk_freq == 0U) {
-		if (dir == I2S_DIR_RX || dir == I2S_DIR_BOTH) {
-			memset(&dev_data->rx.cfg, 0, sizeof(struct i2s_config));
-			drop_queue(&dev_data->rx);
-			dev_data->rx.state = I2S_STATE_NOT_READY;
-		}
-
-		if (dir == I2S_DIR_TX || dir == I2S_DIR_BOTH) {
-			memset(&dev_data->rx.cfg, 0, sizeof(struct i2s_config));
-			drop_queue(&dev_data->tx);
-			dev_data->tx.state = I2S_STATE_NOT_READY;
-		}
-		return 0;
-	}
-
-	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
-
-	size_t sm;
-	if(!dev_data->sm_allocated) {
-		retval = pio_rpi_pico_allocate_sm(dev_config->piodev, &sm);
-
-		if (retval < 0) {
-			LOG_ERR("pio_rpi_pico_allocate_sm failed with ret = %d", retval);
+		retval = i2s_rpi_pico_configure_single(dev, I2S_DIR_RX, i2s_cfg);
+		if(retval < 0) {
 			return retval;
 		}
-		dev_data->sm = sm;
-		dev_data->sm_allocated = true;
-	} else {
-		sm = dev_data->sm;
 	}
 
-	if (dir == I2S_DIR_RX || dir == I2S_DIR_BOTH) {
-		setup_stream(dev, I2S_DIR_RX, i2s_cfg);
-	}
 	if (dir == I2S_DIR_TX || dir == I2S_DIR_BOTH) {
-		setup_stream(dev, I2S_DIR_TX, i2s_cfg);
+		retval = i2s_rpi_pico_configure_single(dev, I2S_DIR_TX, i2s_cfg);
+		if(retval < 0) {
+			return retval;
+		}
 	}
 
-	if (dev_data->loaded_program != NULL) {
-		pio_remove_program(pio, dev_data->loaded_program, dev_data->offset);
-	}
-
-	retval = pio_i2s_controller_setup(dev);
-
-	if (retval < 0) {
-		return retval;
-	}
-
-	if (dir == I2S_DIR_RX || dir == I2S_DIR_BOTH) {
-		dev_data->rx.state = I2S_STATE_READY;
-	}
-	if (dir == I2S_DIR_TX || dir == I2S_DIR_BOTH) {
-		dev_data->tx.state = I2S_STATE_READY;
-	}
+	pio_i2s_controller_start(dev);
 
 	return 0;
 }
@@ -517,9 +489,6 @@ void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 			return;
 		}
 		stream->state = I2S_STATE_READY;
-		if(!(data->rx.state == I2S_STATE_STOPPING || data->rx.state == I2S_STATE_RUNNING)) {
-			pio_i2s_controller_stop(dev);
-		}
 		return;
 	}
 
@@ -601,7 +570,6 @@ void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 			return;
 		}
 
-		pio_i2s_controller_stop(dev);
 		stream->state = I2S_STATE_READY;
 
 		return;
@@ -797,89 +765,75 @@ static int i2s_drain_prepare(const struct device *dev, struct stream *stream) {
 	return 0;
 }
 
-
-static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
+static int i2s_rpi_pico_trigger_single(const struct device *dev, enum i2s_dir dir,
 			     enum i2s_trigger_cmd cmd)
 {
 	const struct pio_i2s_config *dev_config = dev->config;
 	struct pio_i2s_data *dev_data = dev->data;
 	int ret;
 
-	// struct stream *stream = &data->tx;
-	struct stream *stream_tx = &dev_data->tx;
-	struct stream *stream_rx = &dev_data->rx;
+	__ASSERT_NO_MSG(dir == I2S_DIR_RX || dir == I2S_DIR_TX);
 
-	bool is_dir_tx = dir == I2S_DIR_TX || dir == I2S_DIR_BOTH;
-	bool is_dir_rx = dir == I2S_DIR_RX || dir == I2S_DIR_BOTH;
+	struct stream *stream = dir == I2S_DIR_RX ? &dev_data->rx : &dev_data->tx;
 
-	// TODO: Maybe refactor this to avoid so much code duplication with taking locks
 	switch (cmd) {
 	case I2S_TRIGGER_START:
-		if (is_dir_tx) {
-			if(stream_tx->state != I2S_STATE_READY) {
-				LOG_ERR("Stream state must be in ready state to start stream.");
-				return -EINVAL; // TODO: correct error code?
-			}
-			ret = i2s_start_stream_tx(dev, stream_tx);
-			if (ret < 0) {
-				return ret;
-			}
+		if(stream->state != I2S_STATE_READY) {
+			LOG_ERR("Stream state must be in ready state to start stream.");
+			return -EINVAL; // TODO: correct error code?
 		}
-		if (is_dir_rx) {
-			if(stream_rx->state != I2S_STATE_READY) {
-				LOG_ERR("Stream state must be in ready state to start stream.");
-				return -EINVAL; // TODO: correct error code?
-			}
-			ret = i2s_start_stream_rx(dev, stream_rx);
-			if (ret < 0) {
-				return ret;
-			}
+
+		//TODO: inline these functions a bit
+		if (dir == I2S_DIR_TX) {
+			ret = i2s_start_stream_tx(dev, stream);
+		} else {
+			ret = i2s_start_stream_rx(dev, stream);
 		}
-		// TODO: make i2s start stream rx
-		// if (is_dir_rx) {
-		// 	ret = i2s_start_stream(dev, stream_rx);
-		// 	if (ret < 0) {
-		// 		return ret;
-		// 	}
-		// }
-		pio_i2s_controller_start(dev);
+		if (ret < 0) {
+			return ret;
+		}
 		break;
 	case I2S_TRIGGER_STOP:
 		//TODO: what if DMA is not running?
-		if(is_dir_tx) {
-			i2s_stop_stream(dev, stream_tx);
-		}
-		if(is_dir_rx) {
-			i2s_stop_stream(dev, stream_rx);
-		}
+		i2s_stop_stream(dev, stream);
 		break;
 	case I2S_TRIGGER_DRAIN:
 		//TODO: what if queue already empty?
-		if(is_dir_tx) {
-			i2s_drain_stream(dev, stream_tx);
-		}
-		if(is_dir_rx) {
-			i2s_drain_stream(dev, stream_rx);
-		}
+		i2s_drain_stream(dev, stream);
 		break;
 	case I2S_TRIGGER_DROP:
-		if(is_dir_tx) {
-			i2s_drop_stream(dev, stream_tx);
-		}
-		if(is_dir_rx) {
-			i2s_drop_stream(dev, stream_rx);
-		}
+		i2s_drop_stream(dev, stream);
 		break;
 	case I2S_TRIGGER_PREPARE:
-		if(is_dir_tx) {
-			i2s_drain_prepare(dev, stream_tx);
-		}
+		i2s_drain_prepare(dev, stream);
 		break;
 
 	default:
         //TODO: Handle all other trigger commands
 		LOG_ERR("Unsupported trigger command");
 		return -EINVAL;
+	}
+}
+
+static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
+			     enum i2s_trigger_cmd cmd)
+{
+	const struct pio_i2s_config *dev_config = dev->config;
+	struct pio_i2s_data *dev_data = dev->data;
+	int retval;
+
+	if (dir == I2S_DIR_RX || dir == I2S_DIR_BOTH) {
+		retval = i2s_rpi_pico_trigger_single(dev, I2S_DIR_RX, cmd);
+		if(retval < 0) {
+			return retval;
+		}
+	}
+
+	if (dir == I2S_DIR_TX || dir == I2S_DIR_BOTH) {
+		retval = i2s_rpi_pico_trigger_single(dev, I2S_DIR_TX, cmd);
+		if(retval < 0) {
+			return retval;
+		}
 	}
 
 	return 0;
