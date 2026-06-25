@@ -77,6 +77,7 @@ struct pio_i2s_data {
     struct stream rx;
     uint8_t sm;
     uint32_t offset;
+    uint32_t entry_point;
 };
 
 /* For words greater than 16-bit the channel length is considered 32-bit */
@@ -185,7 +186,8 @@ RPI_PICO_PIO_DEFINE_PROGRAM(i2s_controller_tx, 0, 7,
 	0x7001, //  7: out    pins, 1         side 2
                 //     .wrap
 );
-#define i2s_controller_tx_cycles_factor 2u
+static const uint32_t i2s_controller_tx_cycles_factor = 2u;
+static const uint32_t i2s_controller_tx_entry_point = 0;
 
 static int pio_i2s_controller_tx_setup(const struct device *dev)
 {
@@ -203,6 +205,7 @@ static int pio_i2s_controller_tx_setup(const struct device *dev)
 	}
 
 	dev_data->offset = pio_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(i2s_controller_tx));
+	dev_data->entry_point = i2s_controller_tx_entry_point;
 	sm_config = pio_get_default_sm_config();
 	sm_config_set_wrap(&sm_config, dev_data->offset + i2s_controller_tx_wrap_target, dev_data->offset + i2s_controller_tx_wrap);
 	sm_config_set_sideset(&sm_config, 2, false, false);
@@ -242,7 +245,8 @@ RPI_PICO_PIO_DEFINE_PROGRAM(i2s_controller_bidirectional, 0, 15,
 	        //     .wrap
 );
 
-#define i2s_controller_bidirectional_cycles_factor 4u
+static const uint32_t i2s_controller_bidirectional_cycles_factor = 4u;
+static const uint32_t i2s_controller_bidirectional_entry_point = 1;
 
 static int pio_i2s_controller_bidirectional_setup(const struct device *dev)
 {
@@ -261,6 +265,7 @@ static int pio_i2s_controller_bidirectional_setup(const struct device *dev)
 	}
 
 	dev_data->offset = pio_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(i2s_controller_bidirectional));
+	dev_data->entry_point = i2s_controller_bidirectional_entry_point;
 	sm_config = pio_get_default_sm_config();
 	sm_config_set_wrap(&sm_config, dev_data->offset + i2s_controller_bidirectional_wrap_target, dev_data->offset + i2s_controller_bidirectional_wrap);
 	sm_config_set_in_pins(&sm_config, rx_data_pin);
@@ -295,7 +300,7 @@ static void pio_i2s_controller_start(const struct device *dev)
 	// if (dir == I2S_DIR_BOTH) {
 	// 	// pio_sm_exec(pio, sm, pio_encode_set(pio_y, channel_length - 2));
 	// }
-	pio_sm_exec(pio, sm, pio_encode_jmp(dev_data->offset + 1));
+	pio_sm_exec(pio, sm, pio_encode_jmp(dev_data->offset + dev_data->entry_point));
 	pio_sm_set_enabled(pio, sm, true);
 }
 
