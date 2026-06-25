@@ -223,7 +223,7 @@ static int pio_i2s_controller_tx_setup(const struct device *dev)
 // TODO: Convert nops to delays
 RPI_PICO_PIO_DEFINE_PROGRAM(i2s_controller_bidirectional, 0, 15,
 		//     .wrap_target
-	0x5801, //  0: in     pins, 1         side 3 // Im pretty sure this `in` instruction is off-by-one and should be adjusted with some kind of autopush
+	0x5801, //  0: in     pins, 1         side 3
 	0xb842, //  1: nop                    side 3
 	0x7001, //  2: out    pins, 1         side 2
 	0x1040, //  3: jmp    x--, 0          side 2
@@ -279,7 +279,7 @@ static int pio_i2s_controller_bidirectional_setup(const struct device *dev)
 
 	return 0;
 }
-
+// , enum i2s_dir dir
 static void pio_i2s_controller_start(const struct device *dev)
 {
 	const struct pio_i2s_config *dev_config = dev->config;
@@ -288,9 +288,14 @@ static void pio_i2s_controller_start(const struct device *dev)
 	uint32_t sm = dev_data->sm;
 	uint32_t channel_length = pio_i2s_channel_length(dev_data);
 
+	pio_sm_set_enabled(pio, sm, false);
 	pio_sm_exec(pio, sm, pio_encode_set(pio_x, channel_length - 2));
 	pio_sm_exec(pio, sm, pio_encode_set(pio_y, channel_length - 2));
-	pio_sm_exec(pio, sm, pio_encode_jmp(dev_data->offset));
+
+	// if (dir == I2S_DIR_BOTH) {
+	// 	// pio_sm_exec(pio, sm, pio_encode_set(pio_y, channel_length - 2));
+	// }
+	pio_sm_exec(pio, sm, pio_encode_jmp(dev_data->offset + 1));
 	pio_sm_set_enabled(pio, sm, true);
 }
 
