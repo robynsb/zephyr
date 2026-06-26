@@ -178,14 +178,12 @@ static const uint32_t i2s_controller_cycles_factor = 6u;
 static const uint32_t i2s_controller_entry_point = 0;
 
 // TODO: check volume with padded stuff
-static int pio_i2s_controller_setup(const struct device *dev)
+static int pio_i2s_controller_setup(const struct device *dev, enum i2s_dir dir)
 {
 	const struct pio_i2s_config *dev_config = dev->config;
 	struct pio_i2s_data *dev_data = dev->data;
 	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
 	uint32_t sm = dev_data->sm;
-	uint32_t rx_data_pin = dev_data->rx.data_pin;
-	uint32_t tx_data_pin = dev_data->tx.data_pin;
 	uint32_t channel_length = dev_data->channel_length;
 	uint32_t clock_pin_base = dev_config->clock_pin_base;
 	pio_sm_config sm_config;
@@ -199,17 +197,41 @@ static int pio_i2s_controller_setup(const struct device *dev)
 	dev_data->loaded_program = RPI_PICO_PIO_GET_PROGRAM(i2s_controller);
 	sm_config = pio_get_default_sm_config();
 	sm_config_set_wrap(&sm_config, dev_data->offset + i2s_controller_wrap_target, dev_data->offset + i2s_controller_wrap);
-	sm_config_set_in_pins(&sm_config, rx_data_pin);
-	sm_config_set_in_pin_count(&sm_config, 1);
-	sm_config_set_out_pins(&sm_config, tx_data_pin, 1);
+
+	bool setup_tx = dir == I2S_DIR_TX || dir == I2S_DIR_BOTH || dev_data->tx.state != I2S_STATE_NOT_READY;
+	bool setup_rx = dir == I2S_DIR_RX || dir == I2S_DIR_BOTH || dev_data->tx.state != I2S_STATE_NOT_READY;
+
+	uint32_t rx_data_pin = dev_data->rx.data_pin;
+	uint32_t tx_data_pin = dev_data->tx.data_pin;
+
+	if(setup_tx) {
+		sm_config_set_out_pins(&sm_config, tx_data_pin, 1);
+	}
+	if(setup_rx) {
+		sm_config_set_in_pins(&sm_config, rx_data_pin);
+		sm_config_set_in_pin_count(&sm_config, 1);
+	}
+
 	/* set pull threshold to channel_length-1 so that `jmp !osre` doesn't jump before the LSB. */
 	sm_config_set_out_shift(&sm_config, false, false, channel_length-1);
 	sm_config_set_in_shift(&sm_config, false, false, channel_length-1);
 	sm_config_set_sideset_pin_base(&sm_config, clock_pin_base);
 	sm_config_set_sideset(&sm_config, 2, false, false);
 	pio_sm_init(pio, sm, dev_data->offset, &sm_config);
-	uint32_t pin_mask = (0b1 << tx_data_pin) | (0b1 << rx_data_pin) | (0b11 << clock_pin_base);
-	uint32_t pin_dirs = (0b1 << tx_data_pin) | (0b11 << clock_pin_base);
+
+	uint32_t pin_mask, pin_dirs;
+
+	if (setup_tx && setup_rx) {
+		pin_mask = (0b1 << tx_data_pin) | (0b1 << rx_data_pin) | (0b11 << clock_pin_base);
+		pin_dirs = (0b1 << tx_data_pin) | (0b11 << clock_pin_base);
+	} else if(setup_tx) {
+		pin_mask = (0b1 << tx_data_pin) | (0b11 << clock_pin_base);
+		pin_dirs = (0b1 << tx_data_pin) | (0b11 << clock_pin_base);
+	} else {
+		pin_mask = (0b1 << rx_data_pin) | (0b11 << clock_pin_base);
+		pin_dirs = (0b11 << clock_pin_base);
+
+	}
 	pio_sm_set_pindirs_with_mask(pio, sm, pin_dirs, pin_mask);
 	pio_sm_set_pins(pio, sm, 0); // clear pins
 
@@ -312,7 +334,7 @@ static int i2s_rpi_pico_configure_single(const struct device *dev, enum i2s_dir 
 		pio_remove_program(pio, dev_data->loaded_program, dev_data->offset);
 	}
 
-	retval = pio_i2s_controller_setup(dev);
+	retval = pio_i2s_controller_setup(dev, dir);
 
 	if (retval < 0) {
 		return retval;
