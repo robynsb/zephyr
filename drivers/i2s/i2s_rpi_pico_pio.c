@@ -80,7 +80,7 @@ struct pio_i2s_data {
     bool sm_allocated;
     uint32_t offset;
     uint32_t entry_point;
-    pio_program_t *loaded_program;
+    const pio_program_t *loaded_program;
 };
 
 
@@ -103,7 +103,8 @@ struct pio_i2s_data {
 
 static int i2s_rpi_pico_write(const struct device *dev, void *mem_block, size_t size)
 {
-	const struct pio_i2s_config *config = dev->config;
+	LOG_ERR("i2s_rpi_pico_write mem_block size=%d", size);
+	// const struct pio_i2s_config *config = dev->config;
 	struct pio_i2s_data *data = dev->data;
 	const struct stream *stream = &data->tx;
 	enum i2s_state state = stream->state;
@@ -133,7 +134,7 @@ static int i2s_rpi_pico_write(const struct device *dev, void *mem_block, size_t 
 
 static int i2s_rpi_pico_read(const struct device *dev, void **mem_block, size_t *size)
 {
-	const struct pio_i2s_config *dev_config = dev->config;
+	// const struct pio_i2s_config *dev_config = dev->config;
 	struct pio_i2s_data *dev_data = dev->data;
 	const struct stream *stream = &dev_data->rx;
 	enum i2s_state state = stream->state;
@@ -358,9 +359,10 @@ static int i2s_rpi_pico_configure_single(const struct device *dev, enum i2s_dir 
 static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 			       const struct i2s_config *i2s_cfg)
 {
-	const struct pio_i2s_config *dev_config = dev->config;
-	struct pio_i2s_data *dev_data = dev->data;
+	// const struct pio_i2s_config *dev_config = dev->config;
+	// struct pio_i2s_data *dev_data = dev->data;
 	int retval;
+	LOG_ERR("i2s_rpi_pico_configure");
 
 	uint8_t data_format = i2s_cfg->format & I2S_FMT_DATA_FORMAT_MASK;
 
@@ -485,7 +487,7 @@ void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	const struct device *dev = (const struct device *)arg;
 	const struct pio_i2s_config *config = dev->config;
 	struct pio_i2s_data *data = dev->data;
-	uint dma_channel = data->tx.dma_channel;
+	// uint dma_channel = data->tx.dma_channel;
 	PIO pio = pio_rpi_pico_get_pio(config->piodev);
 	// TODO: Use a spinlock here?
 
@@ -557,7 +559,7 @@ void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	const struct device *dev = (const struct device *)arg;
 	const struct pio_i2s_config *dev_config = dev->config;
 	struct pio_i2s_data *dev_data = dev->data;
-	uint dma_channel = dev_data->rx.dma_channel;
+	// uint dma_channel = dev_data->rx.dma_channel;
 	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
 	// TODO: Use a spinlock here?
 
@@ -628,7 +630,7 @@ void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 static int pio_i2s_init(const struct device *dev)
 {
 	const struct pio_i2s_config *dev_config = dev->config;
-	struct pio_i2s_data *dev_data = dev->data;
+	// struct pio_i2s_data *dev_data = dev->data;
 	int retval;
 
 	retval = pinctrl_apply_state(dev_config->pcfg, PINCTRL_STATE_DEFAULT);
@@ -803,7 +805,8 @@ static int i2s_drain_prepare(const struct device *dev, struct stream *stream) {
 static int i2s_rpi_pico_trigger_single(const struct device *dev, enum i2s_dir dir,
 			     enum i2s_trigger_cmd cmd)
 {
-	const struct pio_i2s_config *dev_config = dev->config;
+	LOG_ERR("i2s_rpi_pico_trigger_single dir=%d cmd=%d", dir, cmd);
+	// const struct pio_i2s_config *dev_config = dev->config;
 	struct pio_i2s_data *dev_data = dev->data;
 	int ret;
 
@@ -827,6 +830,7 @@ static int i2s_rpi_pico_trigger_single(const struct device *dev, enum i2s_dir di
 		if (ret < 0) {
 			return ret;
 		}
+		LOG_ERR("i2s_rpi_pico_trigger_single dir=%d started successfully", dir);
 		break;
 	case I2S_TRIGGER_STOP:
 		//TODO: what if DMA is not running?
@@ -854,8 +858,8 @@ static int i2s_rpi_pico_trigger_single(const struct device *dev, enum i2s_dir di
 static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 			     enum i2s_trigger_cmd cmd)
 {
-	const struct pio_i2s_config *dev_config = dev->config;
-	struct pio_i2s_data *dev_data = dev->data;
+	// const struct pio_i2s_config *dev_config = dev->config;
+	// struct pio_i2s_data *dev_data = dev->data;
 	int retval;
 
 	if (dir == I2S_DIR_RX || dir == I2S_DIR_BOTH) {
