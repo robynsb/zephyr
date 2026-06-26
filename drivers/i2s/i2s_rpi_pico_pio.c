@@ -65,7 +65,7 @@ struct stream {
 	struct dma_config dma_cfg;
 	struct k_spinlock lock;
 
-	struct i2s_config cfg;
+	struct i2s_config cfg; // TODO: move config to data struct.
 	void *mem_block;
 
 	const uint32_t data_pin;
@@ -200,13 +200,19 @@ static int pio_i2s_controller_setup(const struct device *dev, enum i2s_dir dir)
 
 	bool setup_tx = dir == I2S_DIR_TX || dir == I2S_DIR_BOTH || dev_data->tx.state != I2S_STATE_NOT_READY;
 	bool setup_rx = dir == I2S_DIR_RX || dir == I2S_DIR_BOTH || dev_data->tx.state != I2S_STATE_NOT_READY;
+	bool en_loopback = (setup_rx && dev_data->rx.cfg.options & I2S_OPT_LOOPBACK) || (setup_tx && dev_data->tx.cfg.options & I2S_OPT_LOOPBACK);
 
 	uint32_t rx_data_pin = dev_data->rx.data_pin;
 	uint32_t tx_data_pin = dev_data->tx.data_pin;
 
+	if(en_loopback) {
+		tx_data_pin = rx_data_pin;
+	}
+
 	if(setup_tx) {
 		sm_config_set_out_pins(&sm_config, tx_data_pin, 1);
 	}
+
 	if(setup_rx) {
 		sm_config_set_in_pins(&sm_config, rx_data_pin);
 		sm_config_set_in_pin_count(&sm_config, 1);
@@ -220,6 +226,7 @@ static int pio_i2s_controller_setup(const struct device *dev, enum i2s_dir dir)
 	pio_sm_init(pio, sm, dev_data->offset, &sm_config);
 
 	uint32_t pin_mask, pin_dirs;
+
 
 	if (setup_tx && setup_rx) {
 		pin_mask = (0b1 << tx_data_pin) | (0b1 << rx_data_pin) | (0b11 << clock_pin_base);
@@ -375,10 +382,10 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 		return -EINVAL;
 	}
 
-	if (i2s_cfg->options & I2S_OPT_LOOPBACK) {
-		LOG_ERR("I2S loopback mode unsupported.");
-		return -EINVAL;
-	}
+	// if (i2s_cfg->options & I2S_OPT_LOOPBACK) {
+	// 	LOG_ERR("I2S loopback mode unsupported.");
+	// 	return -EINVAL;
+	// }
 
 	if (i2s_cfg->options & I2S_OPT_PINGPONG) {
 		LOG_ERR("I2S_OPT_PINGPONG is unsupported.");
