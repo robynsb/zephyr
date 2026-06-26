@@ -74,6 +74,8 @@ struct stream {
 struct pio_i2s_data {
     struct stream tx;
     struct stream rx;
+    uint32_t channel_length;
+    uint32_t sampling_freq;
     uint8_t sm;
     bool sm_allocated;
     uint32_t offset;
@@ -81,7 +83,6 @@ struct pio_i2s_data {
     pio_program_t *loaded_program;
 };
 
-const uint32_t channel_length = 32;
 
 // TODO: Think about integers.
 /*
@@ -98,24 +99,7 @@ const uint32_t channel_length = 32;
  *
  * => k * f_b = f_sys / divider
  * => divider = f_sys / (k * f_b) = f_sys/(k * f_s * channel_length * num_channels)
-
  */
-void update_pio_frequency(const struct device *dev, uint32_t cycles_factor) {
-    const struct pio_i2s_config *dev_config = dev->config;
-    struct pio_i2s_data *dev_data = dev->data;
-    PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
-    uint32_t sm = dev_data->sm;
-    uint32_t sample_freq = dev_data->tx.cfg.frame_clk_freq;
-    /* Number of channels is always 2 for I2S data format */
-    const uint32_t num_channels = 2;
-    uint64_t system_clock_frequency = clock_get_hz(clk_sys);
-    /* 8.8 fixed-point divider: (f_sys << 8) / (2 * f_s * channel_length * num_channels) */
-    uint64_t divider = (system_clock_frequency << 8u) /
-		       (cycles_factor * sample_freq * channel_length * num_channels);
-    assert(divider < 0x1000000); // TODO: These errors should be handled better
-    pio_sm_set_clkdiv_int_frac(pio, sm, divider >> 8u, divider & 0xffu);
-}
-
 
 static int i2s_rpi_pico_write(const struct device *dev, void *mem_block, size_t size)
 {
@@ -202,6 +186,7 @@ static int pio_i2s_controller_setup(const struct device *dev)
 	uint32_t sm = dev_data->sm;
 	uint32_t rx_data_pin = dev_data->rx.data_pin;
 	uint32_t tx_data_pin = dev_data->tx.data_pin;
+	uint32_t channel_length = dev_data->channel_length;
 	uint32_t clock_pin_base = dev_config->clock_pin_base;
 	pio_sm_config sm_config;
 
@@ -228,7 +213,14 @@ static int pio_i2s_controller_setup(const struct device *dev)
 	pio_sm_set_pindirs_with_mask(pio, sm, pin_dirs, pin_mask);
 	pio_sm_set_pins(pio, sm, 0); // clear pins
 
-	update_pio_frequency(dev, i2s_controller_cycles_factor);
+	uint32_t sample_freq = dev_data->sampling_freq;
+	/* Number of channels is always 2 for I2S data format */
+	const uint32_t num_channels = 2;
+	uint64_t system_clock_frequency = sys_clock_hw_cycles_per_sec();
+	/* 8.8 fixed-point divider: (f_sys << 8) / (2 * f_s * channel_length * num_channels) */
+	uint64_t divider = (system_clock_frequency << 8u) /
+	(i2s_controller_cycles_factor * sample_freq * channel_length * num_channels);
+	pio_sm_set_clkdiv_int_frac(pio, sm, divider >> 8u, divider & 0xffu);
 
 	return 0;
 }
@@ -265,6 +257,7 @@ static int i2s_rpi_pico_configure_single(const struct device *dev, enum i2s_dir 
 	__ASSERT_NO_MSG(dir == I2S_DIR_RX || dir == I2S_DIR_TX);
 
 	struct stream *stream = dir == I2S_DIR_RX ? &dev_data->rx : &dev_data->tx;
+	struct stream *other_stream = dir == I2S_DIR_RX ? &dev_data->tx : &dev_data->rx;
 
 	if (stream->state != I2S_STATE_NOT_READY && stream->state != I2S_STATE_READY) {
 		LOG_ERR("stream in invalid state (%d)", stream->state);
@@ -277,6 +270,20 @@ static int i2s_rpi_pico_configure_single(const struct device *dev, enum i2s_dir 
 		stream->state = I2S_STATE_NOT_READY;
 		return 0;
 	}
+
+
+	if(other_stream->state != I2S_STATE_NOT_READY) {
+		if (i2s_cfg->frame_clk_freq != other_stream->cfg.frame_clk_freq) {
+			LOG_ERR("simultaneously configured streams have different frame_clk_freq (%d) (%d)", i2s_cfg->frame_clk_freq, other_stream->cfg.frame_clk_freq);
+			return -EINVAL;
+		}
+
+		if (i2s_cfg->word_size != other_stream->cfg.word_size) {
+			LOG_ERR("simultaneously configured streams have different word_size (%d) (%d)", i2s_cfg->word_size, other_stream->cfg.word_size);
+			return -EINVAL;
+		}
+	}
+
 
 	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
 
@@ -297,6 +304,9 @@ static int i2s_rpi_pico_configure_single(const struct device *dev, enum i2s_dir 
 	stream->dma_cfg.user_data = (void*) dev;
 	stream->dma_cfg.dma_slot = RPI_PICO_DMA_DREQ_TO_SLOT(pio_get_dreq(pio, sm, dir == I2S_DIR_TX));
 	memcpy(&stream->cfg, i2s_cfg, sizeof(struct i2s_config));
+
+	dev_data->channel_length = i2s_cfg->word_size > 16 ? 32 : 16;
+	dev_data->sampling_freq = i2s_cfg->frame_clk_freq;
 
 	if (dev_data->loaded_program != NULL) {
 		pio_remove_program(pio, dev_data->loaded_program, dev_data->offset);
