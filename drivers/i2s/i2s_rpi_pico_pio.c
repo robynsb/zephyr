@@ -887,7 +887,7 @@ static const struct i2s_config *i2s_rpi_pico_config_get(const struct device *dev
 	struct stream *stream = NULL;
 
 	if (dir == I2S_DIR_RX) {
-		stream = NULL;
+		stream = &dev_data->rx;
 	} else if (dir == I2S_DIR_TX) {
 		stream = &dev_data->tx;
 	}
