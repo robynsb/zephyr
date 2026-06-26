@@ -170,35 +170,30 @@ static int i2s_rpi_pico_read(const struct device *dev, void **mem_block, size_t 
 	return 0;
 }
 
-RPI_PICO_PIO_DEFINE_PROGRAM(i2s_controller, 0, 20,
-	//     .wrap_target
-	0xb842, //  0: nop                    side 3
-	0x7101, //  1: out    pins, 1         side 2 [1]
-	0x5801, //  2: in     pins, 1         side 3
-	0x1881, //  3: jmp    y--, 1          side 3
-	0x6001, //  4: out    pins, 1         side 0
-	0x8080, //  5: pull   noblock         side 0
-	0x4801, //  6: in     pins, 1         side 1
-	0x8800, //  7: push   noblock         side 1
-	0x6001, //  8: out    pins, 1         side 0
-	0xe05d, //  9: set    y, 29           side 0
-	0x4901, // 10: in     pins, 1         side 1 [1]
-	0x6101, // 11: out    pins, 1         side 0 [1]
-	0x4801, // 12: in     pins, 1         side 1
-	0x088b, // 13: jmp    y--, 11         side 1
-	0x7001, // 14: out    pins, 1         side 2
-	0x9080, // 15: pull   noblock         side 2
-	0x5801, // 16: in     pins, 1         side 3
-	0x9800, // 17: push   noblock         side 3
-	0x7001, // 18: out    pins, 1         side 2
-	0xf05d, // 19: set    y, 29           side 2
-	0x5801, // 20: in     pins, 1         side 3
+RPI_PICO_PIO_DEFINE_PROGRAM(i2s_controller, 1, 14,
+	0xaa42, //  0: nop                    side 1 [2]
+	        //     .wrap_target
+	0x6201, //  1: out    pins, 1         side 0 [2]
+	0x4801, //  2: in     pins, 1         side 1
+	0x09e1, //  3: jmp    !osre, 1        side 1 [1]
+	0x7201, //  4: out    pins, 1         side 2 [2]
+	0x5801, //  5: in     pins, 1         side 3
+	0x9800, //  6: push   noblock         side 3
+	0x9880, //  7: pull   noblock         side 3
+	0x7201, //  8: out    pins, 1         side 2 [2]
+	0x5801, //  9: in     pins, 1         side 3
+	0x18e8, // 10: jmp    !osre, 8        side 3
+	0x7801, // 11: out    pins, 1         side 3
+	0x4001, // 12: in     pins, 1         side 0
+	0x8100, // 13: push   noblock         side 0 [1]
+	0x8880, // 14: pull   noblock         side 1
 	        //     .wrap
 );
 
-static const uint32_t i2s_controller_cycles_factor = 4u;
+static const uint32_t i2s_controller_cycles_factor = 6u;
 static const uint32_t i2s_controller_entry_point = 0;
 
+// TODO: check volume with padded stuff
 static int pio_i2s_controller_setup(const struct device *dev)
 {
 	const struct pio_i2s_config *dev_config = dev->config;
@@ -222,8 +217,9 @@ static int pio_i2s_controller_setup(const struct device *dev)
 	sm_config_set_in_pins(&sm_config, rx_data_pin);
 	sm_config_set_in_pin_count(&sm_config, 1);
 	sm_config_set_out_pins(&sm_config, tx_data_pin, 1);
-	sm_config_set_out_shift(&sm_config, false, false, channel_length);
-	sm_config_set_in_shift(&sm_config, false, false, channel_length);
+	/* set pull threshold to channel_length-1 so that `jmp !osre` doesn't jump before the LSB. */
+	sm_config_set_out_shift(&sm_config, false, false, channel_length-1);
+	sm_config_set_in_shift(&sm_config, false, false, channel_length-1);
 	sm_config_set_sideset_pin_base(&sm_config, clock_pin_base);
 	sm_config_set_sideset(&sm_config, 2, false, false);
 	pio_sm_init(pio, sm, dev_data->offset, &sm_config);
@@ -246,7 +242,6 @@ static void pio_i2s_controller_start(const struct device *dev)
 
 	pio_sm_set_enabled(pio, sm, false);
 	pio_sm_exec(pio, sm, pio_encode_set(pio_x, 0));
-	pio_sm_exec(pio, sm, pio_encode_set(pio_y, 32 - 3));
 
 	pio_sm_exec(pio, sm, pio_encode_jmp(dev_data->offset + dev_data->entry_point));
 	pio_sm_set_enabled(pio, sm, true);
