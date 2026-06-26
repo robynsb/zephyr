@@ -320,6 +320,7 @@ static int i2s_rpi_pico_configure_single(const struct device *dev, enum i2s_dir 
 }
 
 // TODO: Verify that sampling frequency is the same between tx and rx.
+// TODO: verify target vs loopback modes.
 static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 			       const struct i2s_config *i2s_cfg)
 {
@@ -813,6 +814,7 @@ static int i2s_rpi_pico_trigger_single(const struct device *dev, enum i2s_dir di
 		LOG_ERR("Unsupported trigger command");
 		return -EINVAL;
 	}
+	return 0;
 }
 
 static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
