@@ -155,25 +155,26 @@ static int i2s_rpi_pico_read(const struct device *dev, void **mem_block, size_t 
 	return 0;
 }
 
-RPI_PICO_PIO_DEFINE_PROGRAM(i2s_controller, 1, 16,
-	0xaa42, //  0: nop                    side 1 [2]
-	        //     .wrap_target
-	0x6201, //  1: out    pins, 1         side 0 [2]
-	0x4801, //  2: in     pins, 1         side 1
-	0x0941, //  3: jmp    x--, 1          side 1 [1]
-	0x7001, //  4: out    pins, 1         side 2
+RPI_PICO_PIO_DEFINE_PROGRAM(i2s_controller, 0, 17,
+	//     .wrap_target
+	0x6201, //  0: out    pins, 1         side 0 [2]
+	0x4801, //  1: in     pins, 1         side 1
+	0x0940, //  2: jmp    x--, 0          side 1 [1]
+	0x7001, //  3: out    pins, 1         side 2
+	0xf020, //  4: set    x, 0            side 2
 	0x90c0, //  5: pull   ifempty noblock side 2
-	0xb022, //  6: mov    x, y            side 2
-	0x5901, //  7: in     pins, 1         side 3 [1]
+	0x5801, //  6: in     pins, 1         side 3
+	0xb822, //  7: mov    x, y            side 3
 	0x9840, //  8: push   iffull noblock  side 3
 	0x7201, //  9: out    pins, 1         side 2 [2]
 	0x5801, // 10: in     pins, 1         side 3
 	0x1949, // 11: jmp    x--, 9          side 3 [1]
 	0x6001, // 12: out    pins, 1         side 0
-	0x80c0, // 13: pull   ifempty noblock side 0
-	0xa022, // 14: mov    x, y            side 0
-	0x4901, // 15: in     pins, 1         side 1 [1]
-	0x8840, // 16: push   iffull noblock  side 1
+	0xe020, // 13: set    x, 0            side 0
+	0x80c0, // 14: pull   ifempty noblock side 0
+	0x4801, // 15: in     pins, 1         side 1
+	0xa822, // 16: mov    x, y            side 1
+	0x8840, // 17: push   iffull noblock  side 1
 	        //     .wrap
 );
 
@@ -266,6 +267,9 @@ static void pio_i2s_controller_start(const struct device *dev)
 	uint32_t channel_length = dev_data->channel_length;
 
 	pio_sm_set_enabled(pio, sm, false);
+
+	pio_sm_exec(pio, sm, pio_encode_set(pio_x, 0));
+	pio_sm_exec(pio, sm, pio_encode_pull(false, false));
 	pio_sm_exec(pio, sm, pio_encode_set(pio_x, channel_length-2));
 	pio_sm_exec(pio, sm, pio_encode_set(pio_y, channel_length-2));
 
