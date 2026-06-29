@@ -210,7 +210,6 @@ static int pio_i2s_controller_setup(const struct device *dev, enum i2s_dir dir)
 	uint32_t tx_data_pin = dev_data->tx.data_pin;
 
 	if(en_loopback) {
-		LOG_ERR("en_loopback enabled!");
 		tx_data_pin = rx_data_pin;
 	}
 
@@ -585,27 +584,18 @@ void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 		return;
 	}
 
-	void *mblk_tmp = stream->mem_block;
-
-	/* Prepare to receive the next data block */
-	retval = k_mem_slab_alloc(stream->cfg.mem_slab, &stream->mem_block,
-			       K_NO_WAIT);
-	if (retval < 0) {
-		stream->state = I2S_STATE_ERROR;
-		return;
-	}
-
-	// struct queue_item item;
-	// size_t mem_block_size;
-	// int ret = k_msgq_get(stream->msgq, &item, SYS_TIMEOUT_MS(0));
-	struct queue_item item = {.mem_block = mblk_tmp, .size = stream->cfg.block_size};
+	struct queue_item item = {.mem_block = stream->mem_block, .size = stream->cfg.block_size};
 
 	retval = k_msgq_put(stream->msgq, &item, K_NO_WAIT);
 	if (retval < 0) {
 		LOG_ERR("RX overrun");
 		stream->state = I2S_STATE_ERROR;
+		k_mem_slab_free(stream->cfg.mem_slab, stream->mem_block);
+		stream->mem_block = NULL;
 		return;
 	}
+
+	stream->mem_block = NULL;
 
 	if(stream->state == I2S_STATE_STOPPING && dev_data->tx.state != I2S_STATE_STOPPING) {
 		retval = dma_stop(stream->dev_dma, stream->dma_channel);
@@ -616,6 +606,16 @@ void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 
 		stream->state = I2S_STATE_READY;
 
+		return;
+	}
+
+	/* Prepare to receive the next data block */
+	retval = k_mem_slab_alloc(stream->cfg.mem_slab, &stream->mem_block,
+			       K_NO_WAIT);
+	if (retval < 0) {
+		stream->state = I2S_STATE_ERROR;
+		//TODO: think about when does this trigger? Is the queue sized such that in correct operation this never happens
+		LOG_ERR("RX callback failed to allocate block");
 		return;
 	}
 
@@ -659,6 +659,7 @@ int i2s_start_rx_stream_dma(const struct device *dev, struct stream *stream) {
 	retval = k_mem_slab_alloc(stream->cfg.mem_slab, &stream->mem_block,
 			       K_NO_WAIT);
 	if (retval < 0) {
+		LOG_ERR("While starting rx stream dma, failed to allocate mem slab");
 		return retval;
 	}
 
@@ -671,6 +672,11 @@ int i2s_start_rx_stream_dma(const struct device *dev, struct stream *stream) {
 	// 	LOG_ERR("TX buffer is empty.");
 	// 	return ret;
 	// }
+
+	// Drain RX FIFO
+	for (int i = 0; i < 4; i++) {
+		__unused int x = pio_sm_get(pio, data->sm);
+	}
 
     	// mem_block_size = item.size;
 	retval = start_dma(stream->dev_dma, stream->dma_channel,
@@ -737,7 +743,7 @@ static int i2s_start_stream_tx(const struct device *dev, struct stream *stream) 
 	stream->tx_stop_without_draining = false;
 	int retval = i2s_start_stream_dma(dev, stream);
 	if (retval < 0) {
-		LOG_ERR("START trigger failed %d", retval);
+		LOG_ERR("START TX trigger failed %d", retval);
 		return retval;
 	}
 	// pio_i2s_controller_start(dev);
@@ -751,10 +757,11 @@ static int i2s_start_stream_rx(const struct device *dev, struct stream *stream) 
 			    stream->state);
 		return -EIO;
 	}
+	__ASSERT_NO_MSG(stream->mem_block == NULL);
 
         int retval = i2s_start_rx_stream_dma(dev, stream);
 	if (retval < 0) {
-		LOG_ERR("START trigger failed %d", retval);
+		LOG_ERR("START RX trigger failed %d", retval);
 		return retval;
 	}
 	// pio_i2s_controller_start(dev);
@@ -767,6 +774,11 @@ static int i2s_drop_stream(const struct device *dev, struct stream *stream) {
 	(void) dma_stop(stream->dev_dma, stream->dma_channel);
 	drop_queue(stream);
 	stream->state = I2S_STATE_READY;
+	if(stream->mem_block != NULL) { // TODO: Is this free necessary? ESP32 doesn't do it. Are they wrong?
+		LOG_INF("freeing inflight thing??");
+		k_mem_slab_free(stream->cfg.mem_slab, stream->mem_block);
+		stream->mem_block = NULL;
+	}
 	k_spin_unlock(&stream->lock, key);
 	return 0;
 }
@@ -805,11 +817,13 @@ static int i2s_drain_prepare(const struct device *dev, struct stream *stream) {
 		         stream->state);
 		return -EIO;
 	}
+	drop_queue(stream);
 	stream->state = I2S_STATE_READY;
 	k_spin_unlock(&stream->lock, key);
 	return 0;
 }
 
+// TODO: fix a little code duplication here?
 static int i2s_rpi_pico_trigger_single(const struct device *dev, enum i2s_dir dir,
 			     enum i2s_trigger_cmd cmd)
 {
@@ -820,12 +834,13 @@ static int i2s_rpi_pico_trigger_single(const struct device *dev, enum i2s_dir di
 	__ASSERT_NO_MSG(dir == I2S_DIR_RX || dir == I2S_DIR_TX);
 
 	struct stream *stream = dir == I2S_DIR_RX ? &dev_data->rx : &dev_data->tx;
+	LOG_INF("i2s_rpi_pico_trigger_single dir=%d cmd=%d", dir, cmd);
 
 	switch (cmd) {
 	case I2S_TRIGGER_START:
 		if(stream->state != I2S_STATE_READY) {
 			LOG_ERR("Stream state must be in ready state to start stream.");
-			return -EINVAL; // TODO: correct error code?
+			return -EIO;
 		}
 
 		//TODO: inline these functions a bit
@@ -837,21 +852,32 @@ static int i2s_rpi_pico_trigger_single(const struct device *dev, enum i2s_dir di
 		if (ret < 0) {
 			return ret;
 		}
-		LOG_ERR("i2s_rpi_pico_trigger_single dir=%d started successfully", dir);
 		break;
 	case I2S_TRIGGER_STOP:
 		//TODO: what if DMA is not running?
-		i2s_stop_stream(dev, stream);
+		ret = i2s_stop_stream(dev, stream);
+		if (ret < 0) {
+			return ret;
+		}
 		break;
 	case I2S_TRIGGER_DRAIN:
 		//TODO: what if queue already empty?
-		i2s_drain_stream(dev, stream);
+		ret = i2s_drain_stream(dev, stream);
+		if (ret < 0) {
+			return ret;
+		}
 		break;
 	case I2S_TRIGGER_DROP:
-		i2s_drop_stream(dev, stream);
+		ret = i2s_drop_stream(dev, stream);
+		if (ret < 0) {
+			return ret;
+		}
 		break;
 	case I2S_TRIGGER_PREPARE:
-		i2s_drain_prepare(dev, stream);
+		ret = i2s_drain_prepare(dev, stream);
+		if (ret < 0) {
+			return ret;
+		}
 		break;
 
 	default:
