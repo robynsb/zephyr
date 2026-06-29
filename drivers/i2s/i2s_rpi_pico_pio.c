@@ -19,6 +19,7 @@
 
 
 #include "zephyr/sys/__assert.h"
+#include <stdint.h>
 #define DT_DRV_COMPAT raspberrypi_pico_i2s_pio
 
 #include <zephyr/drivers/pinctrl.h>
@@ -103,7 +104,6 @@ struct pio_i2s_data {
 
 static int i2s_rpi_pico_write(const struct device *dev, void *mem_block, size_t size)
 {
-	LOG_ERR("i2s_rpi_pico_write mem_block size=%d", size);
 	// const struct pio_i2s_config *config = dev->config;
 	struct pio_i2s_data *data = dev->data;
 	const struct stream *stream = &data->tx;
@@ -167,10 +167,10 @@ RPI_PICO_PIO_DEFINE_PROGRAM(i2s_controller, 1, 14,
 	0x9880, //  7: pull   noblock         side 3
 	0x7201, //  8: out    pins, 1         side 2 [2]
 	0x5801, //  9: in     pins, 1         side 3
-	0x18e8, // 10: jmp    !osre, 8        side 3
-	0x7801, // 11: out    pins, 1         side 3
-	0x4001, // 12: in     pins, 1         side 0
-	0x8100, // 13: push   noblock         side 0 [1]
+	0x19e8, // 10: jmp    !osre, 8        side 3 [1]
+	0x6201, // 11: out    pins, 1         side 0 [2]
+	0x4801, // 12: in     pins, 1         side 1
+	0x8800, // 13: push   noblock         side 1
 	0x8880, // 14: pull   noblock         side 1
 	        //     .wrap
 );
@@ -207,6 +207,7 @@ static int pio_i2s_controller_setup(const struct device *dev, enum i2s_dir dir)
 	uint32_t tx_data_pin = dev_data->tx.data_pin;
 
 	if(en_loopback) {
+		LOG_ERR("en_loopback enabled!");
 		tx_data_pin = rx_data_pin;
 	}
 
@@ -362,7 +363,6 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 	// const struct pio_i2s_config *dev_config = dev->config;
 	// struct pio_i2s_data *dev_data = dev->data;
 	int retval;
-	LOG_ERR("i2s_rpi_pico_configure");
 
 	uint8_t data_format = i2s_cfg->format & I2S_FMT_DATA_FORMAT_MASK;
 
@@ -542,6 +542,7 @@ void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	stream->mem_block = item.mem_block;
 	mem_block_size = item.size;
 
+
 	retval = reload_dma(stream->dev_dma, stream->dma_channel,
 		&stream->dma_cfg,
 		stream->mem_block,
@@ -586,7 +587,6 @@ void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 		stream->state = I2S_STATE_ERROR;
 		return;
 	}
-
 
 	// struct queue_item item;
 	// size_t mem_block_size;
@@ -698,6 +698,7 @@ int i2s_start_stream_dma(const struct device *dev, struct stream *stream) {
 	struct queue_item item;
 	int ret = k_msgq_get(stream->msgq, &item, SYS_TIMEOUT_MS(0));
 
+
 	if (ret < 0) {
 		LOG_ERR("TX buffer is empty.");
 		return ret;
@@ -805,7 +806,6 @@ static int i2s_drain_prepare(const struct device *dev, struct stream *stream) {
 static int i2s_rpi_pico_trigger_single(const struct device *dev, enum i2s_dir dir,
 			     enum i2s_trigger_cmd cmd)
 {
-	LOG_ERR("i2s_rpi_pico_trigger_single dir=%d cmd=%d", dir, cmd);
 	// const struct pio_i2s_config *dev_config = dev->config;
 	struct pio_i2s_data *dev_data = dev->data;
 	int ret;

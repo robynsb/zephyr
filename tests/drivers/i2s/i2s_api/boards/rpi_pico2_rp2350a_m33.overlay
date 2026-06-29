@@ -10,10 +10,10 @@
 &pinctrl {
 	pio1_i2s: pio1_i2s {
 		tx_data: tx_data {
-			pinmux = <PIO1_P28>;
+			pinmux = <PIO1_P6>;
 		};
 		rx_data: rx_data {
-			pinmux = <PIO1_P22>;
+			pinmux = <PIO1_P7>;
 			/* Enable the pad input buffer so the PIO `in pins` can sample
 			 * the RX data line (off by default).
 			 */
@@ -21,7 +21,7 @@
 		};
 		clks: clks {
 			/*        CLK BASE  (WS = CLK+1) -> BCLK, LRCLK side-set */
-			pinmux = <PIO1_P26 PIO1_P27>;
+			pinmux = <PIO1_P8 PIO1_P9>;
 		};
 	};
 };
