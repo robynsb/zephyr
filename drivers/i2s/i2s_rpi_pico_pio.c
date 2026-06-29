@@ -168,7 +168,7 @@ RPI_PICO_PIO_DEFINE_PROGRAM(i2s_controller, 1, 16,
 	0x9840, //  8: push   iffull noblock  side 3
 	0x7201, //  9: out    pins, 1         side 2 [2]
 	0x5801, // 10: in     pins, 1         side 3
-	0x19e9, // 11: jmp    !osre, 9        side 3 [1]
+	0x1949, // 11: jmp    x--, 9          side 3 [1]
 	0x6001, // 12: out    pins, 1         side 0
 	0x80c0, // 13: pull   ifempty noblock side 0
 	0xa022, // 14: mov    x, y            side 0
