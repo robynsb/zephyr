@@ -159,6 +159,7 @@ static int i2s_rpi_pico_read(const struct device *dev, void **mem_block, size_t 
 	return 0;
 }
 
+
 RPI_PICO_PIO_DEFINE_PROGRAM(i2s_controller, 0, 17,
 	//     .wrap_target
 	0x6201, //  0: out    pins, 1         side 0 [2]
@@ -200,6 +201,9 @@ static int pio_i2s_controller_setup(const struct device *dev, enum i2s_dir dir)
 		return -EBUSY;
 	}
 
+	// TODO: make the pio program static so that if another i2s is opened they share the pio instructions.
+	// i think it should also use compiler pragmas for if you are on rp2040 or rp2350 because
+	// i think rp2350 can share between PIO modules so that should also be supported.
 	dev_data->offset = pio_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(i2s_controller));
 	dev_data->entry_point = i2s_controller_entry_point;
 	dev_data->loaded_program = RPI_PICO_PIO_GET_PROGRAM(i2s_controller);
@@ -249,7 +253,7 @@ static int pio_i2s_controller_setup(const struct device *dev, enum i2s_dir dir)
 	pio_sm_set_pindirs_with_mask(pio, sm, pin_dirs, pin_mask);
 	pio_sm_set_pins(pio, sm, 0); // clear pins
 
-	// TODO: When I do configure target, check that the PIO frequency is fast enough.
+	// TODO: When I do configure target, check that the sampling frequency is fast enough.
 	uint32_t sample_freq = dev_data->sampling_freq;
 	/* Number of channels is always 2 for I2S data format */
 	const uint32_t num_channels = 2;
