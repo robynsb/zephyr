@@ -406,6 +406,7 @@ static void pio_i2s_start_all(const struct device *dev)
 	pio_sm_exec(pio, dev_data->clks_sm,
 		    pio_encode_jmp(dev_data->clks_offset + clks_entry_point));
 	if (start_tx) {
+		pio_sm_exec(pio, dev_data->tx.sm, pio_encode_set(pio_x, 0xF0F0)); // TODO: remove this line.
 		pio_sm_exec(pio, dev_data->tx.sm,
 			    pio_encode_jmp(dev_data->tx.offset + tx_target_entry_point));
 	}
@@ -816,10 +817,15 @@ int i2s_start_rx_stream_dma(const struct device *dev, struct stream *stream) {
 	// 	return ret;
 	// }
 
+	// uint32_t priming_words = data->channel_length == 32 ? 2 : 1;
+	// uint32_t priming_words = 0;
+
 	// Drain RX FIFO
-	for (int i = 0; i < 4; i++) {
-		__unused int x = pio_sm_get(pio, data->rx.sm);
-	}
+	// for (int i = 0; i < 4; i++) {
+	// 	__unused int x = pio_sm_get(pio, data->rx.sm);
+	// 	// LOG_INF("priming word = %d %d", x & 0xFFFF, (x & 0xFFFF0000) >> 16);
+	// }
+
 
     	// mem_block_size = item.size;
 	retval = start_dma(stream->dev_dma, stream->dma_channel,
@@ -843,12 +849,13 @@ int i2s_start_rx_stream_dma(const struct device *dev, struct stream *stream) {
 
 }
 
-int i2s_start_stream_dma(const struct device *dev, struct stream *stream) {
+int i2s_start_tx_stream_dma(const struct device *dev, struct stream *stream) {
 	const struct pio_i2s_config *config = dev->config;
 	struct pio_i2s_data *data = dev->data;
 	PIO pio = pio_rpi_pico_get_pio(config->piodev);
 
 	// struct stream *stream = &data->tx;
+
 
 	size_t mem_block_size;
 	struct queue_item item;
@@ -862,6 +869,16 @@ int i2s_start_stream_dma(const struct device *dev, struct stream *stream) {
 
 	stream->mem_block = item.mem_block;
     	mem_block_size = item.size;
+
+     /* Prime the TX FIFO with silence before DMA/PIO start so the first
+	 * DMA-supplied frame lands on a clean word boundary. 32-bit channels
+	 * shift 32 bits per word (one 0 per channel slot, two per frame); 16-bit
+	 * channels pack two slots into one 32-bit word (one 0 per frame). */
+	// uint32_t priming_words = data->channel_length == 32 ? 2 : 1;
+
+	for (uint32_t i = 0; i < 2; i++) {
+		pio_sm_put_blocking(pio, data->tx.sm, 0xAAAAAAAA);
+	}
 
 	ret = start_dma(stream->dev_dma, stream->dma_channel,
 			&stream->dma_cfg,
@@ -884,7 +901,7 @@ static int i2s_start_stream_tx(const struct device *dev, struct stream *stream) 
 		return -EIO;
 	}
 	stream->tx_stop_without_draining = false;
-	int retval = i2s_start_stream_dma(dev, stream);
+	int retval = i2s_start_tx_stream_dma(dev, stream);
 	if (retval < 0) {
 		LOG_ERR("START TX trigger failed %d", retval);
 		return retval;
