@@ -389,40 +389,32 @@ static void pio_i2s_start_all(const struct device *dev)
 	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
 	uint32_t channel_length = dev_data->channel_length;
 
-	bool start_tx = dev_data->tx.state != I2S_STATE_NOT_READY;
-	bool start_rx = dev_data->rx.state != I2S_STATE_NOT_READY;
-
-	/* Park everything before (re)seeding. */
+	/* The clocks SM is the continuously-running I2S controller: seed its WS
+	 * counter and start it here, once, at configure time. It must never be
+	 * stopped afterwards. The TX/RX followers are (re)started and realigned to
+	 * this free-running clock each time they begin (see i2s_prepare_follower). */
 	pio_sm_set_enabled(pio, dev_data->clks_sm, false);
-	if (start_tx) {
-		pio_sm_set_enabled(pio, dev_data->tx.sm, false);
-	}
-	if (start_rx) {
-		pio_sm_set_enabled(pio, dev_data->rx.sm, false);
-	}
-
-	/* Seed the clks WS counter (y = channel_length - 2) and point each SM at its entry. */
 	pio_sm_exec(pio, dev_data->clks_sm, pio_encode_set(pio_y, channel_length - 1));
 	pio_sm_exec(pio, dev_data->clks_sm,
 		    pio_encode_jmp(dev_data->clks_offset + clks_entry_point));
-	if (start_tx) {
-		pio_sm_exec(pio, dev_data->tx.sm, pio_encode_set(pio_x, 0xF0F0)); // TODO: remove this line.
-		pio_sm_exec(pio, dev_data->tx.sm,
-			    pio_encode_jmp(dev_data->tx.offset + tx_target_entry_point));
-	}
-	if (start_rx) {
-		pio_sm_exec(pio, dev_data->rx.sm,
-			    pio_encode_jmp(dev_data->rx.offset + rx_target_entry_point));
-	}
-
-	/* Enable sequentially: followers first (parked on wait/pull), then clocks. */
-	if (start_tx) {
-		pio_sm_set_enabled(pio, dev_data->tx.sm, true);
-	}
-	if (start_rx) {
-		pio_sm_set_enabled(pio, dev_data->rx.sm, true);
-	}
 	pio_sm_set_enabled(pio, dev_data->clks_sm, true);
+}
+
+/*
+ * Park a follower and reset it to a clean starting point so it can be enabled
+ * fresh at each START. pio_sm_restart clears the OSR/ISR shift counters and
+ * clearing the FIFO drops stale samples; the SM is left pointing at its entry
+ * (pull for TX / first BCLK wait for RX). Once enabled with a priming word
+ * staged, the follower re-syncs to the free-running WS within the first frame
+ * via its own `jmp pin` checks, so the first real sample lands on the left
+ * channel. The caller stages FIFO data and then enables the SM.
+ */
+static void i2s_prepare_follower(PIO pio, struct stream *stream, uint32_t entry_point)
+{
+	pio_sm_set_enabled(pio, stream->sm, false);
+	pio_sm_restart(pio, stream->sm);
+	pio_sm_clear_fifos(pio, stream->sm);
+	pio_sm_exec(pio, stream->sm, pio_encode_jmp(stream->offset + entry_point));
 }
 
 static void drop_queue(struct stream *stream) {
@@ -807,27 +799,21 @@ int i2s_start_rx_stream_dma(const struct device *dev, struct stream *stream) {
 		return retval;
 	}
 
+	/* Park and reset the follower, then enable it so it re-syncs to the
+	 * free-running WS. It may be enabled mid-frame, in which case its first
+	 * captured frame is a torn partial (right slot reads 0); unlike TX we cannot
+	 * absorb that with a priming word, so let it run for a few frame periods to
+	 * lock on, then drop everything it captured before arming the DMA. This way
+	 * the first block starts on a clean left-channel frame boundary. */
+	i2s_prepare_follower(pio, &data->rx, rx_target_entry_point);
+	pio_sm_set_enabled(pio, data->rx.sm, true);
 
-	// size_t mem_block_size;
-	// struct queue_item item;
-	// int ret = k_msgq_get(stream->msgq, &item, SYS_TIMEOUT_MS(0));
+	/* A frame is 1/frame_clk_freq seconds; wait several frames for the follower
+	 * to discard its partial frame and settle, staying well under the 8-word
+	 * FIFO depth so nothing overflows before we clear it. */
+	k_busy_wait(4 * USEC_PER_SEC / stream->cfg.frame_clk_freq);
+	pio_sm_clear_fifos(pio, data->rx.sm);
 
-	// if (ret < 0) {
-	// 	LOG_ERR("TX buffer is empty.");
-	// 	return ret;
-	// }
-
-	// uint32_t priming_words = data->channel_length == 32 ? 2 : 1;
-	// uint32_t priming_words = 0;
-
-	// Drain RX FIFO
-	// for (int i = 0; i < 4; i++) {
-	// 	__unused int x = pio_sm_get(pio, data->rx.sm);
-	// 	// LOG_INF("priming word = %d %d", x & 0xFFFF, (x & 0xFFFF0000) >> 16);
-	// }
-
-
-    	// mem_block_size = item.size;
 	retval = start_dma(stream->dev_dma, stream->dma_channel,
 			&stream->dma_cfg,
 			(void *)&pio->rxf[data->rx.sm],
@@ -835,16 +821,11 @@ int i2s_start_rx_stream_dma(const struct device *dev, struct stream *stream) {
 			true, stream->cfg.block_size
 	);
 
-	// ret = start_dma(stream->dev_dma, stream->dma_channel,
-	// 		&stream->dma_cfg,
-	// 		stream->mem_block, true, /* TODO: scr addr increment setting? */
-	// 		(void *)&pio->txf[data->sm],
-	// 		false,
-	// 		mem_block_size);
 	if (retval < 0) {
 		LOG_ERR("Failed to start RX DMA transfer: %d", retval);
 		return retval;
 	}
+
 	return 0;
 
 }
@@ -870,14 +851,20 @@ int i2s_start_tx_stream_dma(const struct device *dev, struct stream *stream) {
 	stream->mem_block = item.mem_block;
     	mem_block_size = item.size;
 
-     /* Prime the TX FIFO with silence before DMA/PIO start so the first
-	 * DMA-supplied frame lands on a clean word boundary. 32-bit channels
-	 * shift 32 bits per word (one 0 per channel slot, two per frame); 16-bit
-	 * channels pack two slots into one 32-bit word (one 0 per frame). */
-	// uint32_t priming_words = data->channel_length == 32 ? 2 : 1;
+	/* Park and reset the follower; it stays stopped while we stage the FIFO so
+	 * it cannot shift at an arbitrary WS phase before the priming word. */
+	i2s_prepare_follower(pio, &data->tx, tx_target_entry_point);
 
-	for (uint32_t i = 0; i < 2; i++) {
-		pio_sm_put_blocking(pio, data->tx.sm, 0xAAAAAAAA);
+	/* Stage one frame of silence ahead of the real data. When the follower is
+	 * enabled it may start mid-frame; it consumes this silent word while its
+	 * `jmp pin` WS checks re-sync it to the next frame boundary, so the first
+	 * real sample is shifted cleanly on the left channel (and any one-BCLK
+	 * startup skew lands on silence, 0 << 1 == 0). A 32-bit channel is one word
+	 * per slot (two per frame); a 16-bit channel packs both slots into a word. */
+	uint32_t priming_words = data->channel_length == 32 ? 2 : 1;
+
+	for (uint32_t i = 0; i < priming_words; i++) {
+		pio_sm_put_blocking(pio, data->tx.sm, 0);
 	}
 
 	ret = start_dma(stream->dev_dma, stream->dma_channel,
@@ -890,6 +877,12 @@ int i2s_start_tx_stream_dma(const struct device *dev, struct stream *stream) {
 		LOG_ERR("Failed to start TX DMA transfer: %d", ret);
 		return ret;
 	}
+
+	/* Data is staged: enable the follower. Its preamble waits for the next WS
+	 * frame boundary on the free-running clocks, then shifts starting on the
+	 * left channel. The clocks SM is never touched here. */
+	pio_sm_set_enabled(pio, data->tx.sm, true);
+
 	return 0;
 
 }
