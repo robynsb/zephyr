@@ -166,6 +166,7 @@ static int i2s_rpi_pico_read(const struct device *dev, void **mem_block, size_t 
 }
 
 
+//TODO: Make sure that if im only using tx_target or rx_target that only one gets loaded and uses up PIO memory.
 /* Clock generator: 1-bit sideset = BCLK; `mov pins, !pins` toggles WS (out/in base).
  * Seeded by the y register (= channel_length - 2). ~2 PIO cycles per BCLK period. */
 RPI_PICO_PIO_DEFINE_PROGRAM(clks, 0, 3,
@@ -327,6 +328,7 @@ static int pio_i2s_setup_all(const struct device *dev)
 		sm_config_set_in_pin_count(&c, 1);
 		sm_config_set_jmp_pin(&c, ws_pin);
 		sm_config_set_out_shift(&c, false, false, channel_length == 16 ? 32 : 0);
+		sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
 		pio_sm_init(pio, dev_data->tx.sm, dev_data->tx.offset, &c);
 		/* Followers run as fast as possible; they gate on the clock pins. */
 		pio_sm_set_clkdiv_int_frac(pio, dev_data->tx.sm, 1, 0);
@@ -346,6 +348,7 @@ static int pio_i2s_setup_all(const struct device *dev)
 		sm_config_set_in_pin_count(&c, 2); /* data at +0, BCLK at +1 */
 		sm_config_set_jmp_pin(&c, ws_pin);
 		sm_config_set_in_shift(&c, false, false, channel_length == 16 ? 32 : 0);
+		sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
 		pio_sm_init(pio, dev_data->rx.sm, dev_data->rx.offset, &c);
 		pio_sm_set_clkdiv_int_frac(pio, dev_data->rx.sm, 1, 0);
 	}
@@ -398,6 +401,8 @@ static void pio_i2s_start_all(const struct device *dev)
 	pio_sm_exec(pio, dev_data->clks_sm,
 		    pio_encode_jmp(dev_data->clks_offset + clks_entry_point));
 	pio_sm_set_enabled(pio, dev_data->clks_sm, true);
+	pio_sm_set_enabled(pio, dev_data->rx.sm, true);
+
 }
 
 /*
@@ -807,9 +812,12 @@ int i2s_start_rx_stream_dma(const struct device *dev, struct stream *stream) {
 	 * arming the DMA. This way the first block starts on a clean left-channel
 	 * frame boundary. A frame is 1/frame_clk_freq seconds; the settle stays well
 	 * under the 8-word FIFO depth so nothing overflows before we clear it. */
-	i2s_prepare_follower(pio, &data->rx);
-	pio_sm_set_enabled(pio, data->rx.sm, true);
-	k_busy_wait(4 * USEC_PER_SEC / stream->cfg.frame_clk_freq);
+	// TODO: Check what the actual FIFO depth is.
+	// i2s_prepare_follower(pio, &data->rx);
+	// pio_sm_set_enabled(pio, data->rx.sm, true);
+ 	// pio_sm_clear_fifos(pio, stream->sm);
+
+	// k_busy_wait(4 * USEC_PER_SEC / stream->cfg.frame_clk_freq); // TODO: This dont look good.
 	pio_sm_clear_fifos(pio, data->rx.sm);
 
 	retval = start_dma(stream->dev_dma, stream->dma_channel,
