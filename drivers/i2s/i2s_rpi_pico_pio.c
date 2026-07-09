@@ -405,23 +405,6 @@ static void pio_i2s_start_all(const struct device *dev)
 
 }
 
-/*
- * Reset a single follower and point it at its program entry so it can be started
- * cleanly and deterministically at each START. This only ever touches the given
- * stream's SM — never the clocks SM or the other stream's follower. Disabling it
- * first makes the restart/rewind race-free; pio_sm_restart clears the OSR/ISR
- * shift counters and clearing the FIFO drops stale samples. The caller stages
- * FIFO data and then enables the SM, at which point it re-syncs to the
- * free-running WS via the `jmp pin` checks in its program.
- */
-static void i2s_prepare_follower(PIO pio, struct stream *stream)
-{
-	pio_sm_set_enabled(pio, stream->sm, false);
-	pio_sm_restart(pio, stream->sm);
-	pio_sm_clear_fifos(pio, stream->sm);
-	pio_sm_exec(pio, stream->sm, pio_encode_jmp(stream->offset));
-}
-
 static void drop_queue(struct stream *stream) {
 	struct queue_item item;
 	while (k_msgq_get(stream->msgq, &item, K_NO_WAIT) == 0) {
@@ -804,20 +787,6 @@ int i2s_start_rx_stream_dma(const struct device *dev, struct stream *stream) {
 		return retval;
 	}
 
-	/* Reset the RX follower (only this SM is touched) and enable it so it
-	 * re-syncs to the free-running WS. It may be enabled mid-frame, in which
-	 * case its first captured frame is a torn partial (right slot reads 0);
-	 * unlike TX we cannot absorb that with a priming word, so let it run for a
-	 * few frame periods to lock on, then drop everything it captured before
-	 * arming the DMA. This way the first block starts on a clean left-channel
-	 * frame boundary. A frame is 1/frame_clk_freq seconds; the settle stays well
-	 * under the 8-word FIFO depth so nothing overflows before we clear it. */
-	// TODO: Check what the actual FIFO depth is.
-	// i2s_prepare_follower(pio, &data->rx);
-	// pio_sm_set_enabled(pio, data->rx.sm, true);
- 	// pio_sm_clear_fifos(pio, stream->sm);
-
-	// k_busy_wait(4 * USEC_PER_SEC / stream->cfg.frame_clk_freq); // TODO: This dont look good.
 	pio_sm_clear_fifos(pio, data->rx.sm);
 
 	retval = start_dma(stream->dev_dma, stream->dma_channel,
@@ -857,10 +826,9 @@ int i2s_start_tx_stream_dma(const struct device *dev, struct stream *stream) {
 	stream->mem_block = item.mem_block;
     	mem_block_size = item.size;
 
-	/* Reset the TX follower (only this SM is touched) and keep it stopped while
-	 * we stage the FIFO, so it cannot shift at an arbitrary WS phase before the
-	 * priming word. */
-	i2s_prepare_follower(pio, &data->tx);
+	pio_sm_set_enabled(pio, stream->sm, false);
+	pio_sm_restart(pio, stream->sm);
+	pio_sm_clear_fifos(pio, stream->sm);
 
 	/* Stage one frame of silence ahead of the real data: once enabled the
 	 * follower may start mid-frame, and it consumes this silent word while its
