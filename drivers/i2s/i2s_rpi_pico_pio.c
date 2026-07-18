@@ -168,21 +168,21 @@ static int i2s_rpi_pico_read(const struct device *dev, void **mem_block, size_t 
 
 //TODO: Make sure that if im only using tx_target or rx_target that only one gets loaded and uses up PIO memory.
 /* Clock generator: 1-bit sideset = BCLK; `mov pins, !pins` toggles WS (out/in base).
- * Seeded by the y register (= channel_length - 2). ~2 PIO cycles per BCLK period. */
+ * Seeded by the y register (= channel_length - 2). 2 PIO cycles per BCLK period. */
 RPI_PICO_PIO_DEFINE_PROGRAM(clks, 0, 3,
-	//     .wrap_target
-	0xa022, //  0: mov    x, y            side 0
+		//     .wrap_target
+	0xb022, //  0: mov    x, y            side 1
 	0xa042, //  1: nop                    side 0
 	0x1041, //  2: jmp    x--, 1          side 1
 	0xa008, //  3: mov    pins, ~pins     side 0
-	        //     .wrap
+		//     .wrap
 );
 
 /* TX clock-follower: waits on BCLK (in base + 0), `jmp pin` on WS, `out pins, 1` -> tx_data.
  * `pull block` sits at the wrap target (not inside left_loop), so each channel consumes
  * exactly one FIFO word with autopull off. */
 RPI_PICO_PIO_DEFINE_PROGRAM(tx_target, 0, 10,
-	//     .wrap_target
+		//     .wrap_target
 	0x80a0, //  0: pull   block
 	0x2020, //  1: wait   0 pin, 0   (left_loop)
 	0x6001, //  2: out    pins, 1
@@ -200,7 +200,7 @@ RPI_PICO_PIO_DEFINE_PROGRAM(tx_target, 0, 10,
 /* RX clock-follower: `in pins, 1` reads data (in base + 0); waits on BCLK (in base + 1);
  * `jmp pin` on WS. Requires rx_data == BCLK - 1 in the overlay. */
 RPI_PICO_PIO_DEFINE_PROGRAM(rx_target, 0, 10,
-	//     .wrap_target
+		//     .wrap_target
 	0x2021, //  0: wait   0 pin, 1
 	0x20a1, //  1: wait   1 pin, 1
 	0x4001, //  2: in     pins, 1
@@ -399,7 +399,7 @@ static void pio_i2s_start_all(const struct device *dev)
 	 * its own START (see i2s_prepare_follower); starting one stream never
 	 * disturbs the clocks SM or the other stream's follower. */
 	pio_sm_set_enabled(pio, dev_data->clks_sm, false);
-	pio_sm_exec(pio, dev_data->clks_sm, pio_encode_set(pio_y, channel_length - 1));
+	pio_sm_exec(pio, dev_data->clks_sm, pio_encode_set(pio_y, channel_length - 2));
 	pio_sm_exec(pio, dev_data->clks_sm,
 		    pio_encode_jmp(dev_data->clks_offset + clks_entry_point));
 	pio_sm_set_enabled(pio, dev_data->clks_sm, true);
