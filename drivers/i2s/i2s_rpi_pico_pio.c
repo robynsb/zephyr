@@ -16,6 +16,12 @@
 	      enabling support for various PIO programs. Only the statically enabled ones
 	      can be used in the configure function.
 */
+/* Next steps:
+ * - delete sm_allocated flags
+ * - make the loaded programs static somehow.
+ * - add target receiver and sender.
+ *
+ */
 
 
 #include "zephyr/sys/__assert.h"
