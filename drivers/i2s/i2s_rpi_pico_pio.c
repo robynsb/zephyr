@@ -223,7 +223,7 @@ static int alloc_sm_once(const struct device *piodev, uint32_t *sm, bool *alloca
 {
 	size_t allocated_sm;
 	int retval;
-	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
+	PIO pio = pio_rpi_pico_get_pio(piodev);
 
 	if (*allocated) {
 		return 0;
