@@ -74,7 +74,7 @@ struct stream {
 
 	/* PIO state machine running this stream's follower program. */
 	uint32_t sm;
-	bool sm_allocated;
+	bool sm_allocated; // TODO: I think I want to delete these.
 	uint32_t offset;
 	const pio_program_t *loaded_program;
 };
@@ -223,6 +223,7 @@ static int alloc_sm_once(const struct device *piodev, uint32_t *sm, bool *alloca
 {
 	size_t allocated_sm;
 	int retval;
+	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
 
 	if (*allocated) {
 		return 0;
@@ -234,6 +235,7 @@ static int alloc_sm_once(const struct device *piodev, uint32_t *sm, bool *alloca
 		return retval;
 	}
 
+	pio_sm_set_enabled(pio, allocated_sm, false);
 	*sm = allocated_sm;
 	*allocated = true;
 	return 0;
@@ -327,7 +329,7 @@ static int pio_i2s_setup_all(const struct device *dev)
 		sm_config_set_in_pins(&c, bclk_pin);
 		sm_config_set_in_pin_count(&c, 1);
 		sm_config_set_jmp_pin(&c, ws_pin);
-		sm_config_set_out_shift(&c, false, false, channel_length == 16 ? 32 : 0);
+		sm_config_set_out_shift(&c, false, false, channel_length == 16 ? 32 : 1);
 		sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
 		pio_sm_init(pio, dev_data->tx.sm, dev_data->tx.offset, &c);
 		/* Followers run as fast as possible; they gate on the clock pins. */
@@ -347,7 +349,7 @@ static int pio_i2s_setup_all(const struct device *dev)
 		sm_config_set_in_pins(&c, dev_data->rx.data_pin);
 		sm_config_set_in_pin_count(&c, 2); /* data at +0, BCLK at +1 */
 		sm_config_set_jmp_pin(&c, ws_pin);
-		sm_config_set_in_shift(&c, false, false, channel_length == 16 ? 32 : 0);
+		sm_config_set_in_shift(&c, false, false, channel_length == 16 ? 32 : 1);
 		sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
 		pio_sm_init(pio, dev_data->rx.sm, dev_data->rx.offset, &c);
 		pio_sm_set_clkdiv_int_frac(pio, dev_data->rx.sm, 1, 0);
@@ -401,7 +403,6 @@ static void pio_i2s_start_all(const struct device *dev)
 	pio_sm_exec(pio, dev_data->clks_sm,
 		    pio_encode_jmp(dev_data->clks_offset + clks_entry_point));
 	pio_sm_set_enabled(pio, dev_data->clks_sm, true);
-	pio_sm_set_enabled(pio, dev_data->rx.sm, true);
 
 }
 
@@ -427,6 +428,8 @@ static int i2s_rpi_pico_configure_single(const struct device *dev, enum i2s_dir 
 	struct stream *stream = dir == I2S_DIR_RX ? &dev_data->rx : &dev_data->tx;
 	struct stream *other_stream = dir == I2S_DIR_RX ? &dev_data->tx : &dev_data->rx;
 
+	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
+
 	if (stream->state != I2S_STATE_NOT_READY && stream->state != I2S_STATE_READY) {
 		LOG_ERR("stream in invalid state (%d)", stream->state);
 		return -EINVAL;
@@ -434,7 +437,16 @@ static int i2s_rpi_pico_configure_single(const struct device *dev, enum i2s_dir 
 
 	if (i2s_cfg->frame_clk_freq == 0U) {
 		drop_queue(stream);
+
+		if(stream->sm_allocated) {
+			pio_sm_set_enabled(pio, stream->sm, false);
+		}
+		if(stream->loaded_program != NULL) {
+			pio_remove_program(pio, stream->loaded_program, stream->offset);
+			stream->loaded_program = NULL;
+		}
 		memset(&stream->cfg, 0, sizeof(struct i2s_config));
+
 		stream->state = I2S_STATE_NOT_READY;
 		return 0;
 	}
@@ -492,7 +504,6 @@ static int i2s_rpi_pico_configure_single(const struct device *dev, enum i2s_dir 
 	}
 
 
-	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
 
 	/* Allocate this stream's follower SM up front so we can derive its DMA DREQ slot.
 	 * The clocks SM and the actual program loading happen later in pio_i2s_setup_all(). */
@@ -787,7 +798,17 @@ int i2s_start_rx_stream_dma(const struct device *dev, struct stream *stream) {
 		return retval;
 	}
 
-	pio_sm_clear_fifos(pio, data->rx.sm);
+	pio_sm_set_enabled(pio, stream->sm, false);
+	pio_sm_clear_fifos(pio, stream->sm);
+	pio_sm_restart(pio, stream->sm);
+	pio_sm_exec(pio, stream->sm, pio_encode_jmp(stream->offset));
+	pio_sm_set_enabled(pio, stream->sm, true);
+
+	uint32_t priming_words = data->channel_length == 32 ? 2 : 1;
+	// TODO: think about putting a ISR lock on this startup code.
+	for (uint32_t i = 0; i < priming_words; i++) {
+		pio_sm_get_blocking(pio, stream->sm);
+	}
 
 	retval = start_dma(stream->dev_dma, stream->dma_channel,
 			&stream->dma_cfg,
@@ -829,6 +850,7 @@ int i2s_start_tx_stream_dma(const struct device *dev, struct stream *stream) {
 	pio_sm_set_enabled(pio, stream->sm, false);
 	pio_sm_restart(pio, stream->sm);
 	pio_sm_clear_fifos(pio, stream->sm);
+	pio_sm_exec(pio, stream->sm, pio_encode_jmp(stream->offset));
 
 	/* Stage one frame of silence ahead of the real data: once enabled the
 	 * follower may start mid-frame, and it consumes this silent word while its
