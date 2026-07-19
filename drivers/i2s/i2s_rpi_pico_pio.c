@@ -17,7 +17,6 @@
 	      can be used in the configure function.
 */
 /* Next steps:
- * - delete sm_allocated flags
  * - make the loaded programs static somehow.
  * - add target receiver and sender.
  *
@@ -80,7 +79,7 @@ struct stream {
 
 	/* PIO state machine running this stream's follower program. */
 	uint32_t sm;
-	bool sm_allocated; // TODO: I think I want to delete these.
+	bool sm_allocated;
 	uint32_t offset;
 	const pio_program_t *loaded_program;
 };
@@ -446,11 +445,26 @@ static int i2s_rpi_pico_configure_single(const struct device *dev, enum i2s_dir 
 
 		if(stream->sm_allocated) {
 			pio_sm_set_enabled(pio, stream->sm, false);
+			stream->sm_allocated = false;
+			pio_sm_unclaim(pio, stream->sm);
 		}
+
+		if(!other_stream->sm_allocated) {
+			pio_sm_set_enabled(pio, dev_data->clks_sm, false);
+			dev_data->clks_sm_allocated = false;
+			pio_sm_unclaim(pio, dev_data->clks_sm);
+
+			if(dev_data->clks_loaded_program != NULL) {
+				pio_remove_program(pio, dev_data->clks_loaded_program, dev_data->clks_offset);
+				dev_data->clks_loaded_program = NULL;
+			}
+		}
+
 		if(stream->loaded_program != NULL) {
 			pio_remove_program(pio, stream->loaded_program, stream->offset);
 			stream->loaded_program = NULL;
 		}
+
 		memset(&stream->cfg, 0, sizeof(struct i2s_config));
 
 		stream->state = I2S_STATE_NOT_READY;
