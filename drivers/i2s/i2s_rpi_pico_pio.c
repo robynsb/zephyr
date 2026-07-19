@@ -62,6 +62,12 @@ struct pio_i2s_config {
 	const uint32_t ws_pin;    /* word select; independent of BCLK */
 };
 
+struct pio_sm_res {
+	size_t sm;                 /* (size_t)-1 = not claimed */
+	const pio_program_t *prog; /* NULL = not loaded */
+	uint32_t offset;
+};
+
 struct stream {
 	enum i2s_state state;
 	bool tx_stop_without_draining;
@@ -76,11 +82,7 @@ struct stream {
 
 	const uint32_t data_pin;
 
-	/* PIO state machine running this stream's follower program.
-	 * (size_t)-1 means not allocated. */
-	size_t sm;
-	uint32_t offset;
-	const pio_program_t *loaded_program;
+	struct pio_sm_res res;
 };
 
 struct pio_i2s_data {
@@ -88,11 +90,7 @@ struct pio_i2s_data {
     struct stream rx;
     uint32_t channel_length;
     uint32_t sampling_freq;
-    /* PIO state machine running the BCLK/WS clock generator.
-     * (size_t)-1 means not allocated. */
-    size_t clks_sm;
-    uint32_t clks_offset;
-    const pio_program_t *clks_loaded_program;
+    struct pio_sm_res clks_res;
 };
 
 
@@ -170,7 +168,6 @@ static int i2s_rpi_pico_read(const struct device *dev, void **mem_block, size_t 
 }
 
 
-//TODO: Make sure that if im only using tx_target or rx_target that only one gets loaded and uses up PIO memory.
 /* Clock generator: 1-bit sideset = BCLK; `mov pins, !pins` toggles WS (out/in base).
  * Seeded by the y register (= channel_length - 2). 2 PIO cycles per BCLK period. */
 RPI_PICO_PIO_DEFINE_PROGRAM(clks, 0, 3,
@@ -222,14 +219,13 @@ RPI_PICO_PIO_DEFINE_PROGRAM(rx_target, 0, 10,
 static const uint32_t clks_cycles_factor = 2u; /* k=2: 2 PIO cycles per BCLK period */
 static const uint32_t clks_entry_point = 0;
 
-/* Allocate `*sm` once; (size_t)-1 means not yet allocated. */
-static int alloc_sm_once(const struct device *piodev, size_t *sm)
+static int sm_res_claim(const struct device *piodev, struct pio_sm_res *res)
 {
 	size_t allocated_sm;
 	int retval;
 	PIO pio = pio_rpi_pico_get_pio(piodev);
 
-	if (*sm != (size_t)-1) {
+	if (res->sm != (size_t)-1) {
 		return 0;
 	}
 
@@ -240,16 +236,134 @@ static int alloc_sm_once(const struct device *piodev, size_t *sm)
 	}
 
 	pio_sm_set_enabled(pio, allocated_sm, false);
-	*sm = allocated_sm;
+	res->sm = allocated_sm;
 	return 0;
 }
 
+static int sm_res_load(const struct device *piodev, struct pio_sm_res *res,
+		       const pio_program_t *prog)
+{
+	PIO pio = pio_rpi_pico_get_pio(piodev);
+
+	if (res->prog == prog) {
+		return 0;
+	}
+
+	if (res->sm == (size_t)-1) {
+		LOG_ERR("cannot load program: SM not claimed");
+		return -EINVAL;
+	}
+
+	pio_sm_set_enabled(pio, res->sm, false);
+
+	if (res->prog != NULL) {
+		/* Overwrite. Not atomic: if the add below fails, the
+		 * resource is left unloaded. */
+		pio_remove_program(pio, res->prog, res->offset);
+		res->prog = NULL;
+	}
+
+	if (!pio_can_add_program(pio, prog)) {
+		LOG_ERR("no PIO instruction memory left for program");
+		return -EBUSY;
+	}
+
+	res->offset = pio_add_program(pio, prog);
+	res->prog = prog;
+	return 0;
+}
+
+static void sm_res_release(const struct device *piodev, struct pio_sm_res *res)
+{
+	PIO pio = pio_rpi_pico_get_pio(piodev);
+
+	if (res->prog != NULL) {
+		pio_remove_program(pio, res->prog, res->offset);
+		res->prog = NULL;
+	}
+
+	if (res->sm != (size_t)-1) {
+		pio_sm_set_enabled(pio, res->sm, false);
+		pio_sm_unclaim(pio, res->sm);
+		res->sm = (size_t)-1;
+	}
+}
+
 /*
- * Load and configure the clock generator plus the configured TX/RX follower state
- * machines. The clks SM emits BCLK (1-bit sideset) and WS (out/in base = BCLK + 1);
- * the followers gate off those clock pins via `wait pin` / `jmp pin`.
+ * Set up the clks SM: load the clock generator program, configure BCLK on the
+ * 1-bit sideset and WS on the out/in base, and program the clock divider from
+ * the shared sampling parameters. Started separately by pio_i2s_clks_start().
  */
-static int pio_i2s_setup_all(const struct device *dev)
+static int pio_i2s_setup_clks(const struct device *dev)
+{
+	const struct pio_i2s_config *dev_config = dev->config;
+	struct pio_i2s_data *dev_data = dev->data;
+	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
+	uint32_t bclk_pin = dev_config->clock_pin;
+	uint32_t ws_pin = dev_config->ws_pin;
+	struct pio_sm_res *res = &dev_data->clks_res;
+	pio_sm_config c;
+	int retval;
+
+	retval = sm_res_claim(dev_config->piodev, res);
+	if (retval < 0) {
+		return retval;
+	}
+
+	retval = sm_res_load(dev_config->piodev, res, RPI_PICO_PIO_GET_PROGRAM(clks));
+	if (retval < 0) {
+		return retval;
+	}
+
+	c = pio_get_default_sm_config();
+	sm_config_set_wrap(&c, res->offset + clks_wrap_target, res->offset + clks_wrap);
+	sm_config_set_sideset_pin_base(&c, bclk_pin);
+	sm_config_set_sideset(&c, 1, false, false);
+	sm_config_set_out_pins(&c, ws_pin, 1);
+	sm_config_set_in_pins(&c, ws_pin);
+	sm_config_set_in_pin_count(&c, 1);
+	pio_sm_init(pio, res->sm, res->offset, &c);
+
+	/* clks drives BCLK + WS; they are independent pins, so set both bits. */
+	uint32_t pin_mask = (1u << bclk_pin) | (1u << ws_pin);
+	pio_sm_set_pins_with_mask(pio, res->sm, 0, pin_mask); /* clear pins */
+	pio_sm_set_pindirs_with_mask(pio, res->sm, pin_mask, pin_mask);
+
+	/* clks clock divider: k=2 PIO cycles per BCLK period. */
+	// TODO: When I do configure target, check that the sampling frequency is fast enough.
+	uint32_t sample_freq = dev_data->sampling_freq;
+	uint32_t channel_length = dev_data->channel_length;
+	/* Number of channels is always 2 for I2S data format */
+	const uint32_t num_channels = 2;
+	uint64_t system_clock_frequency = sys_clock_hw_cycles_per_sec();
+	/* 8.8 fixed-point divider: (f_sys << 8) / (k * f_s * channel_length * num_channels) */
+	uint64_t divider = (system_clock_frequency << 8u) /
+		(clks_cycles_factor * sample_freq * channel_length * num_channels);
+	pio_sm_set_clkdiv_int_frac(pio, res->sm, divider >> 8u, divider & 0xffu);
+
+	return 0;
+}
+
+/* True when either configured stream requests loopback: the TX follower then
+ * drives the rx_data pin directly, so the RX follower samples exactly what TX
+ * emits (mirrors the original single-SM driver). rx_data == BCLK - 1 still
+ * holds, so RX keeps gating on BCLK correctly. */
+static bool pio_i2s_loopback_enabled(struct pio_i2s_data *dev_data)
+{
+	bool tx_configured = dev_data->tx.state != I2S_STATE_NOT_READY;
+	bool rx_configured = dev_data->rx.state != I2S_STATE_NOT_READY;
+
+	return (tx_configured && (dev_data->tx.cfg.options & I2S_OPT_LOOPBACK)) ||
+	       (rx_configured && (dev_data->rx.cfg.options & I2S_OPT_LOOPBACK));
+}
+
+/*
+ * Set up one stream's clock-follower SM: load its program and configure it
+ * against the clks SM's BCLK/WS pins, which it gates off via `wait pin` /
+ * `jmp pin`. Touches only this stream's resources.
+ */
+static int pio_i2s_setup_stream(const struct device *dev, struct stream *stream,
+				enum i2s_dir dir)
 {
 	const struct pio_i2s_config *dev_config = dev->config;
 	struct pio_i2s_data *dev_data = dev->data;
@@ -257,162 +371,105 @@ static int pio_i2s_setup_all(const struct device *dev)
 	uint32_t channel_length = dev_data->channel_length;
 	uint32_t bclk_pin = dev_config->clock_pin;
 	uint32_t ws_pin = dev_config->ws_pin;
+	struct pio_sm_res *res = &stream->res;
+	bool en_loopback = pio_i2s_loopback_enabled(dev_data);
 	pio_sm_config c;
 	int retval;
 
-	bool setup_tx = dev_data->tx.state != I2S_STATE_NOT_READY;
-	bool setup_rx = dev_data->rx.state != I2S_STATE_NOT_READY;
-
-	/* In loopback mode the TX follower drives the rx_data pin directly, so the RX
-	 * follower samples exactly what TX emits (mirrors the original single-SM driver).
-	 * rx_data == BCLK - 1 still holds, so RX keeps gating on BCLK correctly. */
-	bool en_loopback = (setup_tx && (dev_data->tx.cfg.options & I2S_OPT_LOOPBACK)) ||
-			   (setup_rx && (dev_data->rx.cfg.options & I2S_OPT_LOOPBACK));
-	uint32_t tx_out_pin = en_loopback ? dev_data->rx.data_pin : dev_data->tx.data_pin;
-
-	/* Allocate the clocks SM (always needed) and the per-stream follower SMs. */
-	retval = alloc_sm_once(dev_config->piodev, &dev_data->clks_sm);
+	retval = sm_res_claim(dev_config->piodev, res);
 	if (retval < 0) {
 		return retval;
 	}
-	if (setup_tx) {
-		retval = alloc_sm_once(dev_config->piodev, &dev_data->tx.sm);
+
+	if (dir == I2S_DIR_TX) {
+		/* out -> tx_data (rx_data in loopback), in base = BCLK, jmp pin = WS */
+		uint32_t tx_out_pin = en_loopback ? dev_data->rx.data_pin : stream->data_pin;
+
+		retval = sm_res_load(dev_config->piodev, res, RPI_PICO_PIO_GET_PROGRAM(tx_target));
 		if (retval < 0) {
 			return retval;
 		}
-	}
-	if (setup_rx) {
-		retval = alloc_sm_once(dev_config->piodev, &dev_data->rx.sm);
-		if (retval < 0) {
-			return retval;
-		}
-	}
-
-	/* Remove previously loaded programs so a reconfigure starts from a clean slate. */
-	if (dev_data->clks_loaded_program != NULL) {
-		pio_remove_program(pio, dev_data->clks_loaded_program, dev_data->clks_offset);
-		dev_data->clks_loaded_program = NULL;
-	}
-	if (dev_data->tx.loaded_program != NULL) {
-		pio_remove_program(pio, dev_data->tx.loaded_program, dev_data->tx.offset);
-		dev_data->tx.loaded_program = NULL;
-	}
-	if (dev_data->rx.loaded_program != NULL) {
-		pio_remove_program(pio, dev_data->rx.loaded_program, dev_data->rx.offset);
-		dev_data->rx.loaded_program = NULL;
-	}
-
-	/* --- clks: BCLK on sideset, WS on out/in base --- */
-	if (!pio_can_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(clks))) {
-		return -EBUSY;
-	}
-	dev_data->clks_offset = pio_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(clks));
-	dev_data->clks_loaded_program = RPI_PICO_PIO_GET_PROGRAM(clks);
-	c = pio_get_default_sm_config();
-	sm_config_set_wrap(&c, dev_data->clks_offset + clks_wrap_target,
-			   dev_data->clks_offset + clks_wrap);
-	sm_config_set_sideset_pin_base(&c, bclk_pin);
-	sm_config_set_sideset(&c, 1, false, false);
-	sm_config_set_out_pins(&c, ws_pin, 1);
-	sm_config_set_in_pins(&c, ws_pin);
-	sm_config_set_in_pin_count(&c, 1);
-	pio_sm_init(pio, dev_data->clks_sm, dev_data->clks_offset, &c);
-
-	/* --- tx_target: out -> tx_data, in base = BCLK, jmp pin = WS --- */
-	if (setup_tx) {
-		if (!pio_can_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(tx_target))) {
-			return -EBUSY;
-		}
-		dev_data->tx.offset = pio_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(tx_target));
-		dev_data->tx.loaded_program = RPI_PICO_PIO_GET_PROGRAM(tx_target);
 		c = pio_get_default_sm_config();
-		sm_config_set_wrap(&c, dev_data->tx.offset + tx_target_wrap_target,
-				   dev_data->tx.offset + tx_target_wrap);
+		sm_config_set_wrap(&c, res->offset + tx_target_wrap_target,
+				   res->offset + tx_target_wrap);
 		sm_config_set_out_pins(&c, tx_out_pin, 1);
 		sm_config_set_in_pins(&c, bclk_pin);
 		sm_config_set_in_pin_count(&c, 1);
 		sm_config_set_jmp_pin(&c, ws_pin);
 		sm_config_set_out_shift(&c, false, false, channel_length == 16 ? 32 : 1);
 		sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
-		pio_sm_init(pio, dev_data->tx.sm, dev_data->tx.offset, &c);
+		pio_sm_init(pio, res->sm, res->offset, &c);
 		/* Followers run as fast as possible; they gate on the clock pins. */
-		pio_sm_set_clkdiv_int_frac(pio, dev_data->tx.sm, 1, 0);
-	}
-
-	/* --- rx_target: in base = rx_data (data at +0, BCLK at +1), jmp pin = WS --- */
-	if (setup_rx) {
-		if (!pio_can_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(rx_target))) {
-			return -EBUSY;
+		pio_sm_set_clkdiv_int_frac(pio, res->sm, 1, 0);
+		pio_sm_set_pins_with_mask(pio, res->sm, 0, 1u << tx_out_pin);
+		pio_sm_set_pindirs_with_mask(pio, res->sm, 1u << tx_out_pin, 1u << tx_out_pin);
+	} else {
+		/* in base = rx_data (data at +0, BCLK at +1), jmp pin = WS */
+		retval = sm_res_load(dev_config->piodev, res, RPI_PICO_PIO_GET_PROGRAM(rx_target));
+		if (retval < 0) {
+			return retval;
 		}
-		dev_data->rx.offset = pio_add_program(pio, RPI_PICO_PIO_GET_PROGRAM(rx_target));
-		dev_data->rx.loaded_program = RPI_PICO_PIO_GET_PROGRAM(rx_target);
 		c = pio_get_default_sm_config();
-		sm_config_set_wrap(&c, dev_data->rx.offset + rx_target_wrap_target,
-				   dev_data->rx.offset + rx_target_wrap);
-		sm_config_set_in_pins(&c, dev_data->rx.data_pin);
+		sm_config_set_wrap(&c, res->offset + rx_target_wrap_target,
+				   res->offset + rx_target_wrap);
+		sm_config_set_in_pins(&c, stream->data_pin);
 		sm_config_set_in_pin_count(&c, 2); /* data at +0, BCLK at +1 */
 		sm_config_set_jmp_pin(&c, ws_pin);
 		sm_config_set_in_shift(&c, false, false, channel_length == 16 ? 32 : 1);
 		sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
-		pio_sm_init(pio, dev_data->rx.sm, dev_data->rx.offset, &c);
-		pio_sm_set_clkdiv_int_frac(pio, dev_data->rx.sm, 1, 0);
+		pio_sm_init(pio, res->sm, res->offset, &c);
+		pio_sm_set_clkdiv_int_frac(pio, res->sm, 1, 0);
+		if (!en_loopback) {
+			/* rx_data stays an input; in loopback it is the TX out pin
+			 * and driven by the TX follower instead. */
+			pio_sm_set_pindirs_with_mask(pio, res->sm, 0, 1u << stream->data_pin);
+		}
 	}
-
-	/* Pin directions: clks drives BCLK + WS; tx drives tx_data; rx_data stays input.
-	 * BCLK and WS are independent pins, so set their direction bits separately. */
-	uint32_t pin_mask = (1u << bclk_pin) | (1u << ws_pin);
-	uint32_t pin_dirs = (1u << bclk_pin) | (1u << ws_pin);
-
-	if (setup_tx) {
-		pin_mask |= (1u << tx_out_pin);
-		pin_dirs |= (1u << tx_out_pin);
-	}
-	if (setup_rx && !en_loopback) {
-		/* In loopback rx_data == tx_out_pin and is already an output above. */
-		pin_mask |= (1u << dev_data->rx.data_pin); /* leave as input */
-	}
-	pio_sm_set_pindirs_with_mask(pio, dev_data->clks_sm, pin_dirs, pin_mask);
-	pio_sm_set_pins(pio, dev_data->clks_sm, 0); /* clear pins */
-
-	/* clks clock divider: k=2 PIO cycles per BCLK period. */
-	// TODO: When I do configure target, check that the sampling frequency is fast enough.
-	uint32_t sample_freq = dev_data->sampling_freq;
-	/* Number of channels is always 2 for I2S data format */
-	const uint32_t num_channels = 2;
-	uint64_t system_clock_frequency = sys_clock_hw_cycles_per_sec();
-	/* 8.8 fixed-point divider: (f_sys << 8) / (k * f_s * channel_length * num_channels) */
-	uint64_t divider = (system_clock_frequency << 8u) /
-		(clks_cycles_factor * sample_freq * channel_length * num_channels);
-	pio_sm_set_clkdiv_int_frac(pio, dev_data->clks_sm, divider >> 8u, divider & 0xffu);
 
 	return 0;
 }
 
-static void pio_i2s_start_all(const struct device *dev)
+static void pio_i2s_clks_start(const struct device *dev)
 {
 	const struct pio_i2s_config *dev_config = dev->config;
 	struct pio_i2s_data *dev_data = dev->data;
 	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
 	uint32_t channel_length = dev_data->channel_length;
+	struct pio_sm_res *res = &dev_data->clks_res;
 
-	/* Start the clocks SM here, once, at configure time; it is the I2S
-	 * controller (BCLK/WS) and runs continuously — it is never stopped or
-	 * restarted while running, and the followers are never touched here. Each
-	 * TX/RX follower is instead reset and aligned to this free-running clock at
-	 * its own START (see i2s_prepare_follower); starting one stream never
-	 * disturbs the clocks SM or the other stream's follower. */
-	pio_sm_set_enabled(pio, dev_data->clks_sm, false);
-	pio_sm_exec(pio, dev_data->clks_sm, pio_encode_set(pio_y, channel_length - 2));
-	pio_sm_exec(pio, dev_data->clks_sm,
-		    pio_encode_jmp(dev_data->clks_offset + clks_entry_point));
-	pio_sm_set_enabled(pio, dev_data->clks_sm, true);
-
+	/* The clks SM is the I2S controller (BCLK/WS): started here, when it is
+	 * (re)configured, and then left free-running — stream START/STOP never
+	 * stops or restarts it, and the followers are never touched here. Each
+	 * TX/RX follower is instead reset and aligned to this free-running clock
+	 * at its own START; starting one stream never disturbs the clks SM or
+	 * the other stream's follower. */
+	pio_sm_set_enabled(pio, res->sm, false);
+	pio_sm_exec(pio, res->sm, pio_encode_set(pio_y, channel_length - 2));
+	pio_sm_exec(pio, res->sm, pio_encode_jmp(res->offset + clks_entry_point));
+	pio_sm_set_enabled(pio, res->sm, true);
 }
 
 static void drop_queue(struct stream *stream) {
 	struct queue_item item;
 	while (k_msgq_get(stream->msgq, &item, K_NO_WAIT) == 0) {
 		k_mem_slab_free(stream->cfg.mem_slab, item.mem_block);
+	}
+}
+
+static void pio_i2s_deconfigure_stream(const struct device *dev, struct stream *stream)
+{
+	const struct pio_i2s_config *dev_config = dev->config;
+	struct pio_i2s_data *dev_data = dev->data;
+	struct stream *other_stream =
+		stream == &dev_data->rx ? &dev_data->tx : &dev_data->rx;
+
+	drop_queue(stream);
+	sm_res_release(dev_config->piodev, &stream->res);
+	memset(&stream->cfg, 0, sizeof(struct i2s_config));
+	stream->state = I2S_STATE_NOT_READY;
+
+	if (other_stream->state == I2S_STATE_NOT_READY) {
+		sm_res_release(dev_config->piodev, &dev_data->clks_res);
 	}
 }
 
@@ -439,33 +496,7 @@ static int i2s_rpi_pico_configure_single(const struct device *dev, enum i2s_dir 
 	}
 
 	if (i2s_cfg->frame_clk_freq == 0U) {
-		drop_queue(stream);
-
-		if(stream->sm != (size_t)-1) {
-			pio_sm_set_enabled(pio, stream->sm, false);
-			pio_sm_unclaim(pio, stream->sm);
-			stream->sm = (size_t)-1;
-		}
-
-		if(other_stream->sm == (size_t)-1) {
-			pio_sm_set_enabled(pio, dev_data->clks_sm, false);
-			pio_sm_unclaim(pio, dev_data->clks_sm);
-			dev_data->clks_sm = (size_t)-1;
-
-			if(dev_data->clks_loaded_program != NULL) {
-				pio_remove_program(pio, dev_data->clks_loaded_program, dev_data->clks_offset);
-				dev_data->clks_loaded_program = NULL;
-			}
-		}
-
-		if(stream->loaded_program != NULL) {
-			pio_remove_program(pio, stream->loaded_program, stream->offset);
-			stream->loaded_program = NULL;
-		}
-
-		memset(&stream->cfg, 0, sizeof(struct i2s_config));
-
-		stream->state = I2S_STATE_NOT_READY;
+		pio_i2s_deconfigure_stream(dev, stream);
 		return 0;
 	}
 
@@ -521,17 +552,13 @@ static int i2s_rpi_pico_configure_single(const struct device *dev, enum i2s_dir 
 		}
 	}
 
-
-
-	/* Allocate this stream's follower SM up front so we can derive its DMA DREQ slot.
-	 * The clocks SM and the actual program loading happen later in pio_i2s_setup_all(). */
-	retval = alloc_sm_once(dev_config->piodev, &stream->sm);
+	retval = sm_res_claim(dev_config->piodev, &stream->res);
 	if (retval < 0) {
 		return retval;
 	}
 
 	stream->dma_cfg.user_data = (void*) dev;
-	stream->dma_cfg.dma_slot = RPI_PICO_DMA_DREQ_TO_SLOT(pio_get_dreq(pio, stream->sm, dir == I2S_DIR_TX));
+	stream->dma_cfg.dma_slot = RPI_PICO_DMA_DREQ_TO_SLOT(pio_get_dreq(pio, stream->res.sm, dir == I2S_DIR_TX));
 	memcpy(&stream->cfg, i2s_cfg, sizeof(struct i2s_config));
 
 	dev_data->channel_length = i2s_cfg->word_size > 16 ? 32 : 16;
@@ -543,40 +570,71 @@ static int i2s_rpi_pico_configure_single(const struct device *dev, enum i2s_dir 
 
 }
 
-// TODO: Verify that sampling frequency is the same between tx and rx.
 // TODO: verify target vs loopback modes.
 // TODO: Comprehensive checks against bad cfgs.
 static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 			       const struct i2s_config *i2s_cfg)
 {
-	// const struct pio_i2s_config *dev_config = dev->config;
-	// struct pio_i2s_data *dev_data = dev->data;
+	struct pio_i2s_data *dev_data = dev->data;
+	bool cfg_rx = (dir == I2S_DIR_RX || dir == I2S_DIR_BOTH);
+	bool cfg_tx = (dir == I2S_DIR_TX || dir == I2S_DIR_BOTH);
 	int retval;
 
-	if (dir == I2S_DIR_RX || dir == I2S_DIR_BOTH) {
+	if (cfg_rx) {
 		retval = i2s_rpi_pico_configure_single(dev, I2S_DIR_RX, i2s_cfg);
-		if(retval < 0) {
+		if (retval < 0) {
 			return retval;
 		}
 	}
 
-	if (dir == I2S_DIR_TX || dir == I2S_DIR_BOTH) {
+	if (cfg_tx) {
 		retval = i2s_rpi_pico_configure_single(dev, I2S_DIR_TX, i2s_cfg);
-		if(retval < 0) {
+		if (retval < 0) {
 			return retval;
 		}
 	}
 
-	if(i2s_cfg->frame_clk_freq == 0) {
+	if (i2s_cfg->frame_clk_freq == 0U) {
 		return 0;
 	}
 
-	retval = pio_i2s_setup_all(dev);
-	if (retval < 0) {
-		return retval;
+	if (cfg_rx) {
+		retval = pio_i2s_setup_stream(dev, &dev_data->rx, I2S_DIR_RX);
+		if (retval < 0) {
+			return retval;
+		}
 	}
 
-	pio_i2s_start_all(dev);
+	if (cfg_tx) {
+		retval = pio_i2s_setup_stream(dev, &dev_data->tx, I2S_DIR_TX);
+		if (retval < 0) {
+			return retval;
+		}
+	} else if (cfg_rx && dev_data->tx.state == I2S_STATE_READY) {
+		retval = pio_i2s_setup_stream(dev, &dev_data->tx, I2S_DIR_TX);
+		if (retval < 0) {
+			return retval;
+		}
+	}
+
+	/* A stream that is RUNNING (or STOPPING, i.e. still draining) depends on
+	 * the free-running clks SM, and configure_single guarantees the shared
+	 * parameters cannot change while one is configured — so leave clks
+	 * untouched. Otherwise nothing consumes the clock: (re)program and
+	 * (re)start it unconditionally, which also covers the first configure
+	 * and reconfigure-after-deconfigure. */
+	bool tx_active = dev_data->tx.state == I2S_STATE_RUNNING ||
+			 dev_data->tx.state == I2S_STATE_STOPPING;
+	bool rx_active = dev_data->rx.state == I2S_STATE_RUNNING ||
+			 dev_data->rx.state == I2S_STATE_STOPPING;
+
+	if (!tx_active && !rx_active) {
+		retval = pio_i2s_setup_clks(dev);
+		if (retval < 0) {
+			return retval;
+		}
+		pio_i2s_clks_start(dev);
+	}
 
 	return 0;
 }
@@ -709,7 +767,7 @@ void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	retval = reload_dma(stream->dev_dma, stream->dma_channel,
 		&stream->dma_cfg,
 		stream->mem_block,
-		(void *)&pio->txf[data->tx.sm],
+		(void *)&pio->txf[data->tx.res.sm],
 		mem_block_size);
 
 	if (retval < 0) {
@@ -778,7 +836,7 @@ void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 
 	retval = reload_dma(stream->dev_dma, stream->dma_channel,
 			&stream->dma_cfg,
-			(void *)&pio->rxf[dev_data->rx.sm],
+			(void *)&pio->rxf[dev_data->rx.res.sm],
 			stream->mem_block,
 			stream->cfg.block_size);
 
@@ -820,21 +878,21 @@ int i2s_start_rx_stream_dma(const struct device *dev, struct stream *stream) {
 		return retval;
 	}
 
-	pio_sm_set_enabled(pio, stream->sm, false);
-	pio_sm_clear_fifos(pio, stream->sm);
-	pio_sm_restart(pio, stream->sm);
-	pio_sm_exec(pio, stream->sm, pio_encode_jmp(stream->offset));
-	pio_sm_set_enabled(pio, stream->sm, true);
+	pio_sm_set_enabled(pio, stream->res.sm, false);
+	pio_sm_clear_fifos(pio, stream->res.sm);
+	pio_sm_restart(pio, stream->res.sm);
+	pio_sm_exec(pio, stream->res.sm, pio_encode_jmp(stream->res.offset));
+	pio_sm_set_enabled(pio, stream->res.sm, true);
 
 	uint32_t priming_words = data->channel_length == 32 ? 2 : 1;
 	// TODO: think about putting a ISR lock on this startup code.
 	for (uint32_t i = 0; i < priming_words; i++) {
-		pio_sm_get_blocking(pio, stream->sm);
+		pio_sm_get_blocking(pio, stream->res.sm);
 	}
 
 	retval = start_dma(stream->dev_dma, stream->dma_channel,
 			&stream->dma_cfg,
-			(void *)&pio->rxf[data->rx.sm],
+			(void *)&pio->rxf[stream->res.sm],
 			false, stream->mem_block,
 			true, stream->cfg.block_size
 	);
@@ -869,10 +927,10 @@ int i2s_start_tx_stream_dma(const struct device *dev, struct stream *stream) {
 	stream->mem_block = item.mem_block;
     	mem_block_size = item.size;
 
-	pio_sm_set_enabled(pio, stream->sm, false);
-	pio_sm_restart(pio, stream->sm);
-	pio_sm_clear_fifos(pio, stream->sm);
-	pio_sm_exec(pio, stream->sm, pio_encode_jmp(stream->offset));
+	pio_sm_set_enabled(pio, stream->res.sm, false);
+	pio_sm_restart(pio, stream->res.sm);
+	pio_sm_clear_fifos(pio, stream->res.sm);
+	pio_sm_exec(pio, stream->res.sm, pio_encode_jmp(stream->res.offset));
 
 	/* Stage one frame of silence ahead of the real data: once enabled the
 	 * follower may start mid-frame, and it consumes this silent word while its
@@ -883,13 +941,13 @@ int i2s_start_tx_stream_dma(const struct device *dev, struct stream *stream) {
 	uint32_t priming_words = data->channel_length == 32 ? 2 : 1;
 
 	for (uint32_t i = 0; i < priming_words; i++) {
-		pio_sm_put_blocking(pio, data->tx.sm, 0);
+		pio_sm_put_blocking(pio, stream->res.sm, 0);
 	}
 
 	ret = start_dma(stream->dev_dma, stream->dma_channel,
 			&stream->dma_cfg,
 			stream->mem_block, true, /* TODO: scr addr increment setting? */
-			(void *)&pio->txf[data->tx.sm],
+			(void *)&pio->txf[stream->res.sm],
 			false,
 			mem_block_size);
 	if (ret < 0) {
@@ -899,7 +957,7 @@ int i2s_start_tx_stream_dma(const struct device *dev, struct stream *stream) {
 
 	/* Data staged: enable just this follower. Its first pull is the priming
 	 * word; the clocks SM and the RX follower are left untouched. */
-	pio_sm_set_enabled(pio, data->tx.sm, true);
+	pio_sm_set_enabled(pio, stream->res.sm, true);
 
 	return 0;
 
@@ -1191,8 +1249,7 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 			.channel_priority = 1, /* TODO: hardcoded */		\
 			.dma_callback = dma_tx_callback			\
 		},								\
-		.sm = (size_t)-1,                          \
-		.loaded_program = NULL,                         \
+		.res = {.sm = (size_t)-1, .prog = NULL},        \
         },                                             \
         .rx = {                                                        \
 		.msgq = &rx_##idx##_queue,                               \
@@ -1212,11 +1269,9 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 			.channel_priority = 1, /* TODO: hardcoded */		\
 			.dma_callback = dma_rx_callback			\
 		},								\
-		.sm = (size_t)-1,                          \
-		.loaded_program = NULL,                         \
+		.res = {.sm = (size_t)-1, .prog = NULL},        \
         },                                             \
-        .clks_sm = (size_t)-1,                        \
-        .clks_loaded_program = NULL                        \
+        .clks_res = {.sm = (size_t)-1, .prog = NULL}                       \
     };					\
 	DEVICE_DT_INST_DEFINE(idx, pio_i2s_init, NULL, &pio_i2s##idx##_data,			\
 			      &pio_i2s##idx##_config, POST_KERNEL,				\
