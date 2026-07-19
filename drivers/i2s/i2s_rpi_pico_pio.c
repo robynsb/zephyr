@@ -17,7 +17,6 @@
 	      can be used in the configure function.
 */
 /* Next steps:
- * - make the loaded programs static somehow.
  * - add target receiver and sender.
  *
  */
@@ -77,9 +76,9 @@ struct stream {
 
 	const uint32_t data_pin;
 
-	/* PIO state machine running this stream's follower program. */
-	uint32_t sm;
-	bool sm_allocated;
+	/* PIO state machine running this stream's follower program.
+	 * (size_t)-1 means not allocated. */
+	size_t sm;
 	uint32_t offset;
 	const pio_program_t *loaded_program;
 };
@@ -89,9 +88,9 @@ struct pio_i2s_data {
     struct stream rx;
     uint32_t channel_length;
     uint32_t sampling_freq;
-    /* PIO state machine running the BCLK/WS clock generator. */
-    uint32_t clks_sm;
-    bool clks_sm_allocated;
+    /* PIO state machine running the BCLK/WS clock generator.
+     * (size_t)-1 means not allocated. */
+    size_t clks_sm;
     uint32_t clks_offset;
     const pio_program_t *clks_loaded_program;
 };
@@ -223,14 +222,14 @@ RPI_PICO_PIO_DEFINE_PROGRAM(rx_target, 0, 10,
 static const uint32_t clks_cycles_factor = 2u; /* k=2: 2 PIO cycles per BCLK period */
 static const uint32_t clks_entry_point = 0;
 
-/* Allocate `*sm` once, guarded by `*allocated`. */
-static int alloc_sm_once(const struct device *piodev, uint32_t *sm, bool *allocated)
+/* Allocate `*sm` once; (size_t)-1 means not yet allocated. */
+static int alloc_sm_once(const struct device *piodev, size_t *sm)
 {
 	size_t allocated_sm;
 	int retval;
 	PIO pio = pio_rpi_pico_get_pio(piodev);
 
-	if (*allocated) {
+	if (*sm != (size_t)-1) {
 		return 0;
 	}
 
@@ -242,7 +241,6 @@ static int alloc_sm_once(const struct device *piodev, uint32_t *sm, bool *alloca
 
 	pio_sm_set_enabled(pio, allocated_sm, false);
 	*sm = allocated_sm;
-	*allocated = true;
 	return 0;
 }
 
@@ -273,18 +271,18 @@ static int pio_i2s_setup_all(const struct device *dev)
 	uint32_t tx_out_pin = en_loopback ? dev_data->rx.data_pin : dev_data->tx.data_pin;
 
 	/* Allocate the clocks SM (always needed) and the per-stream follower SMs. */
-	retval = alloc_sm_once(dev_config->piodev, &dev_data->clks_sm, &dev_data->clks_sm_allocated);
+	retval = alloc_sm_once(dev_config->piodev, &dev_data->clks_sm);
 	if (retval < 0) {
 		return retval;
 	}
 	if (setup_tx) {
-		retval = alloc_sm_once(dev_config->piodev, &dev_data->tx.sm, &dev_data->tx.sm_allocated);
+		retval = alloc_sm_once(dev_config->piodev, &dev_data->tx.sm);
 		if (retval < 0) {
 			return retval;
 		}
 	}
 	if (setup_rx) {
-		retval = alloc_sm_once(dev_config->piodev, &dev_data->rx.sm, &dev_data->rx.sm_allocated);
+		retval = alloc_sm_once(dev_config->piodev, &dev_data->rx.sm);
 		if (retval < 0) {
 			return retval;
 		}
@@ -443,16 +441,16 @@ static int i2s_rpi_pico_configure_single(const struct device *dev, enum i2s_dir 
 	if (i2s_cfg->frame_clk_freq == 0U) {
 		drop_queue(stream);
 
-		if(stream->sm_allocated) {
+		if(stream->sm != (size_t)-1) {
 			pio_sm_set_enabled(pio, stream->sm, false);
-			stream->sm_allocated = false;
 			pio_sm_unclaim(pio, stream->sm);
+			stream->sm = (size_t)-1;
 		}
 
-		if(!other_stream->sm_allocated) {
+		if(other_stream->sm == (size_t)-1) {
 			pio_sm_set_enabled(pio, dev_data->clks_sm, false);
-			dev_data->clks_sm_allocated = false;
 			pio_sm_unclaim(pio, dev_data->clks_sm);
+			dev_data->clks_sm = (size_t)-1;
 
 			if(dev_data->clks_loaded_program != NULL) {
 				pio_remove_program(pio, dev_data->clks_loaded_program, dev_data->clks_offset);
@@ -527,7 +525,7 @@ static int i2s_rpi_pico_configure_single(const struct device *dev, enum i2s_dir 
 
 	/* Allocate this stream's follower SM up front so we can derive its DMA DREQ slot.
 	 * The clocks SM and the actual program loading happen later in pio_i2s_setup_all(). */
-	retval = alloc_sm_once(dev_config->piodev, &stream->sm, &stream->sm_allocated);
+	retval = alloc_sm_once(dev_config->piodev, &stream->sm);
 	if (retval < 0) {
 		return retval;
 	}
@@ -567,6 +565,10 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 		if(retval < 0) {
 			return retval;
 		}
+	}
+
+	if(i2s_cfg->frame_clk_freq == 0) {
+		return 0;
 	}
 
 	retval = pio_i2s_setup_all(dev);
@@ -1189,7 +1191,7 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 			.channel_priority = 1, /* TODO: hardcoded */		\
 			.dma_callback = dma_tx_callback			\
 		},								\
-		.sm_allocated = false,                          \
+		.sm = (size_t)-1,                          \
 		.loaded_program = NULL,                         \
         },                                             \
         .rx = {                                                        \
@@ -1210,10 +1212,10 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 			.channel_priority = 1, /* TODO: hardcoded */		\
 			.dma_callback = dma_rx_callback			\
 		},								\
-		.sm_allocated = false,                          \
+		.sm = (size_t)-1,                          \
 		.loaded_program = NULL,                         \
         },                                             \
-        .clks_sm_allocated = false,                        \
+        .clks_sm = (size_t)-1,                        \
         .clks_loaded_program = NULL                        \
     };					\
 	DEVICE_DT_INST_DEFINE(idx, pio_i2s_init, NULL, &pio_i2s##idx##_data,			\
