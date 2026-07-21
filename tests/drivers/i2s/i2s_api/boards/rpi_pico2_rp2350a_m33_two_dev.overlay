@@ -1,0 +1,121 @@
+/*
+ * Two-device GPIO-loopback variant: exercises the PIO I2S driver in target mode.
+ *
+ *   i2s-node1 = pio1 -> TX, clock CONTROLLER (drives BCLK/WS)
+ *   i2s-node0 = pio0 -> RX, clock TARGET     (recovers BCLK/WS from the pins)
+ *
+ * configure_stream() in src/common.c assigns those roles; main.c only ever
+ * configures node0 for RX and node1 for TX, so neither instance is bidirectional.
+ *
+ * Required jumpers:
+ *
+ *   GP10 (TX SD)   <--->  GP7 (RX SD)
+ *   GP11 (TX BCLK) <--->  GP8 (RX BCLK)
+ *   GP12 (TX WS)   <--->  GP9 (RX WS)
+ *
+ * Pin-assignment constraint (driver, not arbitrary): the rx_target program does
+ * `in pins, 1` at in_base+0 and `wait n pin, 1` at in_base+1, with in_base set
+ * from rx_data (i2s_rpi_pico_pio.c:413-414). So on the RX instance
+ * BCLK must be rx_data + 1 -- hence 7/8 and not, say, 8/7.
+ * The TX side has no such adjacency requirement; 10/11/12 is chosen only to make
+ * the three jumpers parallel.
+ *
+ * This overlay is layered on top of boards/rpi_pico2_rp2350a_m33.overlay, which
+ * twister applies automatically for this board target. It repoints the existing
+ * pio1 pinctrl groups rather than redefining them.
+ */
+
+#include <dt-bindings/pinctrl/rpi-pico-rp2350a-pinctrl.h>
+#include <zephyr/dt-bindings/dma/rpi-pico-dma-rp2350.h>
+
+/ {
+	aliases {
+		/* Overrides the base overlay's i2s-node0 = &pio1_i2s0. */
+		i2s-node0 = &pio0_i2s0;
+		i2s-node1 = &pio1_i2s0;
+	};
+};
+
+/*
+ * pio1 / TX side. Only pinmux changes; the base overlay's input-enable flags
+ * are kept. TX genuinely needs them: the tx_target program reads its own BCLK
+ * (`sm_config_set_in_pins(&c, bclk_pin)`) and gates on WS via `jmp pin`.
+ */
+&tx_data {
+	pinmux = <PIO1_P10>;
+};
+
+&clks {
+	pinmux = <PIO1_P11>;
+};
+
+&ws {
+	pinmux = <PIO1_P12>;
+};
+
+/*
+ * Placeholder. PIO_I2S_INIT() references rx_data and the "rx" DMA
+ * unconditionally (i2s_rpi_pico_pio.c:1274), so a TX-only instance still has to
+ * declare both. GP13 is otherwise unused; the RX stream is never configured on
+ * this instance, so nothing drives or samples it.
+ */
+&rx_data {
+	pinmux = <PIO1_P13>;
+};
+
+/*
+ * pio0 / RX side, running as clock target. pio_i2s_setup_clks() is gated on
+ * `tx_is_controller || rx_is_controller` (i2s_rpi_pico_pio.c:645), so this
+ * instance claims only one state machine and never programs a clock generator.
+ *
+ * The group *node names* must be exactly rx_data / clks / ws / tx_data: the
+ * driver resolves them with DT_CHILD(<group>, <literal name>) via
+ * DT_RPI_PICO_PIO_PIN_BY_NAME (pio_rpi_pico.h:119). Only the labels are
+ * prefixed, to keep them unique against the pio1 groups in the base overlay.
+ */
+&pinctrl {
+	pio0_i2s: pio0_i2s {
+		pio0_rx_data: rx_data {
+			pinmux = <PIO0_P7>;
+			/* PIO `in pins` needs the pad input buffer, off by default. */
+			input-enable;
+		};
+		pio0_clks: clks {
+			/* Must be rx_data + 1; read as in_base+1 by rx_target. */
+			pinmux = <PIO0_P8>;
+			input-enable;
+		};
+		pio0_ws: ws {
+			/* jmp pin */
+			pinmux = <PIO0_P9>;
+			input-enable;
+		};
+		/* Placeholder, as above. Must differ from rx_data: the RX setup
+		 * forces rx_data to an input only when tx.data_pin != rx.data_pin
+		 * (i2s_rpi_pico_pio.c:420), which is the single-device loopback check.
+		 */
+		pio0_tx_data: tx_data {
+			pinmux = <PIO0_P6>;
+		};
+	};
+};
+
+&pio0 {
+	status = "okay";
+
+	pio0_i2s0: i2s0 {
+		compatible = "raspberrypi,pico-i2s-pio";
+		status = "okay";
+
+		pinctrl-0 = <&pio0_i2s>;
+		pinctrl-names = "default";
+
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		/* Channels 7/8 are taken by pio1_i2s0 in the base overlay. */
+		dmas = <&dma 5 RPI_PICO_DMA_SLOT_PIO0_TX0 0>,
+		       <&dma 6 RPI_PICO_DMA_SLOT_PIO0_RX0 0>;
+		dma-names = "tx", "rx";
+	};
+};

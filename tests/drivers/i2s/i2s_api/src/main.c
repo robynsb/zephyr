@@ -54,6 +54,23 @@ static void before_dir_both(void *fixture)
 
 	int ret;
 
+	/* These suites loop back through dev_i2s alone, which is always
+	 * i2s-node0. With CONFIG_I2S_TEST_SEPARATE_DEVICES that node is the
+	 * receiver: its transmit pin is wired to the *other* device, not back to
+	 * its own receive pin, so the loopback has no signal path.
+	 *
+	 * Drivers that reject I2S_DIR_BOTH already skip below, via the
+	 * dir_both_supported probe. That is not enough for a driver which does
+	 * support it, and configuring node0 for I2S_DIR_BOTH would make this
+	 * device a clock controller on wires another device already drives, so
+	 * bail out before touching it.
+	 */
+	if (IS_ENABLED(CONFIG_I2S_TEST_SEPARATE_DEVICES)) {
+		TC_PRINT("Single-device loopback needs CONFIG_I2S_TEST_SEPARATE_DEVICES=n.\n");
+		ztest_test_skip();
+		return;
+	}
+
 	zassert_not_null(dev_i2s, "TX/RX device not found");
 	zassert_true(device_is_ready(dev_i2s),
 		     "device %s is not ready", dev_i2s->name);

@@ -16,10 +16,6 @@
 	      enabling support for various PIO programs. Only the statically enabled ones
 	      can be used in the configure function.
 */
-/* Next steps:
- * - add target receiver and sender.
- *
- */
 
 
 #include "zephyr/sys/__assert.h"
@@ -344,6 +340,42 @@ static int pio_i2s_setup_clks(const struct device *dev)
 	return 0;
 }
 
+/*
+ * Target-mode counterpart of pio_i2s_setup_clks(): BCLK/WS come from whichever
+ * device is the controller, so this one must not drive them. They are inputs
+ * out of reset, but pin directions are per-PIO-block state that outlives the SM
+ * that set them — if this device was configured as a controller earlier,
+ * pio_i2s_setup_clks() left them as outputs and releasing that SM did not undo
+ * it. Where another I2S instance is the controller, that leaves two push-pull
+ * drivers fighting over BCLK/WS and corrupts the framing every receiver on
+ * those wires recovers. Assert the direction we need instead of inheriting
+ * whatever ran before. No clks SM is claimed: the clock is external.
+ */
+static void pio_i2s_setup_target_clks(const struct device *dev)
+{
+	const struct pio_i2s_config *dev_config = dev->config;
+	struct pio_i2s_data *dev_data = dev->data;
+	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
+	uint32_t clk_pins = (1u << dev_config->clock_pin) | (1u << dev_config->ws_pin);
+	size_t sm;
+
+	/* Pindirs are block-wide, but only an SM can drive the SET that changes
+	 * them, and doing that borrows the SM: pio_sm_set_pindirs_with_mask()
+	 * rewrites its PINCTRL and injects an instruction. Use one of our own
+	 * followers, which the caller has just set up and not yet enabled —
+	 * never a fixed index, which may belong to another driver or be running.
+	 */
+	if (dev_data->rx.res.sm != (size_t)-1) {
+		sm = dev_data->rx.res.sm;
+	} else if (dev_data->tx.res.sm != (size_t)-1) {
+		sm = dev_data->tx.res.sm;
+	} else {
+		return; /* nothing configured, so nothing of ours drives the pins */
+	}
+
+	pio_sm_set_pindirs_with_mask(pio, sm, 0, clk_pins);
+}
+
 /* True when either configured stream requests loopback: the TX follower then
  * drives the rx_data pin directly, so the RX follower samples exactly what TX
  * emits (mirrors the original single-SM driver). rx_data == BCLK - 1 still
@@ -562,6 +594,7 @@ static int i2s_rpi_pico_configure_single(const struct device *dev, enum i2s_dir 
 	}
 
 	stream->dma_cfg.user_data = (void*) dev;
+	// TODO: think about this dma_slot and the one in the overlay.
 	stream->dma_cfg.dma_slot = RPI_PICO_DMA_DREQ_TO_SLOT(pio_get_dreq(pio, stream->res.sm, dir == I2S_DIR_TX));
 	memcpy(&stream->cfg, i2s_cfg, sizeof(struct i2s_config));
 
@@ -642,6 +675,8 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 			return retval;
 		}
 		pio_i2s_clks_start(dev);
+	} else if (!tx_is_controller && !rx_is_controller) {
+		pio_i2s_setup_target_clks(dev);
 	}
 
 	return 0;
