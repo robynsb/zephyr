@@ -348,14 +348,14 @@ static int pio_i2s_setup_clks(const struct device *dev)
  * drives the rx_data pin directly, so the RX follower samples exactly what TX
  * emits (mirrors the original single-SM driver). rx_data == BCLK - 1 still
  * holds, so RX keeps gating on BCLK correctly. */
-static bool pio_i2s_loopback_enabled(struct pio_i2s_data *dev_data)
-{
-	bool tx_configured = dev_data->tx.state != I2S_STATE_NOT_READY;
-	bool rx_configured = dev_data->rx.state != I2S_STATE_NOT_READY;
+// static bool pio_i2s_loopback_enabled(struct pio_i2s_data *dev_data)
+// {
+// 	bool tx_configured = dev_data->tx.state != I2S_STATE_NOT_READY;
+// 	bool rx_configured = dev_data->rx.state != I2S_STATE_NOT_READY;
 
-	return (tx_configured && (dev_data->tx.cfg.options & I2S_OPT_LOOPBACK)) ||
-	       (rx_configured && (dev_data->rx.cfg.options & I2S_OPT_LOOPBACK));
-}
+// 	return (tx_configured && (dev_data->tx.cfg.options & I2S_OPT_LOOPBACK)) ||
+// 	       (rx_configured && (dev_data->rx.cfg.options & I2S_OPT_LOOPBACK));
+// }
 
 /*
  * Set up one stream's clock-follower SM: load its program and configure it
@@ -372,7 +372,6 @@ static int pio_i2s_setup_stream(const struct device *dev, struct stream *stream,
 	uint32_t bclk_pin = dev_config->clock_pin;
 	uint32_t ws_pin = dev_config->ws_pin;
 	struct pio_sm_res *res = &stream->res;
-	bool en_loopback = pio_i2s_loopback_enabled(dev_data);
 	pio_sm_config c;
 	int retval;
 
@@ -382,8 +381,7 @@ static int pio_i2s_setup_stream(const struct device *dev, struct stream *stream,
 	}
 
 	if (dir == I2S_DIR_TX) {
-		/* out -> tx_data (rx_data in loopback), in base = BCLK, jmp pin = WS */
-		uint32_t tx_out_pin = en_loopback ? dev_data->rx.data_pin : stream->data_pin;
+		uint32_t tx_out_pin = stream->data_pin;
 
 		retval = sm_res_load(dev_config->piodev, res, RPI_PICO_PIO_GET_PROGRAM(tx_target));
 		if (retval < 0) {
@@ -419,7 +417,7 @@ static int pio_i2s_setup_stream(const struct device *dev, struct stream *stream,
 		sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
 		pio_sm_init(pio, res->sm, res->offset, &c);
 		pio_sm_set_clkdiv_int_frac(pio, res->sm, 1, 0);
-		if (!en_loopback) {
+		if (dev_data->tx.data_pin != dev_data->rx.data_pin) {
 			/* rx_data stays an input; in loopback it is the TX out pin
 			 * and driven by the TX follower instead. */
 			pio_sm_set_pindirs_with_mask(pio, res->sm, 0, 1u << stream->data_pin);
@@ -515,18 +513,24 @@ static int i2s_rpi_pico_configure_single(const struct device *dev, enum i2s_dir 
 		return -EINVAL;
 	}
 
-	// bool is_bit_clk_target = i2s_cfg->options & I2S_OPT_BIT_CLK_TARGET;
-	// bool is_frame_clk_target = i2s_cfg->options & I2S_OPT_FRAME_CLK_TARGET;
+	bool is_bit_clk_target = i2s_cfg->options & I2S_OPT_BIT_CLK_TARGET;
+	bool is_frame_clk_target = i2s_cfg->options & I2S_OPT_FRAME_CLK_TARGET;
+
+	if (is_bit_clk_target != is_frame_clk_target) {
+		LOG_ERR("I2S bit CLK and frame CLK must be either both target or both controller.");
+		return -EINVAL;
+	}
 
 	// if (is_bit_clk_target || is_frame_clk_target) {
 	// 	LOG_ERR("I2S target mode unsupported.");
 	// 	return -EINVAL;
 	// }
 
-	// if (i2s_cfg->options & I2S_OPT_LOOPBACK) {
-	// 	LOG_ERR("I2S loopback mode unsupported.");
-	// 	return -EINVAL;
-	// }
+	if (i2s_cfg->options & I2S_OPT_LOOPBACK) {
+		LOG_ERR("I2S loopback mode unsupported.");
+		LOG_DBG("To enable loopback, use the same SD for TX and RX pinctrl");
+		return -EINVAL;
+	}
 
 	if (i2s_cfg->options & I2S_OPT_PINGPONG) {
 		LOG_ERR("I2S_OPT_PINGPONG is unsupported.");
@@ -605,12 +609,9 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 		}
 	}
 
+	// bool en_loopback = pio_i2s_loopback_enabled(dev_data);
+	// if (cfg_tx || (dev_data->tx.state == I2S_STATE_READY && cfg_rx && en_loopback)) {
 	if (cfg_tx) {
-		retval = pio_i2s_setup_stream(dev, &dev_data->tx, I2S_DIR_TX);
-		if (retval < 0) {
-			return retval;
-		}
-	} else if (cfg_rx && dev_data->tx.state == I2S_STATE_READY) {
 		retval = pio_i2s_setup_stream(dev, &dev_data->tx, I2S_DIR_TX);
 		if (retval < 0) {
 			return retval;
@@ -628,7 +629,14 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 	bool rx_active = dev_data->rx.state == I2S_STATE_RUNNING ||
 			 dev_data->rx.state == I2S_STATE_STOPPING;
 
-	if (!tx_active && !rx_active) {
+	bool tx_is_controller = dev_data->tx.state != I2S_STATE_NOT_READY &&
+				!(dev_data->tx.cfg.options &
+				  (I2S_OPT_BIT_CLK_TARGET | I2S_OPT_FRAME_CLK_TARGET));
+	bool rx_is_controller = dev_data->rx.state != I2S_STATE_NOT_READY &&
+				!(dev_data->rx.cfg.options &
+				  (I2S_OPT_BIT_CLK_TARGET | I2S_OPT_FRAME_CLK_TARGET));
+
+	if (!tx_active && !rx_active && (tx_is_controller || rx_is_controller)) {
 		retval = pio_i2s_setup_clks(dev);
 		if (retval < 0) {
 			return retval;
@@ -1127,40 +1135,46 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 			     enum i2s_trigger_cmd cmd)
 {
 	// const struct pio_i2s_config *dev_config = dev->config;
-	struct pio_i2s_data *dev_data = dev->data;
+	// struct pio_i2s_data *dev_data = dev->data;
 	int retval;
 
-	bool tx_is_configured = dev_data->tx.state != I2S_STATE_NOT_READY;
-	bool rx_is_configured = dev_data->rx.state != I2S_STATE_NOT_READY;
+	// bool tx_is_configured = dev_data->tx.state != I2S_STATE_NOT_READY;
+	// bool rx_is_configured = dev_data->rx.state != I2S_STATE_NOT_READY;
+	// bool en_loopback = pio_i2s_loopback_enabled(dev_data);
+
+	// if(en_loopback && (!tx_is_configured || !rx_is_configured)) {
+	// 	LOG_INF("Can't do loopback while one direction is not configured.");
+	// 	return -EIO;
+	// }
 
 	// if (is_bit_clk_target || is_frame_clk_target) {
 	// 	LOG_ERR("I2S target mode unsupported.");
 	// 	return -EINVAL;
 	// }
 	//
-	if(dir != I2S_DIR_BOTH && cmd == I2S_TRIGGER_START) {
-		bool we_have_a_controller = false;
-		if(tx_is_configured) {
-			bool is_bit_clk_target_tx = dev_data->tx.cfg.options & I2S_OPT_BIT_CLK_TARGET;
-			bool is_frame_clk_target_tx = dev_data->tx.cfg.options & I2S_OPT_FRAME_CLK_TARGET;
-			LOG_INF("tx controller? %d", is_bit_clk_target_tx || is_frame_clk_target_tx);
-			we_have_a_controller = we_have_a_controller || is_bit_clk_target_tx || is_frame_clk_target_tx;
-		}
+	// if(dir != I2S_DIR_BOTH && cmd == I2S_TRIGGER_START) {
+	// 	bool we_have_a_controller = false;
+	// 	if(tx_is_configured) {
+	// 		bool is_bit_clk_target_tx = dev_data->tx.cfg.options & I2S_OPT_BIT_CLK_TARGET;
+	// 		bool is_frame_clk_target_tx = dev_data->tx.cfg.options & I2S_OPT_FRAME_CLK_TARGET;
+	// 		LOG_INF("tx controller? %d", is_bit_clk_target_tx || is_frame_clk_target_tx);
+	// 		we_have_a_controller = we_have_a_controller || is_bit_clk_target_tx || is_frame_clk_target_tx;
+	// 	}
 
-		if(rx_is_configured) {
-			bool is_bit_clk_target_rx = dev_data->rx.cfg.options & I2S_OPT_BIT_CLK_TARGET;
-			bool is_frame_clk_target_rx = dev_data->rx.cfg.options & I2S_OPT_FRAME_CLK_TARGET;
-			LOG_INF("rx controller? %d", is_bit_clk_target_rx || is_frame_clk_target_rx);
-			we_have_a_controller = we_have_a_controller || is_bit_clk_target_rx || is_frame_clk_target_rx;
-		}
-		if (we_have_a_controller) {
-			LOG_INF("Yippie we have a controller!");
-		} else {
-			LOG_ERR("NO CONTROLLER!");
-			return -EIO;
-		}
+	// 	if(rx_is_configured) {
+	// 		bool is_bit_clk_target_rx = dev_data->rx.cfg.options & I2S_OPT_BIT_CLK_TARGET;
+	// 		bool is_frame_clk_target_rx = dev_data->rx.cfg.options & I2S_OPT_FRAME_CLK_TARGET;
+	// 		LOG_INF("rx controller? %d", is_bit_clk_target_rx || is_frame_clk_target_rx);
+	// 		we_have_a_controller = we_have_a_controller || is_bit_clk_target_rx || is_frame_clk_target_rx;
+	// 	}
+	// 	if (we_have_a_controller) {
+	// 		LOG_INF("Yippie we have a controller!");
+	// 	} else {
+	// 		LOG_ERR("NO CONTROLLER!");
+	// 		return -EIO;
+	// 	}
 
-	}
+	// }
 
 	if (dir == I2S_DIR_RX || dir == I2S_DIR_BOTH) {
 		retval = i2s_rpi_pico_trigger_single(dev, I2S_DIR_RX, cmd);

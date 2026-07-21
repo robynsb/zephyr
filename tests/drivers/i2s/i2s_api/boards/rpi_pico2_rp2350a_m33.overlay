@@ -10,7 +10,7 @@
 &pinctrl {
 	pio1_i2s: pio1_i2s {
 		tx_data: tx_data {
-			pinmux = <PIO1_P6>;
+			pinmux = <PIO1_P8>;
 		};
 		rx_data: rx_data {
 			pinmux = <PIO1_P8>;
