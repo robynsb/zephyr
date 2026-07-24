@@ -17,6 +17,9 @@
 	      can be used in the configure function.
 */
 
+// TODO: Write raspberry pi specific tests for failing to allocate multiple i2s periperals on the same pio and stuff like that.
+//       And check that the state machines are correctly deallocated and stuff like that...
+// TODO: check that the sampling frequency check works
 
 #include "zephyr/sys/__assert.h"
 #include <stdint.h>
@@ -90,21 +93,6 @@ struct pio_i2s_data {
 };
 
 
-// TODO: Think about integers.
-/*
- * f_sys = system_clock_frequency
- * f_b = frequency of Bit CLK
- * f_pio = frequency of PIO cycles
- * f_s = sampling frequency
- * k = number of PIO cycles per bit-clock period in the clks program (k = 2)
- *
- * f_b = f_s * channel_length * num_channels
- * f_pio = f_sys / divider
- * f_pio = k * f_b
- *
- * => k * f_b = f_sys / divider
- * => divider = f_sys / (k * f_b) = f_sys/(k * f_s * channel_length * num_channels)
- */
 
 static int i2s_rpi_pico_write(const struct device *dev, void *mem_block, size_t size)
 {
@@ -215,61 +203,36 @@ RPI_PICO_PIO_DEFINE_PROGRAM(rx_target, 0, 10,
 static const uint32_t clks_cycles_factor = 2u; /* k=2: 2 PIO cycles per BCLK period */
 static const uint32_t clks_entry_point = 0;
 
-static int sm_res_claim(const struct device *piodev, struct pio_sm_res *res)
-{
-	size_t allocated_sm;
-	int retval;
-	PIO pio = pio_rpi_pico_get_pio(piodev);
-
-	if (res->sm != (size_t)-1) {
-		return 0;
-	}
-
-	retval = pio_rpi_pico_allocate_sm(piodev, &allocated_sm);
-	if (retval < 0) {
-		LOG_ERR("pio_rpi_pico_allocate_sm failed with ret = %d", retval);
-		return retval;
-	}
-
-	pio_sm_set_enabled(pio, allocated_sm, false);
-	res->sm = allocated_sm;
-	return 0;
-}
-
-static int sm_res_load(const struct device *piodev, struct pio_sm_res *res,
+static int sm_res_init(const struct device *piodev, struct pio_sm_res *res,
 		       const pio_program_t *prog)
 {
+	int retval;
+
+	__ASSERT_NO_MSG(res->sm == (size_t)-1);
+	__ASSERT_NO_MSG(res->prog == NULL);
+
 	PIO pio = pio_rpi_pico_get_pio(piodev);
-
-	if (res->prog == prog) {
-		return 0;
-	}
-
-	if (res->sm == (size_t)-1) {
-		LOG_ERR("cannot load program: SM not claimed");
-		return -EINVAL;
-	}
-
-	pio_sm_set_enabled(pio, res->sm, false);
-
-	if (res->prog != NULL) {
-		/* Overwrite. Not atomic: if the add below fails, the
-		 * resource is left unloaded. */
-		pio_remove_program(pio, res->prog, res->offset);
-		res->prog = NULL;
-	}
 
 	if (!pio_can_add_program(pio, prog)) {
 		LOG_ERR("no PIO instruction memory left for program");
 		return -EBUSY;
 	}
 
+	retval = pio_rpi_pico_allocate_sm(piodev, &res->sm);
+	if(retval < 0) {
+		return retval;
+	}
+
+	pio_sm_set_enabled(pio, res->sm, false);
+
+
 	res->offset = pio_add_program(pio, prog);
 	res->prog = prog;
 	return 0;
 }
 
-static void sm_res_release(const struct device *piodev, struct pio_sm_res *res)
+static void sm_res_release(const struct device *piodev, struct pio_sm_res *res,
+			   uint32_t out_pins)
 {
 	PIO pio = pio_rpi_pico_get_pio(piodev);
 
@@ -280,17 +243,106 @@ static void sm_res_release(const struct device *piodev, struct pio_sm_res *res)
 
 	if (res->sm != (size_t)-1) {
 		pio_sm_set_enabled(pio, res->sm, false);
+
+		if (out_pins != 0) {
+			/* Only an SM can drive the SET that changes pindirs, so
+			 * borrow the one being unclaimed. It is stopped on the
+			 * line above, so injecting an instruction cannot disturb
+			 * a transfer — the clks SM in particular is left
+			 * free-running by pio_i2s_clks_start() and may still be
+			 * executing on entry.
+			 */
+			pio_sm_set_pindirs_with_mask(pio, res->sm, 0, out_pins);
+		}
+
 		pio_sm_unclaim(pio, res->sm);
 		res->sm = (size_t)-1;
 	}
 }
+
+static int sm_res_claim_dir(const struct device *dev, enum i2s_dir dir)
+{
+	const struct pio_i2s_config *dev_config = dev->config;
+	struct pio_i2s_data *dev_data = dev->data;
+	const struct device *piodev = dev_config->piodev;
+	// PIO pio = pio_rpi_pico_get_pio(piodev);
+
+	int retval;
+	bool free_clk_sm_during_error = false;
+	bool free_tx_sm_during_error = false;
+
+	if (dev_data->clks_res.sm == (size_t)-1) {
+		retval = sm_res_init(piodev, &dev_data->clks_res, RPI_PICO_PIO_GET_PROGRAM(clks));
+		if (retval < 0) {
+			goto free_sms;
+		}
+
+		free_clk_sm_during_error = true;
+	}
+
+	if(dir == I2S_DIR_TX || dir == I2S_DIR_BOTH) {
+		if (dev_data->tx.res.sm == (size_t)-1) {
+			retval = sm_res_init(piodev, &dev_data->tx.res, RPI_PICO_PIO_GET_PROGRAM(tx_target));
+			if (retval < 0) {
+				goto free_sms;
+			}
+			free_tx_sm_during_error = true;
+		}
+
+	}
+	if(dir == I2S_DIR_RX || dir == I2S_DIR_BOTH) {
+		if (dev_data->rx.res.sm == (size_t)-1) {
+			retval = sm_res_init(piodev, &dev_data->rx.res, RPI_PICO_PIO_GET_PROGRAM(rx_target));
+			if (retval < 0) {
+				goto free_sms;
+			}
+		}
+	}
+
+	return 0;
+
+free_sms:
+	if(free_clk_sm_during_error) {
+		sm_res_release(piodev, &dev_data->clks_res, 0);
+	}
+	if(free_tx_sm_during_error) {
+		sm_res_release(piodev, &dev_data->tx.res, 0);
+	}
+	return -EBUSY;
+}
+
+/*
+ * f_sys = system_clock_frequency
+ * f_b = frequency of Bit CLK
+ * f_pio = instruction frequency of PIO clk state machine
+ * f_s = sampling frequency
+ * k = number of PIO cycles per bit-clock period in the clks program (k = 2)
+ *
+ * f_b = f_s * channel_length * num_channels
+ * f_pio = f_sys / divider
+ * f_pio = k * f_b
+ *
+ * => k * f_b = f_sys / divider
+ * => divider = f_sys / (k * f_b) = f_sys/(k * f_s * channel_length * num_channels)
+ */
+static int calculate_divider_shift_8(uint32_t sample_freq, uint32_t channel_length) {
+	/* Number of channels is always 2 for I2S data format */
+	/* Only I2S supported at this time. */
+	const uint32_t num_channels = 2;
+	uint64_t system_clock_frequency = sys_clock_hw_cycles_per_sec();
+	/* 8.8 fixed-point divider: (f_sys << 8) / (k * f_s * channel_length * num_channels) */
+	uint64_t divider = (system_clock_frequency << 8u) /
+		(clks_cycles_factor * sample_freq * channel_length * num_channels);
+	return divider;
+}
+
 
 /*
  * Set up the clks SM: load the clock generator program, configure BCLK on the
  * 1-bit sideset and WS on the out/in base, and program the clock divider from
  * the shared sampling parameters. Started separately by pio_i2s_clks_start().
  */
-static int pio_i2s_setup_clks(const struct device *dev)
+static void pio_i2s_setup_clks(const struct device *dev)
 {
 	const struct pio_i2s_config *dev_config = dev->config;
 	struct pio_i2s_data *dev_data = dev->data;
@@ -299,17 +351,7 @@ static int pio_i2s_setup_clks(const struct device *dev)
 	uint32_t ws_pin = dev_config->ws_pin;
 	struct pio_sm_res *res = &dev_data->clks_res;
 	pio_sm_config c;
-	int retval;
-
-	retval = sm_res_claim(dev_config->piodev, res);
-	if (retval < 0) {
-		return retval;
-	}
-
-	retval = sm_res_load(dev_config->piodev, res, RPI_PICO_PIO_GET_PROGRAM(clks));
-	if (retval < 0) {
-		return retval;
-	}
+	// int retval;
 
 	c = pio_get_default_sm_config();
 	sm_config_set_wrap(&c, res->offset + clks_wrap_target, res->offset + clks_wrap);
@@ -325,76 +367,43 @@ static int pio_i2s_setup_clks(const struct device *dev)
 	pio_sm_set_pins_with_mask(pio, res->sm, 0, pin_mask); /* clear pins */
 	pio_sm_set_pindirs_with_mask(pio, res->sm, pin_mask, pin_mask);
 
-	/* clks clock divider: k=2 PIO cycles per BCLK period. */
-	// TODO: When I do configure target, check that the sampling frequency is fast enough.
 	uint32_t sample_freq = dev_data->sampling_freq;
 	uint32_t channel_length = dev_data->channel_length;
-	/* Number of channels is always 2 for I2S data format */
-	const uint32_t num_channels = 2;
-	uint64_t system_clock_frequency = sys_clock_hw_cycles_per_sec();
-	/* 8.8 fixed-point divider: (f_sys << 8) / (k * f_s * channel_length * num_channels) */
-	uint64_t divider = (system_clock_frequency << 8u) /
-		(clks_cycles_factor * sample_freq * channel_length * num_channels);
+
+	uint64_t divider = calculate_divider_shift_8(sample_freq, channel_length);
+
+	__ASSERT_NO_MSG(divider >> 8u != 0);
 	pio_sm_set_clkdiv_int_frac(pio, res->sm, divider >> 8u, divider & 0xffu);
 
-	return 0;
+	return;
 }
 
 /*
- * Target-mode counterpart of pio_i2s_setup_clks(): BCLK/WS come from whichever
- * device is the controller, so this one must not drive them. They are inputs
- * out of reset, but pin directions are per-PIO-block state that outlives the SM
- * that set them — if this device was configured as a controller earlier,
- * pio_i2s_setup_clks() left them as outputs and releasing that SM did not undo
- * it. Where another I2S instance is the controller, that leaves two push-pull
- * drivers fighting over BCLK/WS and corrupts the framing every receiver on
- * those wires recovers. Assert the direction we need instead of inheriting
- * whatever ran before. No clks SM is claimed: the clock is external.
+ * True when the device operates as an I2S target: at least one stream is
+ * configured and no configured stream is a controller, so BCLK/WS are driven by
+ * an external device. Both streams being targets, or a single configured target,
+ * both qualify.
  */
-static void pio_i2s_setup_target_clks(const struct device *dev)
+static bool pio_i2s_is_target(const struct pio_i2s_data *dev_data)
 {
-	const struct pio_i2s_config *dev_config = dev->config;
-	struct pio_i2s_data *dev_data = dev->data;
-	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
-	uint32_t clk_pins = (1u << dev_config->clock_pin) | (1u << dev_config->ws_pin);
-	size_t sm;
+	bool tx_is_controller = dev_data->tx.state != I2S_STATE_NOT_READY &&
+				!(dev_data->tx.cfg.options &
+				  (I2S_OPT_BIT_CLK_TARGET | I2S_OPT_FRAME_CLK_TARGET));
+	bool rx_is_controller = dev_data->rx.state != I2S_STATE_NOT_READY &&
+				!(dev_data->rx.cfg.options &
+				  (I2S_OPT_BIT_CLK_TARGET | I2S_OPT_FRAME_CLK_TARGET));
+	bool any_configured = dev_data->tx.state != I2S_STATE_NOT_READY ||
+			      dev_data->rx.state != I2S_STATE_NOT_READY;
 
-	/* Pindirs are block-wide, but only an SM can drive the SET that changes
-	 * them, and doing that borrows the SM: pio_sm_set_pindirs_with_mask()
-	 * rewrites its PINCTRL and injects an instruction. Use one of our own
-	 * followers, which the caller has just set up and not yet enabled —
-	 * never a fixed index, which may belong to another driver or be running.
-	 */
-	if (dev_data->rx.res.sm != (size_t)-1) {
-		sm = dev_data->rx.res.sm;
-	} else if (dev_data->tx.res.sm != (size_t)-1) {
-		sm = dev_data->tx.res.sm;
-	} else {
-		return; /* nothing configured, so nothing of ours drives the pins */
-	}
-
-	pio_sm_set_pindirs_with_mask(pio, sm, 0, clk_pins);
+	return any_configured && !tx_is_controller && !rx_is_controller;
 }
-
-/* True when either configured stream requests loopback: the TX follower then
- * drives the rx_data pin directly, so the RX follower samples exactly what TX
- * emits (mirrors the original single-SM driver). rx_data == BCLK - 1 still
- * holds, so RX keeps gating on BCLK correctly. */
-// static bool pio_i2s_loopback_enabled(struct pio_i2s_data *dev_data)
-// {
-// 	bool tx_configured = dev_data->tx.state != I2S_STATE_NOT_READY;
-// 	bool rx_configured = dev_data->rx.state != I2S_STATE_NOT_READY;
-
-// 	return (tx_configured && (dev_data->tx.cfg.options & I2S_OPT_LOOPBACK)) ||
-// 	       (rx_configured && (dev_data->rx.cfg.options & I2S_OPT_LOOPBACK));
-// }
 
 /*
  * Set up one stream's clock-follower SM: load its program and configure it
  * against the clks SM's BCLK/WS pins, which it gates off via `wait pin` /
  * `jmp pin`. Touches only this stream's resources.
  */
-static int pio_i2s_setup_stream(const struct device *dev, struct stream *stream,
+static void pio_i2s_setup_stream(const struct device *dev, struct stream *stream,
 				enum i2s_dir dir)
 {
 	const struct pio_i2s_config *dev_config = dev->config;
@@ -405,20 +414,11 @@ static int pio_i2s_setup_stream(const struct device *dev, struct stream *stream,
 	uint32_t ws_pin = dev_config->ws_pin;
 	struct pio_sm_res *res = &stream->res;
 	pio_sm_config c;
-	int retval;
-
-	retval = sm_res_claim(dev_config->piodev, res);
-	if (retval < 0) {
-		return retval;
-	}
+	// int retval;
 
 	if (dir == I2S_DIR_TX) {
 		uint32_t tx_out_pin = stream->data_pin;
 
-		retval = sm_res_load(dev_config->piodev, res, RPI_PICO_PIO_GET_PROGRAM(tx_target));
-		if (retval < 0) {
-			return retval;
-		}
 		c = pio_get_default_sm_config();
 		sm_config_set_wrap(&c, res->offset + tx_target_wrap_target,
 				   res->offset + tx_target_wrap);
@@ -435,10 +435,6 @@ static int pio_i2s_setup_stream(const struct device *dev, struct stream *stream,
 		pio_sm_set_pindirs_with_mask(pio, res->sm, 1u << tx_out_pin, 1u << tx_out_pin);
 	} else {
 		/* in base = rx_data (data at +0, BCLK at +1), jmp pin = WS */
-		retval = sm_res_load(dev_config->piodev, res, RPI_PICO_PIO_GET_PROGRAM(rx_target));
-		if (retval < 0) {
-			return retval;
-		}
 		c = pio_get_default_sm_config();
 		sm_config_set_wrap(&c, res->offset + rx_target_wrap_target,
 				   res->offset + rx_target_wrap);
@@ -456,7 +452,13 @@ static int pio_i2s_setup_stream(const struct device *dev, struct stream *stream,
 		}
 	}
 
-	return 0;
+	if (pio_i2s_is_target(dev_data)) {
+		uint32_t clk_pins = (1u << bclk_pin) | (1u << ws_pin);
+
+		pio_sm_set_pindirs_with_mask(pio, res->sm, 0, clk_pins);
+	}
+
+	return;
 }
 
 static void pio_i2s_clks_start(const struct device *dev)
@@ -494,31 +496,31 @@ static void pio_i2s_deconfigure_stream(const struct device *dev, struct stream *
 		stream == &dev_data->rx ? &dev_data->tx : &dev_data->rx;
 
 	drop_queue(stream);
-	sm_res_release(dev_config->piodev, &stream->res);
+	/* TX drives tx_data (see pio_i2s_setup_stream TX branch); RX leaves
+	 * rx_data an input, so it hands nothing back.
+	 */
+	sm_res_release(dev_config->piodev, &stream->res,
+		       stream == &dev_data->tx ? (1u << stream->data_pin) : 0);
 	memset(&stream->cfg, 0, sizeof(struct i2s_config));
 	stream->state = I2S_STATE_NOT_READY;
 
 	if (other_stream->state == I2S_STATE_NOT_READY) {
-		sm_res_release(dev_config->piodev, &dev_data->clks_res);
+		/* clks drives BCLK + WS (see pio_i2s_setup_clks). */
+		sm_res_release(dev_config->piodev, &dev_data->clks_res,
+			       (1u << dev_config->clock_pin) |
+			       (1u << dev_config->ws_pin));
 	}
 }
 
-// TODO: make stream->state a per-device
-static int i2s_rpi_pico_configure_single(const struct device *dev, enum i2s_dir dir,
-			       const struct i2s_config *i2s_cfg)
+static int i2s_rpi_pico_config_check_single(const struct device *dev, enum i2s_dir dir,
+				       const struct i2s_config *i2s_cfg)
 {
-	const struct pio_i2s_config *dev_config = dev->config;
 	struct pio_i2s_data *dev_data = dev->data;
-	int retval;
 
-	// uint8_t data_format = i2s_cfg->format & I2S_FMT_DATA_FORMAT_MASK;
-	//
 	__ASSERT_NO_MSG(dir == I2S_DIR_RX || dir == I2S_DIR_TX);
 
 	struct stream *stream = dir == I2S_DIR_RX ? &dev_data->rx : &dev_data->tx;
 	struct stream *other_stream = dir == I2S_DIR_RX ? &dev_data->tx : &dev_data->rx;
-
-	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
 
 	if (stream->state != I2S_STATE_NOT_READY && stream->state != I2S_STATE_READY) {
 		LOG_ERR("stream in invalid state (%d)", stream->state);
@@ -526,7 +528,6 @@ static int i2s_rpi_pico_configure_single(const struct device *dev, enum i2s_dir 
 	}
 
 	if (i2s_cfg->frame_clk_freq == 0U) {
-		pio_i2s_deconfigure_stream(dev, stream);
 		return 0;
 	}
 
@@ -574,8 +575,6 @@ static int i2s_rpi_pico_configure_single(const struct device *dev, enum i2s_dir 
 		return -EINVAL;
 	}
 
-
-
 	if(other_stream->state != I2S_STATE_NOT_READY) {
 		if (i2s_cfg->frame_clk_freq != other_stream->cfg.frame_clk_freq) {
 			LOG_ERR("simultaneously configured streams have different frame_clk_freq (%d) (%d)", i2s_cfg->frame_clk_freq, other_stream->cfg.frame_clk_freq);
@@ -588,10 +587,30 @@ static int i2s_rpi_pico_configure_single(const struct device *dev, enum i2s_dir 
 		}
 	}
 
-	retval = sm_res_claim(dev_config->piodev, &stream->res);
-	if (retval < 0) {
-		return retval;
+	uint64_t divider = calculate_divider_shift_8(i2s_cfg->frame_clk_freq, i2s_cfg->word_size) >> 8u;
+	if (divider == 0) {
+		LOG_ERR("sampling frequency is too high");
+		return -EINVAL;
 	}
+
+	return 0;
+}
+
+// TODO: make stream->state a per-device
+static void i2s_rpi_pico_configure_single(const struct device *dev, enum i2s_dir dir,
+			       const struct i2s_config *i2s_cfg)
+{
+	const struct pio_i2s_config *dev_config = dev->config;
+	struct pio_i2s_data *dev_data = dev->data;
+	// int retval;
+
+	// uint8_t data_format = i2s_cfg->format & I2S_FMT_DATA_FORMAT_MASK;
+	//
+	__ASSERT_NO_MSG(dir == I2S_DIR_RX || dir == I2S_DIR_TX);
+
+	struct stream *stream = dir == I2S_DIR_RX ? &dev_data->rx : &dev_data->tx;
+
+	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
 
 	stream->dma_cfg.user_data = (void*) dev;
 	// TODO: think about this dma_slot and the one in the overlay.
@@ -601,62 +620,63 @@ static int i2s_rpi_pico_configure_single(const struct device *dev, enum i2s_dir 
 	dev_data->channel_length = i2s_cfg->word_size > 16 ? 32 : 16;
 	dev_data->sampling_freq = i2s_cfg->frame_clk_freq;
 
-	stream->state = I2S_STATE_READY;
-
-	return 0;
+	return;
 
 }
 
 // TODO: verify target vs loopback modes.
 // TODO: Comprehensive checks against bad cfgs.
+// TODO: fail safe.
 static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 			       const struct i2s_config *i2s_cfg)
 {
 	struct pio_i2s_data *dev_data = dev->data;
+	// const struct pio_i2s_config *dev_config = dev->config;
+
 	bool cfg_rx = (dir == I2S_DIR_RX || dir == I2S_DIR_BOTH);
 	bool cfg_tx = (dir == I2S_DIR_TX || dir == I2S_DIR_BOTH);
 	int retval;
 
 	if (cfg_rx) {
-		retval = i2s_rpi_pico_configure_single(dev, I2S_DIR_RX, i2s_cfg);
+		retval = i2s_rpi_pico_config_check_single(dev, I2S_DIR_RX, i2s_cfg);
 		if (retval < 0) {
 			return retval;
 		}
 	}
 
 	if (cfg_tx) {
-		retval = i2s_rpi_pico_configure_single(dev, I2S_DIR_TX, i2s_cfg);
+		retval = i2s_rpi_pico_config_check_single(dev, I2S_DIR_TX, i2s_cfg);
 		if (retval < 0) {
 			return retval;
 		}
 	}
 
 	if (i2s_cfg->frame_clk_freq == 0U) {
+		if (cfg_rx) {
+			pio_i2s_deconfigure_stream(dev, &dev_data->rx);
+		}
+		if (cfg_tx) {
+			pio_i2s_deconfigure_stream(dev, &dev_data->tx);
+		}
 		return 0;
 	}
 
+	retval = sm_res_claim_dir(dev, dir);
+	if (retval < 0) {
+		return retval;
+	}
+
 	if (cfg_rx) {
-		retval = pio_i2s_setup_stream(dev, &dev_data->rx, I2S_DIR_RX);
-		if (retval < 0) {
-			return retval;
-		}
+		i2s_rpi_pico_configure_single(dev, I2S_DIR_RX, i2s_cfg);
+		pio_i2s_setup_stream(dev, &dev_data->rx, I2S_DIR_RX);
 	}
 
-	// bool en_loopback = pio_i2s_loopback_enabled(dev_data);
-	// if (cfg_tx || (dev_data->tx.state == I2S_STATE_READY && cfg_rx && en_loopback)) {
 	if (cfg_tx) {
-		retval = pio_i2s_setup_stream(dev, &dev_data->tx, I2S_DIR_TX);
-		if (retval < 0) {
-			return retval;
-		}
+		i2s_rpi_pico_configure_single(dev, I2S_DIR_TX, i2s_cfg);
+		pio_i2s_setup_stream(dev, &dev_data->tx, I2S_DIR_TX);
 	}
 
-	/* A stream that is RUNNING (or STOPPING, i.e. still draining) depends on
-	 * the free-running clks SM, and configure_single guarantees the shared
-	 * parameters cannot change while one is configured — so leave clks
-	 * untouched. Otherwise nothing consumes the clock: (re)program and
-	 * (re)start it unconditionally, which also covers the first configure
-	 * and reconfigure-after-deconfigure. */
+
 	bool tx_active = dev_data->tx.state == I2S_STATE_RUNNING ||
 			 dev_data->tx.state == I2S_STATE_STOPPING;
 	bool rx_active = dev_data->rx.state == I2S_STATE_RUNNING ||
@@ -670,13 +690,16 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 				  (I2S_OPT_BIT_CLK_TARGET | I2S_OPT_FRAME_CLK_TARGET));
 
 	if (!tx_active && !rx_active && (tx_is_controller || rx_is_controller)) {
-		retval = pio_i2s_setup_clks(dev);
-		if (retval < 0) {
-			return retval;
-		}
+		pio_i2s_setup_clks(dev);
 		pio_i2s_clks_start(dev);
-	} else if (!tx_is_controller && !rx_is_controller) {
-		pio_i2s_setup_target_clks(dev);
+	}
+
+	if (cfg_rx) {
+		dev_data->rx.state = I2S_STATE_READY;
+	}
+
+	if (cfg_tx) {
+		dev_data->tx.state = I2S_STATE_READY;
 	}
 
 	return 0;
