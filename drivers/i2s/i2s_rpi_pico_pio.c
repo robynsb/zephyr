@@ -326,7 +326,7 @@ free_sms:
  * => k * f_b = f_sys / divider
  * => divider = f_sys / (k * f_b) = f_sys/(k * f_s * channel_length * num_channels)
  */
-static int calculate_divider_shift_8(uint32_t sample_freq, uint32_t channel_length) {
+static uint64_t calculate_divider_shift_8(uint32_t sample_freq, uint32_t channel_length) {
 	/* Number of channels is always 2 for I2S data format */
 	/* Only I2S supported at this time. */
 	const uint32_t num_channels = 2;
@@ -588,7 +588,9 @@ static int i2s_rpi_pico_config_check_single(const struct device *dev, enum i2s_d
 		}
 	}
 
-	uint64_t divider = calculate_divider_shift_8(i2s_cfg->frame_clk_freq, i2s_cfg->word_size) >> 8u;
+
+	uint32_t channel_length = i2s_cfg->word_size > 16 ? 32 : 16;
+	uint64_t divider = calculate_divider_shift_8(i2s_cfg->frame_clk_freq, channel_length) >> 8u;
 	if (divider == 0) {
 		LOG_ERR("sampling frequency is too high");
 		return -EINVAL;
@@ -621,8 +623,9 @@ static void i2s_rpi_pico_configure_single(const struct device *dev, enum i2s_dir
 	dev_data->channel_length = i2s_cfg->word_size > 16 ? 32 : 16;
 	dev_data->sampling_freq = i2s_cfg->frame_clk_freq;
 
-	return;
+	stream->state = I2S_STATE_READY;
 
+	return;
 }
 
 // TODO: verify target vs loopback modes.
@@ -633,7 +636,7 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 			       const struct i2s_config *i2s_cfg)
 {
 	struct pio_i2s_data *dev_data = dev->data;
-	// const struct pio_i2s_config *dev_config = dev->config;
+	const struct pio_i2s_config *dev_config = dev->config;
 
 	bool cfg_rx = (dir == I2S_DIR_RX || dir == I2S_DIR_BOTH);
 	bool cfg_tx = (dir == I2S_DIR_TX || dir == I2S_DIR_BOTH);
@@ -678,8 +681,8 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 		pio_i2s_setup_stream(dev, &dev_data->tx, I2S_DIR_TX);
 	}
 
-	 bool i2s_cfg_is_controller = !(i2s_cfg->options &
-	               (I2S_OPT_BIT_CLK_TARGET | I2S_OPT_FRAME_CLK_TARGET));
+	 // bool i2s_cfg_is_controller = !(i2s_cfg->options &
+	 //               (I2S_OPT_BIT_CLK_TARGET | I2S_OPT_FRAME_CLK_TARGET));
 
 	bool tx_active = dev_data->tx.state == I2S_STATE_RUNNING ||
 			 dev_data->tx.state == I2S_STATE_STOPPING;
@@ -693,17 +696,15 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 				!(dev_data->rx.cfg.options &
 				  (I2S_OPT_BIT_CLK_TARGET | I2S_OPT_FRAME_CLK_TARGET));
 
-	if (i2s_cfg_is_controller && !tx_active && !rx_active) {
+	if ((tx_is_controller || rx_is_controller) && !tx_active && !rx_active) {
 		pio_i2s_setup_clks(dev);
 		pio_i2s_clks_start(dev);
-	}
-
-	if (cfg_rx) {
-		dev_data->rx.state = I2S_STATE_READY;
-	}
-
-	if (cfg_tx) {
-		dev_data->tx.state = I2S_STATE_READY;
+	} else if(!tx_is_controller && !rx_is_controller) {
+		if (i2s_cfg->options & (I2S_OPT_BIT_CLK_TARGET | I2S_OPT_FRAME_CLK_TARGET)) {
+			sm_res_release(dev_config->piodev, &dev_data->clks_res,
+				       (1u << dev_config->clock_pin) |
+				       (1u << dev_config->ws_pin));
+		}
 	}
 
 	return 0;
