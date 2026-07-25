@@ -261,7 +261,11 @@ static void sm_res_release(const struct device *piodev, struct pio_sm_res *res,
 	}
 }
 
-static int sm_res_claim_dir(const struct device *dev, enum i2s_dir dir)
+/*
+ * Atomically claim 2/3 state machines.
+ * TODO: Think about a different name.
+ */
+static int sm_res_claim_dir(const struct device *dev, enum i2s_dir dir, bool need_clk_sm)
 {
 	const struct pio_i2s_config *dev_config = dev->config;
 	struct pio_i2s_data *dev_data = dev->data;
@@ -272,7 +276,7 @@ static int sm_res_claim_dir(const struct device *dev, enum i2s_dir dir)
 	bool free_clk_sm_during_error = false;
 	bool free_tx_sm_during_error = false;
 
-	if (dev_data->clks_res.sm == (size_t)-1) {
+	if (need_clk_sm && dev_data->clks_res.sm == (size_t)-1) {
 		retval = sm_res_init(piodev, &dev_data->clks_res, RPI_PICO_PIO_GET_PROGRAM(clks));
 		if (retval < 0) {
 			goto free_sms;
@@ -280,6 +284,7 @@ static int sm_res_claim_dir(const struct device *dev, enum i2s_dir dir)
 
 		free_clk_sm_during_error = true;
 	}
+
 
 	if(dir == I2S_DIR_TX || dir == I2S_DIR_BOTH) {
 		if (dev_data->tx.res.sm == (size_t)-1) {
@@ -298,6 +303,12 @@ static int sm_res_claim_dir(const struct device *dev, enum i2s_dir dir)
 				goto free_sms;
 			}
 		}
+	}
+
+	if (!need_clk_sm && dev_data->clks_res.sm != (size_t)-1) {
+		sm_res_release(dev_config->piodev, &dev_data->clks_res,
+			       (1u << dev_config->clock_pin) |
+			       (1u << dev_config->ws_pin));
 	}
 
 	return 0;
@@ -513,6 +524,8 @@ static void pio_i2s_deconfigure_stream(const struct device *dev, struct stream *
 	}
 }
 
+// TODO: think about taking out I2S_DIR_BOTH functionality
+//       see: https://claude.ai/code/artifact/c6b2cedd-348b-4039-991c-61d9f02add64?via=auto_preview
 static int i2s_rpi_pico_config_check_single(const struct device *dev, enum i2s_dir dir,
 				       const struct i2s_config *i2s_cfg)
 {
@@ -525,6 +538,11 @@ static int i2s_rpi_pico_config_check_single(const struct device *dev, enum i2s_d
 
 	if (stream->state != I2S_STATE_NOT_READY && stream->state != I2S_STATE_READY) {
 		LOG_ERR("stream in invalid state (%d)", stream->state);
+		return -EINVAL;
+	}
+
+	if (other_stream->state != I2S_STATE_NOT_READY && other_stream->state != I2S_STATE_READY) {
+		LOG_ERR("other stream in invalid state (%d)", other_stream->state);
 		return -EINVAL;
 	}
 
@@ -555,11 +573,6 @@ static int i2s_rpi_pico_config_check_single(const struct device *dev, enum i2s_d
 		return -EINVAL;
 	}
 
-	// if (is_bit_clk_target || is_frame_clk_target) {
-	// 	LOG_ERR("I2S target mode unsupported.");
-	// 	return -EINVAL;
-	// }
-
 	if (i2s_cfg->options & I2S_OPT_LOOPBACK) {
 		LOG_ERR("I2S loopback mode unsupported.");
 		LOG_DBG("To enable loopback, use the same SD for TX and RX pinctrl");
@@ -587,6 +600,7 @@ static int i2s_rpi_pico_config_check_single(const struct device *dev, enum i2s_d
 			return -EINVAL;
 		}
 	}
+
 
 
 	uint32_t channel_length = i2s_cfg->word_size > 16 ? 32 : 16;
@@ -636,7 +650,7 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 			       const struct i2s_config *i2s_cfg)
 {
 	struct pio_i2s_data *dev_data = dev->data;
-	const struct pio_i2s_config *dev_config = dev->config;
+	// const struct pio_i2s_config *dev_config = dev->config;
 
 	bool cfg_rx = (dir == I2S_DIR_RX || dir == I2S_DIR_BOTH);
 	bool cfg_tx = (dir == I2S_DIR_TX || dir == I2S_DIR_BOTH);
@@ -666,7 +680,23 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 		return 0;
 	}
 
-	retval = sm_res_claim_dir(dev, dir);
+	bool i2s_cfg_is_controller = !(i2s_cfg->options &
+	        (I2S_OPT_BIT_CLK_TARGET | I2S_OPT_FRAME_CLK_TARGET));
+
+	bool tx_was_controller = dev_data->tx.state != I2S_STATE_NOT_READY &&
+				!(dev_data->tx.cfg.options &
+				  (I2S_OPT_BIT_CLK_TARGET | I2S_OPT_FRAME_CLK_TARGET));
+
+	bool rx_was_controller = dev_data->rx.state != I2S_STATE_NOT_READY &&
+				!(dev_data->rx.cfg.options &
+				  (I2S_OPT_BIT_CLK_TARGET | I2S_OPT_FRAME_CLK_TARGET));
+
+	bool tx_is_controller = (!cfg_tx && tx_was_controller) || (cfg_tx && i2s_cfg_is_controller);
+	bool rx_is_controller = (!cfg_rx && rx_was_controller) || (cfg_rx && i2s_cfg_is_controller);
+	bool is_controller = rx_is_controller || tx_is_controller;
+	bool need_start_clk = (!tx_was_controller && !rx_was_controller) && is_controller;
+
+	retval = sm_res_claim_dir(dev, dir, is_controller);
 	if (retval < 0) {
 		return retval;
 	}
@@ -681,30 +711,9 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 		pio_i2s_setup_stream(dev, &dev_data->tx, I2S_DIR_TX);
 	}
 
-	 // bool i2s_cfg_is_controller = !(i2s_cfg->options &
-	 //               (I2S_OPT_BIT_CLK_TARGET | I2S_OPT_FRAME_CLK_TARGET));
-
-	bool tx_active = dev_data->tx.state == I2S_STATE_RUNNING ||
-			 dev_data->tx.state == I2S_STATE_STOPPING;
-	bool rx_active = dev_data->rx.state == I2S_STATE_RUNNING ||
-			 dev_data->rx.state == I2S_STATE_STOPPING;
-
-	bool tx_is_controller = dev_data->tx.state != I2S_STATE_NOT_READY &&
-				!(dev_data->tx.cfg.options &
-				  (I2S_OPT_BIT_CLK_TARGET | I2S_OPT_FRAME_CLK_TARGET));
-	bool rx_is_controller = dev_data->rx.state != I2S_STATE_NOT_READY &&
-				!(dev_data->rx.cfg.options &
-				  (I2S_OPT_BIT_CLK_TARGET | I2S_OPT_FRAME_CLK_TARGET));
-
-	if ((tx_is_controller || rx_is_controller) && !tx_active && !rx_active) {
+	if (need_start_clk) {
 		pio_i2s_setup_clks(dev);
 		pio_i2s_clks_start(dev);
-	} else if(!tx_is_controller && !rx_is_controller) {
-		if (i2s_cfg->options & (I2S_OPT_BIT_CLK_TARGET | I2S_OPT_FRAME_CLK_TARGET)) {
-			sm_res_release(dev_config->piodev, &dev_data->clks_res,
-				       (1u << dev_config->clock_pin) |
-				       (1u << dev_config->ws_pin));
-		}
 	}
 
 	return 0;
