@@ -20,6 +20,7 @@
 // TODO: Write raspberry pi specific tests for failing to allocate multiple i2s periperals on the same pio and stuff like that.
 //       And check that the state machines are correctly deallocated and stuff like that...
 // TODO: check that the sampling frequency check works
+// TODO: check for code smell involving functions with only one call site.
 
 #include "zephyr/sys/__assert.h"
 #include <stdint.h>
@@ -627,6 +628,7 @@ static void i2s_rpi_pico_configure_single(const struct device *dev, enum i2s_dir
 // TODO: verify target vs loopback modes.
 // TODO: Comprehensive checks against bad cfgs.
 // TODO: fail safe.
+// TODO: test case: configure as controller, reconfigure as target. clocks need to be stopped in that case.
 static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 			       const struct i2s_config *i2s_cfg)
 {
@@ -676,6 +678,8 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 		pio_i2s_setup_stream(dev, &dev_data->tx, I2S_DIR_TX);
 	}
 
+	 bool i2s_cfg_is_controller = !(i2s_cfg->options &
+	               (I2S_OPT_BIT_CLK_TARGET | I2S_OPT_FRAME_CLK_TARGET));
 
 	bool tx_active = dev_data->tx.state == I2S_STATE_RUNNING ||
 			 dev_data->tx.state == I2S_STATE_STOPPING;
@@ -689,7 +693,7 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 				!(dev_data->rx.cfg.options &
 				  (I2S_OPT_BIT_CLK_TARGET | I2S_OPT_FRAME_CLK_TARGET));
 
-	if (!tx_active && !rx_active && (tx_is_controller || rx_is_controller)) {
+	if (i2s_cfg_is_controller && !tx_active && !rx_active) {
 		pio_i2s_setup_clks(dev);
 		pio_i2s_clks_start(dev);
 	}
