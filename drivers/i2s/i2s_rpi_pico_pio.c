@@ -490,14 +490,13 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 
 	if (dir != I2S_DIR_RX && dir != I2S_DIR_TX) {
 		LOG_ERR("Unsupported I2S direction (%d), configure RX and TX separately", dir);
-		return -EINVAL;
+		return -ENOSYS;
 	}
 
 	struct stream *stream = dir == I2S_DIR_RX ? &dev_data->rx : &dev_data->tx;
 	struct stream *other_stream = dir == I2S_DIR_RX ? &dev_data->tx : &dev_data->rx;
 
-
-	bool other_was_controller = other_stream->state != I2S_STATE_NOT_READY &&
+	bool other_is_controller = other_stream->state != I2S_STATE_NOT_READY &&
 				!(other_stream->cfg.options &
 				  (I2S_OPT_BIT_CLK_TARGET | I2S_OPT_FRAME_CLK_TARGET));
 
@@ -522,7 +521,7 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 		memset(&stream->cfg, 0, sizeof(struct i2s_config));
 		stream->state = I2S_STATE_NOT_READY;
 
-		if (!other_was_controller) {
+		if (!other_is_controller) {
 			/* clks drives BCLK + WS (see pio_i2s_setup_clks). */
 			sm_res_release(dev_config->piodev, &dev_data->clks_res,
 				       (1u << dev_config->clock_pin) |
@@ -569,17 +568,17 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 	bool i2s_cfg_is_controller = !(i2s_cfg->options &
 	        (I2S_OPT_BIT_CLK_TARGET | I2S_OPT_FRAME_CLK_TARGET));
 
-	bool is_controller = i2s_cfg_is_controller || other_was_controller;
+	bool is_controller = i2s_cfg_is_controller || other_is_controller;
 
 	/* check clk configuration */
-	if(is_controller) {
+	if(i2s_cfg_is_controller) {
 		if (i2s_cfg->options & I2S_OPT_BIT_CLK_GATED) {
 			LOG_ERR("Gated bit clock is unsupported.");
 			return -EINVAL;
 		}
 
-		if (other_stream->state != I2S_STATE_NOT_READY && i2s_cfg->frame_clk_freq != other_stream->cfg.frame_clk_freq) {
-			LOG_ERR("simultaneously configured streams have different frame_clk_freq (%d) (%d)", i2s_cfg->frame_clk_freq, other_stream->cfg.frame_clk_freq);
+		if (other_is_controller && i2s_cfg->frame_clk_freq != other_stream->cfg.frame_clk_freq) {
+			LOG_ERR("simultaneously configured controller streams have different frame_clk_freq (%d) (%d)", i2s_cfg->frame_clk_freq, other_stream->cfg.frame_clk_freq);
 			return -EINVAL;
 		}
 
@@ -1119,44 +1118,6 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 	// const struct pio_i2s_config *dev_config = dev->config;
 	// struct pio_i2s_data *dev_data = dev->data;
 	int retval;
-
-	// bool tx_is_configured = dev_data->tx.state != I2S_STATE_NOT_READY;
-	// bool rx_is_configured = dev_data->rx.state != I2S_STATE_NOT_READY;
-	// bool en_loopback = pio_i2s_loopback_enabled(dev_data);
-
-	// if(en_loopback && (!tx_is_configured || !rx_is_configured)) {
-	// 	LOG_INF("Can't do loopback while one direction is not configured.");
-	// 	return -EIO;
-	// }
-
-	// if (is_bit_clk_target || is_frame_clk_target) {
-	// 	LOG_ERR("I2S target mode unsupported.");
-	// 	return -EINVAL;
-	// }
-	//
-	// if(dir != I2S_DIR_BOTH && cmd == I2S_TRIGGER_START) {
-	// 	bool we_have_a_controller = false;
-	// 	if(tx_is_configured) {
-	// 		bool is_bit_clk_target_tx = dev_data->tx.cfg.options & I2S_OPT_BIT_CLK_TARGET;
-	// 		bool is_frame_clk_target_tx = dev_data->tx.cfg.options & I2S_OPT_FRAME_CLK_TARGET;
-	// 		LOG_INF("tx controller? %d", is_bit_clk_target_tx || is_frame_clk_target_tx);
-	// 		we_have_a_controller = we_have_a_controller || is_bit_clk_target_tx || is_frame_clk_target_tx;
-	// 	}
-
-	// 	if(rx_is_configured) {
-	// 		bool is_bit_clk_target_rx = dev_data->rx.cfg.options & I2S_OPT_BIT_CLK_TARGET;
-	// 		bool is_frame_clk_target_rx = dev_data->rx.cfg.options & I2S_OPT_FRAME_CLK_TARGET;
-	// 		LOG_INF("rx controller? %d", is_bit_clk_target_rx || is_frame_clk_target_rx);
-	// 		we_have_a_controller = we_have_a_controller || is_bit_clk_target_rx || is_frame_clk_target_rx;
-	// 	}
-	// 	if (we_have_a_controller) {
-	// 		LOG_INF("Yippie we have a controller!");
-	// 	} else {
-	// 		LOG_ERR("NO CONTROLLER!");
-	// 		return -EIO;
-	// 	}
-
-	// }
 
 	if (dir == I2S_DIR_RX || dir == I2S_DIR_BOTH) {
 		retval = i2s_rpi_pico_trigger_single(dev, I2S_DIR_RX, cmd);
