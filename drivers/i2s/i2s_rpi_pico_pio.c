@@ -410,13 +410,8 @@ static bool pio_i2s_is_target(const struct pio_i2s_data *dev_data)
 	return any_configured && !tx_is_controller && !rx_is_controller;
 }
 
-/*
- * Set up one stream's clock-follower SM: load its program and configure it
- * against the clks SM's BCLK/WS pins, which it gates off via `wait pin` /
- * `jmp pin`. Touches only this stream's resources.
- */
 static void pio_i2s_setup_stream(const struct device *dev, struct stream *stream,
-				enum i2s_dir dir)
+				enum i2s_dir dir, bool is_controller)
 {
 	const struct pio_i2s_config *dev_config = dev->config;
 	struct pio_i2s_data *dev_data = dev->data;
@@ -464,7 +459,7 @@ static void pio_i2s_setup_stream(const struct device *dev, struct stream *stream
 		}
 	}
 
-	if (pio_i2s_is_target(dev_data)) {
+	if (!is_controller) {
 		uint32_t clk_pins = (1u << bclk_pin) | (1u << ws_pin);
 
 		pio_sm_set_pindirs_with_mask(pio, res->sm, 0, clk_pins);
@@ -500,41 +495,27 @@ static void drop_queue(struct stream *stream) {
 	}
 }
 
-static void pio_i2s_deconfigure_stream(const struct device *dev, struct stream *stream)
+// TODO: verify target vs loopback modes.
+// TODO: Comprehensive checks against bad cfgs.
+// TODO: fail safe.
+// TODO: test case: configure as controller, reconfigure as target. clocks need to be stopped in that case.
+// TODO: Make sure no warnings during test scenario appear.
+static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
+			       const struct i2s_config *i2s_cfg)
 {
 	const struct pio_i2s_config *dev_config = dev->config;
 	struct pio_i2s_data *dev_data = dev->data;
-	struct stream *other_stream =
-		stream == &dev_data->rx ? &dev_data->tx : &dev_data->rx;
+	int retval;
 
-	drop_queue(stream);
-	/* TX drives tx_data (see pio_i2s_setup_stream TX branch); RX leaves
-	 * rx_data an input, so it hands nothing back.
-	 */
-	sm_res_release(dev_config->piodev, &stream->res,
-		       stream == &dev_data->tx ? (1u << stream->data_pin) : 0);
-	memset(&stream->cfg, 0, sizeof(struct i2s_config));
-	stream->state = I2S_STATE_NOT_READY;
-
-	if (other_stream->state == I2S_STATE_NOT_READY) {
-		/* clks drives BCLK + WS (see pio_i2s_setup_clks). */
-		sm_res_release(dev_config->piodev, &dev_data->clks_res,
-			       (1u << dev_config->clock_pin) |
-			       (1u << dev_config->ws_pin));
+	if (dir != I2S_DIR_RX && dir != I2S_DIR_TX) {
+		LOG_ERR("Unsupported I2S direction (%d), configure RX and TX separately", dir);
+		return -EINVAL;
 	}
-}
-
-// TODO: think about taking out I2S_DIR_BOTH functionality
-//       see: https://claude.ai/code/artifact/c6b2cedd-348b-4039-991c-61d9f02add64?via=auto_preview
-static int i2s_rpi_pico_config_check_single(const struct device *dev, enum i2s_dir dir,
-				       const struct i2s_config *i2s_cfg)
-{
-	struct pio_i2s_data *dev_data = dev->data;
-
-	__ASSERT_NO_MSG(dir == I2S_DIR_RX || dir == I2S_DIR_TX);
 
 	struct stream *stream = dir == I2S_DIR_RX ? &dev_data->rx : &dev_data->tx;
 	struct stream *other_stream = dir == I2S_DIR_RX ? &dev_data->tx : &dev_data->rx;
+
+	/* --- config check --- */
 
 	if (stream->state != I2S_STATE_NOT_READY && stream->state != I2S_STATE_READY) {
 		LOG_ERR("stream in invalid state (%d)", stream->state);
@@ -546,86 +527,101 @@ static int i2s_rpi_pico_config_check_single(const struct device *dev, enum i2s_d
 		return -EINVAL;
 	}
 
+	if (i2s_cfg->frame_clk_freq != 0U) {
+		if (i2s_cfg->format != I2S_FMT_DATA_FORMAT_I2S) {
+			LOG_ERR("Unsupported data format: %u", (unsigned int)i2s_cfg->format);
+			return -EINVAL;
+		}
+
+		if (i2s_cfg->channels != 2) {
+			LOG_ERR("Number of channels not 2 when configured with I2S data format.");
+			return -EINVAL;
+		}
+
+		if (!(16 <= i2s_cfg->word_size && i2s_cfg->word_size <= 32)) {
+			LOG_ERR("I2S word size (%d) is unsupported.", i2s_cfg->word_size);
+			return -EINVAL;
+		}
+
+		bool is_bit_clk_target = i2s_cfg->options & I2S_OPT_BIT_CLK_TARGET;
+		bool is_frame_clk_target = i2s_cfg->options & I2S_OPT_FRAME_CLK_TARGET;
+
+		if (is_bit_clk_target != is_frame_clk_target) {
+			LOG_ERR("I2S bit CLK and frame CLK must be either both target or both controller.");
+			return -EINVAL;
+		}
+
+		if (i2s_cfg->options & I2S_OPT_LOOPBACK) {
+			LOG_ERR("I2S loopback mode unsupported.");
+			LOG_DBG("To enable loopback, use the same SD for TX and RX pinctrl");
+			return -EINVAL;
+		}
+
+		if (i2s_cfg->options & I2S_OPT_PINGPONG) {
+			LOG_ERR("I2S_OPT_PINGPONG is unsupported.");
+			return -EINVAL;
+		}
+
+		if (i2s_cfg->options & I2S_OPT_BIT_CLK_GATED) {
+			LOG_ERR("Gated bit clock is unsupported.");
+			return -EINVAL;
+		}
+
+		if (other_stream->state != I2S_STATE_NOT_READY) {
+			if (i2s_cfg->frame_clk_freq != other_stream->cfg.frame_clk_freq) {
+				LOG_ERR("simultaneously configured streams have different frame_clk_freq (%d) (%d)", i2s_cfg->frame_clk_freq, other_stream->cfg.frame_clk_freq);
+				return -EINVAL;
+			}
+
+			if (i2s_cfg->word_size != other_stream->cfg.word_size) {
+				LOG_ERR("simultaneously configured streams have different word_size (%d) (%d)", i2s_cfg->word_size, other_stream->cfg.word_size);
+				return -EINVAL;
+			}
+		}
+
+		uint32_t channel_length = i2s_cfg->word_size > 16 ? 32 : 16;
+		uint64_t divider =
+			calculate_divider_shift_8(i2s_cfg->frame_clk_freq, channel_length) >> 8u;
+		if (divider == 0) {
+			LOG_ERR("sampling frequency is too high");
+			return -EINVAL;
+		}
+	}
+
+	/* --- deconfigure the stream --- */
+
 	if (i2s_cfg->frame_clk_freq == 0U) {
+		drop_queue(stream);
+
+		sm_res_release(dev_config->piodev, &stream->res,
+			       dir == I2S_DIR_TX ? (1u << stream->data_pin) : 0);
+		memset(&stream->cfg, 0, sizeof(struct i2s_config));
+		stream->state = I2S_STATE_NOT_READY;
+
+		if (other_stream->state == I2S_STATE_NOT_READY) {
+			/* clks drives BCLK + WS (see pio_i2s_setup_clks). */
+			sm_res_release(dev_config->piodev, &dev_data->clks_res,
+				       (1u << dev_config->clock_pin) |
+				       (1u << dev_config->ws_pin));
+		}
 		return 0;
 	}
 
-	if (i2s_cfg->format != I2S_FMT_DATA_FORMAT_I2S) {
-		LOG_ERR("Unsupported data format: %u", (unsigned int)i2s_cfg->format);
-		return -EINVAL;
+	/* --- configure the stream --- */
+
+	bool i2s_cfg_is_controller = !(i2s_cfg->options &
+	        (I2S_OPT_BIT_CLK_TARGET | I2S_OPT_FRAME_CLK_TARGET));
+
+	bool other_was_controller = other_stream->state != I2S_STATE_NOT_READY &&
+				!(other_stream->cfg.options &
+				  (I2S_OPT_BIT_CLK_TARGET | I2S_OPT_FRAME_CLK_TARGET));
+
+	bool is_controller = i2s_cfg_is_controller || other_was_controller;
+
+	retval = sm_res_claim_dir(dev, dir, is_controller);
+	if (retval < 0) {
+		return retval;
 	}
-
-	if (i2s_cfg->channels != 2) {
-		LOG_ERR("Number of channels not 2 when configured with I2S data format.");
-		return -EINVAL;
-	}
-
-	if (!(16 <= i2s_cfg->word_size && i2s_cfg->word_size <= 32)) {
-		LOG_ERR("I2S word size (%d) is unsupported.", i2s_cfg->word_size);
-		return -EINVAL;
-	}
-
-	bool is_bit_clk_target = i2s_cfg->options & I2S_OPT_BIT_CLK_TARGET;
-	bool is_frame_clk_target = i2s_cfg->options & I2S_OPT_FRAME_CLK_TARGET;
-
-	if (is_bit_clk_target != is_frame_clk_target) {
-		LOG_ERR("I2S bit CLK and frame CLK must be either both target or both controller.");
-		return -EINVAL;
-	}
-
-	if (i2s_cfg->options & I2S_OPT_LOOPBACK) {
-		LOG_ERR("I2S loopback mode unsupported.");
-		LOG_DBG("To enable loopback, use the same SD for TX and RX pinctrl");
-		return -EINVAL;
-	}
-
-	if (i2s_cfg->options & I2S_OPT_PINGPONG) {
-		LOG_ERR("I2S_OPT_PINGPONG is unsupported.");
-		return -EINVAL;
-	}
-
-	if (i2s_cfg->options & I2S_OPT_BIT_CLK_GATED) {
-		LOG_ERR("Gated bit clock is unsupported.");
-		return -EINVAL;
-	}
-
-	if(other_stream->state != I2S_STATE_NOT_READY) {
-		if (i2s_cfg->frame_clk_freq != other_stream->cfg.frame_clk_freq) {
-			LOG_ERR("simultaneously configured streams have different frame_clk_freq (%d) (%d)", i2s_cfg->frame_clk_freq, other_stream->cfg.frame_clk_freq);
-			return -EINVAL;
-		}
-
-		if (i2s_cfg->word_size != other_stream->cfg.word_size) {
-			LOG_ERR("simultaneously configured streams have different word_size (%d) (%d)", i2s_cfg->word_size, other_stream->cfg.word_size);
-			return -EINVAL;
-		}
-	}
-
-
-
-	uint32_t channel_length = i2s_cfg->word_size > 16 ? 32 : 16;
-	uint64_t divider = calculate_divider_shift_8(i2s_cfg->frame_clk_freq, channel_length) >> 8u;
-	if (divider == 0) {
-		LOG_ERR("sampling frequency is too high");
-		return -EINVAL;
-	}
-
-	return 0;
-}
-
-// TODO: make stream->state a per-device
-static void i2s_rpi_pico_configure_single(const struct device *dev, enum i2s_dir dir,
-			       const struct i2s_config *i2s_cfg)
-{
-	const struct pio_i2s_config *dev_config = dev->config;
-	struct pio_i2s_data *dev_data = dev->data;
-	// int retval;
-
-	// uint8_t data_format = i2s_cfg->format & I2S_FMT_DATA_FORMAT_MASK;
-	//
-	__ASSERT_NO_MSG(dir == I2S_DIR_RX || dir == I2S_DIR_TX);
-
-	struct stream *stream = dir == I2S_DIR_RX ? &dev_data->rx : &dev_data->tx;
 
 	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
 
@@ -639,86 +635,15 @@ static void i2s_rpi_pico_configure_single(const struct device *dev, enum i2s_dir
 
 	stream->state = I2S_STATE_READY;
 
-	return;
-}
+	pio_i2s_setup_stream(dev, stream, dir, is_controller);
 
-// TODO: verify target vs loopback modes.
-// TODO: Comprehensive checks against bad cfgs.
-// TODO: fail safe.
-// TODO: test case: configure as controller, reconfigure as target. clocks need to be stopped in that case.
-static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
-			       const struct i2s_config *i2s_cfg)
-{
-	struct pio_i2s_data *dev_data = dev->data;
-	// const struct pio_i2s_config *dev_config = dev->config;
-
-	bool cfg_rx = (dir == I2S_DIR_RX || dir == I2S_DIR_BOTH);
-	bool cfg_tx = (dir == I2S_DIR_TX || dir == I2S_DIR_BOTH);
-	int retval;
-
-	if (cfg_rx) {
-		retval = i2s_rpi_pico_config_check_single(dev, I2S_DIR_RX, i2s_cfg);
-		if (retval < 0) {
-			return retval;
-		}
-	}
-
-	if (cfg_tx) {
-		retval = i2s_rpi_pico_config_check_single(dev, I2S_DIR_TX, i2s_cfg);
-		if (retval < 0) {
-			return retval;
-		}
-	}
-
-	if (i2s_cfg->frame_clk_freq == 0U) {
-		if (cfg_rx) {
-			pio_i2s_deconfigure_stream(dev, &dev_data->rx);
-		}
-		if (cfg_tx) {
-			pio_i2s_deconfigure_stream(dev, &dev_data->tx);
-		}
-		return 0;
-	}
-
-	bool i2s_cfg_is_controller = !(i2s_cfg->options &
-	        (I2S_OPT_BIT_CLK_TARGET | I2S_OPT_FRAME_CLK_TARGET));
-
-	bool tx_was_controller = dev_data->tx.state != I2S_STATE_NOT_READY &&
-				!(dev_data->tx.cfg.options &
-				  (I2S_OPT_BIT_CLK_TARGET | I2S_OPT_FRAME_CLK_TARGET));
-
-	bool rx_was_controller = dev_data->rx.state != I2S_STATE_NOT_READY &&
-				!(dev_data->rx.cfg.options &
-				  (I2S_OPT_BIT_CLK_TARGET | I2S_OPT_FRAME_CLK_TARGET));
-
-	bool tx_is_controller = (!cfg_tx && tx_was_controller) || (cfg_tx && i2s_cfg_is_controller);
-	bool rx_is_controller = (!cfg_rx && rx_was_controller) || (cfg_rx && i2s_cfg_is_controller);
-	bool is_controller = rx_is_controller || tx_is_controller;
-	bool need_start_clk = (!tx_was_controller && !rx_was_controller) && is_controller;
-
-	retval = sm_res_claim_dir(dev, dir, is_controller);
-	if (retval < 0) {
-		return retval;
-	}
-
-	if (cfg_rx) {
-		i2s_rpi_pico_configure_single(dev, I2S_DIR_RX, i2s_cfg);
-		pio_i2s_setup_stream(dev, &dev_data->rx, I2S_DIR_RX);
-	}
-
-	if (cfg_tx) {
-		i2s_rpi_pico_configure_single(dev, I2S_DIR_TX, i2s_cfg);
-		pio_i2s_setup_stream(dev, &dev_data->tx, I2S_DIR_TX);
-	}
-
-	if (need_start_clk) {
+	if (is_controller) {
 		pio_i2s_setup_clks(dev);
 		pio_i2s_clks_start(dev);
 	}
 
 	return 0;
 }
-
 
 static int reload_dma(const struct device *dev_dma, uint32_t channel,
 		      struct dma_config *dcfg, void *src, void *dst,
