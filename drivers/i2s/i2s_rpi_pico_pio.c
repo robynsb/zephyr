@@ -390,26 +390,6 @@ static void pio_i2s_setup_clks(const struct device *dev)
 	return;
 }
 
-/*
- * True when the device operates as an I2S target: at least one stream is
- * configured and no configured stream is a controller, so BCLK/WS are driven by
- * an external device. Both streams being targets, or a single configured target,
- * both qualify.
- */
-static bool pio_i2s_is_target(const struct pio_i2s_data *dev_data)
-{
-	bool tx_is_controller = dev_data->tx.state != I2S_STATE_NOT_READY &&
-				!(dev_data->tx.cfg.options &
-				  (I2S_OPT_BIT_CLK_TARGET | I2S_OPT_FRAME_CLK_TARGET));
-	bool rx_is_controller = dev_data->rx.state != I2S_STATE_NOT_READY &&
-				!(dev_data->rx.cfg.options &
-				  (I2S_OPT_BIT_CLK_TARGET | I2S_OPT_FRAME_CLK_TARGET));
-	bool any_configured = dev_data->tx.state != I2S_STATE_NOT_READY ||
-			      dev_data->rx.state != I2S_STATE_NOT_READY;
-
-	return any_configured && !tx_is_controller && !rx_is_controller;
-}
-
 static void pio_i2s_setup_stream(const struct device *dev, struct stream *stream,
 				enum i2s_dir dir, bool is_controller)
 {
@@ -527,69 +507,6 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 		return -EINVAL;
 	}
 
-	if (i2s_cfg->frame_clk_freq != 0U) {
-		if (i2s_cfg->format != I2S_FMT_DATA_FORMAT_I2S) {
-			LOG_ERR("Unsupported data format: %u", (unsigned int)i2s_cfg->format);
-			return -EINVAL;
-		}
-
-		if (i2s_cfg->channels != 2) {
-			LOG_ERR("Number of channels not 2 when configured with I2S data format.");
-			return -EINVAL;
-		}
-
-		if (!(16 <= i2s_cfg->word_size && i2s_cfg->word_size <= 32)) {
-			LOG_ERR("I2S word size (%d) is unsupported.", i2s_cfg->word_size);
-			return -EINVAL;
-		}
-
-		bool is_bit_clk_target = i2s_cfg->options & I2S_OPT_BIT_CLK_TARGET;
-		bool is_frame_clk_target = i2s_cfg->options & I2S_OPT_FRAME_CLK_TARGET;
-
-		if (is_bit_clk_target != is_frame_clk_target) {
-			LOG_ERR("I2S bit CLK and frame CLK must be either both target or both controller.");
-			return -EINVAL;
-		}
-
-		if (i2s_cfg->options & I2S_OPT_LOOPBACK) {
-			LOG_ERR("I2S loopback mode unsupported.");
-			LOG_DBG("To enable loopback, use the same SD for TX and RX pinctrl");
-			return -EINVAL;
-		}
-
-		if (i2s_cfg->options & I2S_OPT_PINGPONG) {
-			LOG_ERR("I2S_OPT_PINGPONG is unsupported.");
-			return -EINVAL;
-		}
-
-		if (i2s_cfg->options & I2S_OPT_BIT_CLK_GATED) {
-			LOG_ERR("Gated bit clock is unsupported.");
-			return -EINVAL;
-		}
-
-		if (other_stream->state != I2S_STATE_NOT_READY) {
-			if (i2s_cfg->frame_clk_freq != other_stream->cfg.frame_clk_freq) {
-				LOG_ERR("simultaneously configured streams have different frame_clk_freq (%d) (%d)", i2s_cfg->frame_clk_freq, other_stream->cfg.frame_clk_freq);
-				return -EINVAL;
-			}
-
-			if (i2s_cfg->word_size != other_stream->cfg.word_size) {
-				LOG_ERR("simultaneously configured streams have different word_size (%d) (%d)", i2s_cfg->word_size, other_stream->cfg.word_size);
-				return -EINVAL;
-			}
-		}
-
-		uint32_t channel_length = i2s_cfg->word_size > 16 ? 32 : 16;
-		uint64_t divider =
-			calculate_divider_shift_8(i2s_cfg->frame_clk_freq, channel_length) >> 8u;
-		if (divider == 0) {
-			LOG_ERR("sampling frequency is too high");
-			return -EINVAL;
-		}
-	}
-
-	/* --- deconfigure the stream --- */
-
 	if (i2s_cfg->frame_clk_freq == 0U) {
 		drop_queue(stream);
 
@@ -605,6 +522,66 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 				       (1u << dev_config->ws_pin));
 		}
 		return 0;
+	}
+
+	if (i2s_cfg->format != I2S_FMT_DATA_FORMAT_I2S) {
+		LOG_ERR("Unsupported data format: %u", (unsigned int)i2s_cfg->format);
+		return -EINVAL;
+	}
+
+	if (i2s_cfg->channels != 2) {
+		LOG_ERR("Number of channels not 2 when configured with I2S data format.");
+		return -EINVAL;
+	}
+
+	if (!(16 <= i2s_cfg->word_size && i2s_cfg->word_size <= 32)) {
+		LOG_ERR("I2S word size (%d) is unsupported.", i2s_cfg->word_size);
+		return -EINVAL;
+	}
+
+	bool is_bit_clk_target = i2s_cfg->options & I2S_OPT_BIT_CLK_TARGET;
+	bool is_frame_clk_target = i2s_cfg->options & I2S_OPT_FRAME_CLK_TARGET;
+
+	if (is_bit_clk_target != is_frame_clk_target) {
+		LOG_ERR("I2S bit CLK and frame CLK must be either both target or both controller.");
+		return -EINVAL;
+	}
+
+	if (i2s_cfg->options & I2S_OPT_LOOPBACK) {
+		LOG_ERR("I2S loopback mode unsupported.");
+		LOG_DBG("To enable loopback, use the same SD for TX and RX pinctrl");
+		return -EINVAL;
+	}
+
+	if (i2s_cfg->options & I2S_OPT_PINGPONG) {
+		LOG_ERR("I2S_OPT_PINGPONG is unsupported.");
+		return -EINVAL;
+	}
+
+	if (i2s_cfg->options & I2S_OPT_BIT_CLK_GATED) {
+		LOG_ERR("Gated bit clock is unsupported.");
+		return -EINVAL;
+	}
+
+	if (other_stream->state != I2S_STATE_NOT_READY) {
+		if (i2s_cfg->frame_clk_freq != other_stream->cfg.frame_clk_freq) {
+			LOG_ERR("simultaneously configured streams have different frame_clk_freq (%d) (%d)", i2s_cfg->frame_clk_freq, other_stream->cfg.frame_clk_freq);
+			return -EINVAL;
+		}
+
+		if (i2s_cfg->word_size != other_stream->cfg.word_size) {
+			LOG_ERR("simultaneously configured streams have different word_size (%d) (%d)", i2s_cfg->word_size, other_stream->cfg.word_size);
+			return -EINVAL;
+		}
+	}
+
+	// TODO: what if divider is too big?
+	uint32_t channel_length = i2s_cfg->word_size > 16 ? 32 : 16;
+	uint64_t divider =
+		calculate_divider_shift_8(i2s_cfg->frame_clk_freq, channel_length) >> 8u;
+	if (divider == 0) {
+		LOG_ERR("sampling frequency is too high");
+		return -EINVAL;
 	}
 
 	/* --- configure the stream --- */
