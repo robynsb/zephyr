@@ -1047,18 +1047,20 @@ static int i2s_drain_prepare(const struct device *dev, struct stream *stream) {
 	return 0;
 }
 
-// TODO: fix a little code duplication here?
-static int i2s_rpi_pico_trigger_single(const struct device *dev, enum i2s_dir dir,
+static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 			     enum i2s_trigger_cmd cmd)
 {
 	// const struct pio_i2s_config *dev_config = dev->config;
 	struct pio_i2s_data *dev_data = dev->data;
 	int ret;
 
-	__ASSERT_NO_MSG(dir == I2S_DIR_RX || dir == I2S_DIR_TX);
+	if (dir != I2S_DIR_RX && dir != I2S_DIR_TX) {
+		LOG_ERR("Unsupported trigger direction %d", dir);
+		return -ENOSYS;
+	}
 
 	struct stream *stream = dir == I2S_DIR_RX ? &dev_data->rx : &dev_data->tx;
-	LOG_INF("i2s_rpi_pico_trigger_single dir=%d cmd=%d", dir, cmd);
+	LOG_INF("i2s_rpi_pico_trigger dir=%d cmd=%d", dir, cmd);
 
 	switch (cmd) {
 	case I2S_TRIGGER_START:
@@ -1109,30 +1111,6 @@ static int i2s_rpi_pico_trigger_single(const struct device *dev, enum i2s_dir di
 		LOG_ERR("Unsupported trigger command");
 		return -EINVAL;
 	}
-	return 0;
-}
-
-static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
-			     enum i2s_trigger_cmd cmd)
-{
-	// const struct pio_i2s_config *dev_config = dev->config;
-	// struct pio_i2s_data *dev_data = dev->data;
-	int retval;
-
-	if (dir == I2S_DIR_RX || dir == I2S_DIR_BOTH) {
-		retval = i2s_rpi_pico_trigger_single(dev, I2S_DIR_RX, cmd);
-		if(retval < 0) {
-			return retval;
-		}
-	}
-
-	if (dir == I2S_DIR_TX || dir == I2S_DIR_BOTH) {
-		retval = i2s_rpi_pico_trigger_single(dev, I2S_DIR_TX, cmd);
-		if(retval < 0) {
-			return retval;
-		}
-	}
-
 	return 0;
 }
 
