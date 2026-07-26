@@ -1,0 +1,54 @@
+#include <dt-bindings/pinctrl/rpi-pico-rp2350a-pinctrl.h>
+#include <zephyr/dt-bindings/dma/rpi-pico-dma-rp2350.h>
+
+/ {
+	aliases {
+		i2s-node0 = &pio1_i2s0;
+	};
+};
+
+&pinctrl {
+	pio1_i2s: pio1_i2s {
+		tx_data: tx_data {
+			pinmux = <PIO1_P16>;
+		};
+		rx_data: rx_data {
+			pinmux = <PIO1_P16>;
+			/* Enable the pad input buffer so the PIO `in pins` can sample
+			 * the RX data line (off by default).
+			 */
+			input-enable;
+		};
+		clks: clks {
+			pinmux = <PIO1_P17>;
+			input-enable;
+		};
+		ws: ws {
+			pinmux = <PIO1_P18>;
+			input-enable;
+		};
+	};
+};
+
+&pio1 {
+	status = "okay";
+
+	pio1_i2s0: i2s0 {
+		compatible = "raspberrypi,pico-i2s-pio";
+		status = "okay";
+
+		pinctrl-0 = <&pio1_i2s>;
+		pinctrl-names = "default";
+
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		dmas = <&dma 7 RPI_PICO_DMA_SLOT_PIO1_TX0 0>,
+		       <&dma 8 RPI_PICO_DMA_SLOT_PIO1_RX0 0>;
+		dma-names = "tx", "rx";
+	};
+};
+
+&dma {
+	status = "okay";
+};

@@ -21,6 +21,10 @@
 //       And check that the state machines are correctly deallocated and stuff like that...
 // TODO: write test for the sampling frequency check works
 // TODO: check for code smell involving functions with only one call site.
+// TODO: claude claims: RX doesn't stop when told, if TX is mid-drain. dma_rx_callback gates its stop path on
+//       dev_data->tx.state != I2S_STATE_STOPPING (i2s_rpi_pico_pio.c:805). After TX DRAIN + RX STOP, RX
+//       keeps allocating and capturing until the TX drain completes. With a slab sized to the test's
+//       exact needs, that's what exhausted it.
 
 #include "zephyr/sys/__assert.h"
 #include <stdint.h>
@@ -614,17 +618,18 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 	memcpy(&stream->cfg, i2s_cfg, sizeof(struct i2s_config));
 
 	dev_data->channel_length = channel_length;
-	dev_data->sampling_freq = i2s_cfg->frame_clk_freq;
 
-	stream->state = I2S_STATE_READY;
 
 	pio_i2s_setup_stream(dev, stream, dir, is_controller);
 
 	// TODO: Think about if this guard is correct.
 	if (i2s_cfg_is_controller) {
+		dev_data->sampling_freq = i2s_cfg->frame_clk_freq;
 		pio_i2s_setup_clks(dev);
 		pio_i2s_clks_start(dev);
 	}
+
+	stream->state = I2S_STATE_READY;
 
 	return 0;
 }
