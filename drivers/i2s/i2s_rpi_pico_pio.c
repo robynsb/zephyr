@@ -19,7 +19,7 @@
 
 // TODO: Write raspberry pi specific tests for failing to allocate multiple i2s periperals on the same pio and stuff like that.
 //       And check that the state machines are correctly deallocated and stuff like that...
-// TODO: check that the sampling frequency check works
+// TODO: write test for the sampling frequency check works
 // TODO: check for code smell involving functions with only one call site.
 
 #include "zephyr/sys/__assert.h"
@@ -281,26 +281,26 @@ static int sm_res_claim_dir(const struct device *dev, enum i2s_dir dir, bool nee
 	if (need_clk_sm && dev_data->clks_res.sm == (size_t)-1) {
 		retval = sm_res_init(piodev, &dev_data->clks_res, RPI_PICO_PIO_GET_PROGRAM(clks));
 		if (retval < 0) {
-			goto free_sms;
+			return -EBUSY;
 		}
 
 		free_clk_sm_during_error = true;
 	}
 
-
-	if(dir == I2S_DIR_TX) {
-		if (dev_data->tx.res.sm == (size_t)-1) {
-			retval = sm_res_init(piodev, &dev_data->tx.res, RPI_PICO_PIO_GET_PROGRAM(tx_target));
-			if (retval < 0) {
-				goto free_sms;
-			}
-		}
+	const pio_program_t *prog;
+	struct pio_sm_res *res;
+	if (dir == I2S_DIR_TX) {
+		res = &dev_data->tx.res;
+		prog = RPI_PICO_PIO_GET_PROGRAM(tx_target);
 	} else {
-		if (dev_data->rx.res.sm == (size_t)-1) {
-			retval = sm_res_init(piodev, &dev_data->rx.res, RPI_PICO_PIO_GET_PROGRAM(rx_target));
-			if (retval < 0) {
-				goto free_sms;
-			}
+		res = &dev_data->rx.res;
+		prog = RPI_PICO_PIO_GET_PROGRAM(rx_target);
+	}
+
+	if (res->sm == (size_t)-1) {
+		retval = sm_res_init(piodev, res, prog);
+		if (retval < 0) {
+			goto cleanup;
 		}
 	}
 
@@ -310,10 +310,9 @@ static int sm_res_claim_dir(const struct device *dev, enum i2s_dir dir, bool nee
 			       (1u << dev_config->ws_pin));
 	}
 
-
 	return 0;
 
-free_sms:
+cleanup:
 	if(free_clk_sm_during_error) {
 		sm_res_release(piodev, &dev_data->clks_res, 0);
 	}
@@ -621,7 +620,8 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 
 	pio_i2s_setup_stream(dev, stream, dir, is_controller);
 
-	if (is_controller) {
+	// TODO: Think about if this guard is correct.
+	if (i2s_cfg_is_controller) {
 		pio_i2s_setup_clks(dev);
 		pio_i2s_clks_start(dev);
 	}
