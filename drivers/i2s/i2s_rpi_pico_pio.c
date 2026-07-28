@@ -466,11 +466,16 @@ static void pio_i2s_clks_start(const struct device *dev)
 	pio_sm_set_enabled(pio, res->sm, true);
 }
 
-static void drop_queue(struct stream *stream) {
+static void drop_stream(struct stream *stream) {
 	struct queue_item item;
 	while (k_msgq_get(stream->msgq, &item, K_NO_WAIT) == 0) {
 		k_mem_slab_free(stream->cfg.mem_slab, item.mem_block);
 	}
+	if (stream->mem_block != NULL) {
+		k_mem_slab_free(stream->cfg.mem_slab, stream->mem_block);
+		stream->mem_block = NULL;
+	}
+
 }
 
 static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
@@ -501,7 +506,7 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 	}
 
 	if (i2s_cfg->frame_clk_freq == 0U) {
-		drop_queue(stream);
+		drop_stream(stream);
 
 		sm_res_release(dev_config->piodev, &stream->res,
 			       dir == I2S_DIR_TX ? (1u << stream->data_pin) : 0);
@@ -696,15 +701,14 @@ void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 
 	struct stream *stream = &data->tx;
 
+	k_mem_slab_free(stream->cfg.mem_slab, stream->mem_block);
+	stream->mem_block = NULL;
+
 	if (status < 0) {
 		LOG_ERR("Something went wrong with DMA. status=%d", status);
 		stream->state = I2S_STATE_ERROR;
 		return;
 	}
-
-	// TODO: Should we free only if no error or in all cases?
-	k_mem_slab_free(stream->cfg.mem_slab, stream->mem_block);
-	stream->mem_block = NULL;
 
 	// I2S_TRIGGER_STOP
 	// I2S_TRIGGER_DRAIN
@@ -734,7 +738,8 @@ void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 		mem_block_size);
 
 	if (retval < 0) {
-		LOG_DBG("Failed to start TX DMA transfer: %d", retval);
+		LOG_ERR("Failed to start TX DMA transfer: %d", retval);
+		stream->state = I2S_STATE_ERROR;
 		return;
 	}
 }
@@ -767,8 +772,6 @@ void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	if (retval < 0) {
 		LOG_ERR("RX overrun");
 		stream->state = I2S_STATE_ERROR;
-		k_mem_slab_free(stream->cfg.mem_slab, stream->mem_block);
-		stream->mem_block = NULL;
 		return;
 	}
 
@@ -784,7 +787,6 @@ void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 			       K_NO_WAIT);
 	if (retval < 0) {
 		stream->state = I2S_STATE_ERROR;
-		//TODO: think about when does this trigger? Is the queue sized such that in correct operation this never happens
 		LOG_ERR("RX callback failed to allocate block");
 		return;
 	}
@@ -886,12 +888,10 @@ int i2s_start_tx_stream_dma(const struct device *dev, struct stream *stream) {
 	pio_sm_clear_fifos(pio, stream->res.sm);
 	pio_sm_exec(pio, stream->res.sm, pio_encode_jmp(stream->res.offset));
 
-	/* Stage one frame of silence ahead of the real data: once enabled the
-	 * follower may start mid-frame, and it consumes this silent word while its
-	 * `jmp pin` WS checks re-sync it to the next frame boundary. The first real
-	 * sample then shifts cleanly on the left channel (and any one-BCLK startup
-	 * skew lands on silence, 0 << 1 == 0). A 32-bit channel is one word per slot
-	 * (two per frame); a 16-bit channel packs both slots into a single word. */
+	/* PIO will start sending data inbetween a WS cycle.
+	* We write 1 or 2 priming words before writing data
+	* to prevent the first L/R pair from being corrupted
+	* and allow the PIO program to sync with the WS line. */
 	uint32_t priming_words = data->channel_length == 32 ? 2 : 1;
 
 	for (uint32_t i = 0; i < priming_words; i++) {
@@ -909,8 +909,6 @@ int i2s_start_tx_stream_dma(const struct device *dev, struct stream *stream) {
 		return ret;
 	}
 
-	/* Data staged: enable just this follower. Its first pull is the priming
-	 * word; the clocks SM and the RX follower are left untouched. */
 	pio_sm_set_enabled(pio, stream->res.sm, true);
 
 	return 0;
@@ -947,7 +945,6 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 			stream->tx_stop_without_draining = false;
 			ret = i2s_start_tx_stream_dma(dev, stream);
 		} else {
-			__ASSERT_NO_MSG(stream->mem_block == NULL);
 			ret = i2s_start_rx_stream_dma(dev, stream);
 		}
 
@@ -960,7 +957,6 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 		break;
 
 	case I2S_TRIGGER_STOP:
-		//TODO: what if DMA is not running?
 		if (stream->state != I2S_STATE_RUNNING) {
 			LOG_ERR("STOP trigger: invalid state %d", stream->state);
 			ret = -EIO;
@@ -972,7 +968,6 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 		break;
 
 	case I2S_TRIGGER_DRAIN:
-		//TODO: what if queue already empty?
 		if (stream->state != I2S_STATE_RUNNING) {
 			LOG_ERR("DRAIN trigger: invalid state %d", stream->state);
 			ret = -EIO;
@@ -989,14 +984,10 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 			break;
 		}
 
-		(void) dma_stop(stream->dev_dma, stream->dma_channel);
-		drop_queue(stream);
+		dma_stop(stream->dev_dma, stream->dma_channel);
+
+		drop_stream(stream);
 		stream->state = I2S_STATE_READY;
-		if (stream->mem_block != NULL) { // TODO: Is this free necessary? ESP32 doesn't do it. Are they wrong?
-			LOG_INF("freeing inflight thing??");
-			k_mem_slab_free(stream->cfg.mem_slab, stream->mem_block);
-			stream->mem_block = NULL;
-		}
 		break;
 
 	case I2S_TRIGGER_PREPARE:
@@ -1006,7 +997,7 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 			break;
 		}
 
-		drop_queue(stream);
+		drop_stream(stream);
 		stream->state = I2S_STATE_READY;
 		break;
 
