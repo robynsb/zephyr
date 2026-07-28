@@ -79,7 +79,6 @@ struct stream {
 	uint32_t dma_channel;
 	const struct device *dev_dma;
 	struct dma_config dma_cfg;
-	struct k_spinlock lock;
 
 	struct i2s_config cfg;
 	void *mem_block;
@@ -95,6 +94,7 @@ struct pio_i2s_data {
     uint32_t channel_length;
     uint32_t sampling_freq;
     struct pio_sm_res clks_res;
+    struct k_spinlock lock;
 };
 
 
@@ -867,7 +867,6 @@ int i2s_start_rx_stream_dma(const struct device *dev, struct stream *stream) {
 	pio_sm_set_enabled(pio, stream->res.sm, true);
 
 	uint32_t priming_words = data->channel_length == 32 ? 2 : 1;
-	// TODO: think about putting a ISR lock on this startup code.
 	for (uint32_t i = 0; i < priming_words; i++) {
 		pio_sm_get_blocking(pio, stream->res.sm);
 	}
@@ -945,107 +944,13 @@ int i2s_start_tx_stream_dma(const struct device *dev, struct stream *stream) {
 
 }
 
-static int i2s_start_stream_tx(const struct device *dev, struct stream *stream) {
-	if (stream->state != I2S_STATE_READY) {
-		LOG_ERR("START trigger: invalid state %d",
-			    stream->state);
-		return -EIO;
-	}
-	stream->tx_stop_without_draining = false;
-	int retval = i2s_start_tx_stream_dma(dev, stream);
-	if (retval < 0) {
-		LOG_ERR("START TX trigger failed %d", retval);
-		return retval;
-	}
-	// pio_i2s_controller_start(dev);
-	stream->state = I2S_STATE_RUNNING;
-	return 0;
-}
-
-static int i2s_start_stream_rx(const struct device *dev, struct stream *stream) {
-	if (stream->state != I2S_STATE_READY) {
-		LOG_ERR("START trigger: invalid state %d",
-			    stream->state);
-		return -EIO;
-	}
-	__ASSERT_NO_MSG(stream->mem_block == NULL);
-
-        int retval = i2s_start_rx_stream_dma(dev, stream);
-	if (retval < 0) {
-		LOG_ERR("START RX trigger failed %d", retval);
-		return retval;
-	}
-	// pio_i2s_controller_start(dev);
-	stream->state = I2S_STATE_RUNNING;
-	return 0;
-}
-
-static int i2s_drop_stream(const struct device *dev, struct stream *stream) {
-	k_spinlock_key_t key = k_spin_lock(&stream->lock);
-	if (stream->state == I2S_STATE_NOT_READY) {
-		k_spin_unlock(&stream->lock, key);
-		LOG_ERR("DROP trigger: invalid state %d",
-		         stream->state);
-		return -EIO;
-	}
-	(void) dma_stop(stream->dev_dma, stream->dma_channel);
-	drop_queue(stream);
-	stream->state = I2S_STATE_READY;
-	if(stream->mem_block != NULL) { // TODO: Is this free necessary? ESP32 doesn't do it. Are they wrong?
-		LOG_INF("freeing inflight thing??");
-		k_mem_slab_free(stream->cfg.mem_slab, stream->mem_block);
-		stream->mem_block = NULL;
-	}
-	k_spin_unlock(&stream->lock, key);
-	return 0;
-}
-
-static int i2s_stop_stream(const struct device *dev, struct stream *stream) {
-	k_spinlock_key_t key = k_spin_lock(&stream->lock);
-	if (stream->state != I2S_STATE_RUNNING) {
-		k_spin_unlock(&stream->lock, key);
-		LOG_ERR("STOP trigger: invalid state %d", stream->state);
-		return -EIO;
-	}
-	stream->state = I2S_STATE_STOPPING;
-	stream->tx_stop_without_draining = true;
-	k_spin_unlock(&stream->lock, key);
-	return 0;
-}
-
-static int i2s_drain_stream(const struct device *dev, struct stream *stream) {
-	k_spinlock_key_t key = k_spin_lock(&stream->lock);
-	if (stream->state != I2S_STATE_RUNNING) {
-		k_spin_unlock(&stream->lock, key);
-		LOG_ERR("DRAIN trigger: invalid state %d",
-		         stream->state);
-		return -EIO;
-	}
-	stream->state = I2S_STATE_STOPPING;
-	k_spin_unlock(&stream->lock, key);
-	return 0;
-}
-
-static int i2s_drain_prepare(const struct device *dev, struct stream *stream) {
-	k_spinlock_key_t key = k_spin_lock(&stream->lock);
-	if (stream->state != I2S_STATE_ERROR) {
-		k_spin_unlock(&stream->lock, key);
-		LOG_ERR("PREPARE trigger: invalid state %d",
-		         stream->state);
-		return -EIO;
-	}
-	drop_queue(stream);
-	stream->state = I2S_STATE_READY;
-	k_spin_unlock(&stream->lock, key);
-	return 0;
-}
-
 static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 			     enum i2s_trigger_cmd cmd)
 {
 	// const struct pio_i2s_config *dev_config = dev->config;
 	struct pio_i2s_data *dev_data = dev->data;
-	int ret;
+	k_spinlock_key_t key;
+	int ret = 0;
 
 	if (dir != I2S_DIR_RX && dir != I2S_DIR_TX) {
 		LOG_ERR("Unsupported trigger direction %d", dir);
@@ -1055,56 +960,91 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 	struct stream *stream = dir == I2S_DIR_RX ? &dev_data->rx : &dev_data->tx;
 	LOG_INF("i2s_rpi_pico_trigger dir=%d cmd=%d", dir, cmd);
 
+	key = k_spin_lock(&dev_data->lock);
+
 	switch (cmd) {
 	case I2S_TRIGGER_START:
-		if(stream->state != I2S_STATE_READY) {
-			LOG_ERR("Stream state must be in ready state to start stream.");
-			return -EIO;
+		if (stream->state != I2S_STATE_READY) {
+			LOG_ERR("START trigger: invalid state %d", stream->state);
+			ret = -EIO;
+			break;
 		}
 
-		//TODO: inline these functions a bit
 		if (dir == I2S_DIR_TX) {
-			ret = i2s_start_stream_tx(dev, stream);
+			stream->tx_stop_without_draining = false;
+			ret = i2s_start_tx_stream_dma(dev, stream);
 		} else {
-			ret = i2s_start_stream_rx(dev, stream);
+			__ASSERT_NO_MSG(stream->mem_block == NULL);
+			ret = i2s_start_rx_stream_dma(dev, stream);
 		}
+
 		if (ret < 0) {
-			return ret;
+			LOG_ERR("START trigger failed %d", ret);
+			break;
 		}
+
+		stream->state = I2S_STATE_RUNNING;
 		break;
+
 	case I2S_TRIGGER_STOP:
 		//TODO: what if DMA is not running?
-		ret = i2s_stop_stream(dev, stream);
-		if (ret < 0) {
-			return ret;
+		if (stream->state != I2S_STATE_RUNNING) {
+			LOG_ERR("STOP trigger: invalid state %d", stream->state);
+			ret = -EIO;
+			break;
 		}
+
+		stream->state = I2S_STATE_STOPPING;
+		stream->tx_stop_without_draining = true;
 		break;
+
 	case I2S_TRIGGER_DRAIN:
 		//TODO: what if queue already empty?
-		ret = i2s_drain_stream(dev, stream);
-		if (ret < 0) {
-			return ret;
+		if (stream->state != I2S_STATE_RUNNING) {
+			LOG_ERR("DRAIN trigger: invalid state %d", stream->state);
+			ret = -EIO;
+			break;
 		}
+
+		stream->state = I2S_STATE_STOPPING;
 		break;
+
 	case I2S_TRIGGER_DROP:
-		ret = i2s_drop_stream(dev, stream);
-		if (ret < 0) {
-			return ret;
+		if (stream->state == I2S_STATE_NOT_READY) {
+			LOG_ERR("DROP trigger: invalid state %d", stream->state);
+			ret = -EIO;
+			break;
+		}
+
+		(void) dma_stop(stream->dev_dma, stream->dma_channel);
+		drop_queue(stream);
+		stream->state = I2S_STATE_READY;
+		if (stream->mem_block != NULL) { // TODO: Is this free necessary? ESP32 doesn't do it. Are they wrong?
+			LOG_INF("freeing inflight thing??");
+			k_mem_slab_free(stream->cfg.mem_slab, stream->mem_block);
+			stream->mem_block = NULL;
 		}
 		break;
+
 	case I2S_TRIGGER_PREPARE:
-		ret = i2s_drain_prepare(dev, stream);
-		if (ret < 0) {
-			return ret;
+		if (stream->state != I2S_STATE_ERROR) {
+			LOG_ERR("PREPARE trigger: invalid state %d", stream->state);
+			ret = -EIO;
+			break;
 		}
+
+		drop_queue(stream);
+		stream->state = I2S_STATE_READY;
 		break;
 
 	default:
-        //TODO: Handle all other trigger commands
 		LOG_ERR("Unsupported trigger command");
-		return -EINVAL;
+		ret = -EINVAL;
 	}
-	return 0;
+
+	k_spin_unlock(&dev_data->lock, key);
+
+	return ret;
 }
 
 // TODO: Test this function
