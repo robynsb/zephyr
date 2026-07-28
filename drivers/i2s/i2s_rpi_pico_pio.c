@@ -318,6 +318,7 @@ cleanup:
 }
 
 /*
+ * TODO: rewrite this with the used variable names
  * f_sys = system_clock_frequency
  * f_b = frequency of Bit CLK
  * f_pio = instruction frequency of PIO clk state machine
@@ -1039,7 +1040,6 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 	.trigger = i2s_rpi_pico_trigger,
 };
 
-// TODO: hardcoded queue size!
 /*  TODO:
  *  BCLK (clks group), WS (ws group) and the data pins are independent in the overlay.
  *  The one hardware constraint that remains is rx_data == BCLK - 1, because rx_target
@@ -1059,9 +1059,9 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 		.ws_pin = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, ws, 0)                 \
 	};                                                                                         \
 	K_MSGQ_DEFINE(tx_##idx##_queue, sizeof(struct queue_item),                                 \
-	        32, 4);                                                                            \
+	        CONFIG_I2S_RPI_PICO_PIO_TX_QUEUE_SIZE, 1);                                         \
 	K_MSGQ_DEFINE(rx_##idx##_queue, sizeof(struct queue_item),	                           \
-	        32, 4);                                                                            \
+	        CONFIG_I2S_RPI_PICO_PIO_RX_QUEUE_SIZE, 1);                                         \
 	static struct pio_i2s_data pio_i2s##idx##_data = {                                         \
         .tx = {                                                                                    \
 		.msgq = &tx_##idx##_queue,                                                         \

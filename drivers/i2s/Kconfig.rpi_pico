@@ -16,5 +16,20 @@ config I2S_RPI_PICO_PIO
 
 if I2S_RPI_PICO_PIO
 
+config I2S_RPI_PICO_PIO_RX_QUEUE_SIZE
+	int "RX queue length"
+	default 32
+	help
+	  This option sets the number of elements allocated for the rx software
+	  queue. This should match the number of blocks in the memory slab
+	  that will hold the i2s receive data.
+
+config I2S_RPI_PICO_PIO_TX_QUEUE_SIZE
+	int "TX queue length"
+	default 32
+	help
+	  This option sets the number of elements allocated for the tx software
+	  queue. This should match the number of blocks in the memory slab
+	  that will hold the i2s transmit data.
 
 endif # I2S_RPI_PICO_PIO
