@@ -344,11 +344,6 @@ static uint64_t calculate_divider_shift_8(uint64_t sample_freq, uint64_t channel
 }
 
 
-/*
- * Set up the clks SM: load the clock generator program, configure BCLK on the
- * 1-bit sideset and WS on the out/in base, and program the clock divider from
- * the shared sampling parameters. Started separately by pio_i2s_clks_start().
- */
 static void pio_i2s_setup_clks(const struct device *dev)
 {
 	const struct pio_i2s_config *dev_config = dev->config;
@@ -1071,13 +1066,12 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 		.dma_channel = DT_INST_DMAS_CELL_BY_NAME(idx, tx, channel),                        \
 		.data_pin = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, tx_data, 0),         \
 		.dma_cfg = {                                                                       \
-			.block_count = 1, /* block_count > 1 not supported */                      \
+			.block_count = 1,                                                          \
 			.channel_direction = MEMORY_TO_PERIPHERAL,                                 \
-			.source_data_size = 4,  /* 32bit hard coded */                             \
-			.dest_data_size = 4,    /* TODO: 32bit hard coded */                       \
-			/* single transfers (burst length = data size) */                          \
-			.source_burst_length = 1, /* unused i think */                             \
-			.dest_burst_length = 1,	/* unused i think */                               \
+			.source_data_size = 4,                                                     \
+			.dest_data_size = 4,                                                       \
+			.source_burst_length = 1,                                                  \
+			.dest_burst_length = 1,                                                    \
 			.channel_priority = 1, /* TODO: hardcoded */                               \
 			.dma_callback = dma_tx_callback                                            \
 		},                                                                                 \
@@ -1091,13 +1085,12 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 		.dma_channel = DT_INST_DMAS_CELL_BY_NAME(idx, rx, channel),                        \
 		.data_pin = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, rx_data, 0),         \
 		.dma_cfg = {                                                                       \
-			.block_count = 1, /* block_count > 1 not supported */                      \
+			.block_count = 1,                                                          \
 			.channel_direction = PERIPHERAL_TO_MEMORY,                                 \
-			.source_data_size = 4,  /* 32bit hard coded */                             \
-			.dest_data_size = 4,    /* TODO: 32bit hard coded */                       \
-			/* single transfers (burst length = data size) */                          \
-			.source_burst_length = 1, /* unused i think */                             \
-			.dest_burst_length = 1,	/* unused i think */                               \
+			.source_data_size = 4,                                                     \
+			.dest_data_size = 4,                                                       \
+			.source_burst_length = 1,                                                  \
+			.dest_burst_length = 1,                                                    \
 			.channel_priority = 1, /* TODO: hardcoded */                               \
 			.dma_callback = dma_rx_callback                                            \
 		},                                                                                 \
