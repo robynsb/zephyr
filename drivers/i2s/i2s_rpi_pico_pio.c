@@ -1050,64 +1050,64 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
          "I2S rx_data pin must be bit-clock pin - 1 "                                \
          "(rx_target reads data at in_base+0 and BCLK at in_base+1); fix the overlay");\
  */
-#define PIO_I2S_INIT(idx)									\
-	PINCTRL_DT_INST_DEFINE(idx);								\
-	static const struct pio_i2s_config pio_i2s##idx##_config = {				\
-		.piodev = DEVICE_DT_GET(DT_INST_PARENT(idx)),					\
-		.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(idx),					\
-		.clock_pin = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, clks, 0),	\
-		.ws_pin = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, ws, 0)	\
-	};                                                  \
-	K_MSGQ_DEFINE(tx_##idx##_queue, sizeof(struct queue_item),		\
-	        32, 4);			\
-	K_MSGQ_DEFINE(rx_##idx##_queue, sizeof(struct queue_item),		\
-	        32, 4);			\
-	static struct pio_i2s_data pio_i2s##idx##_data = {                \
-        .tx = {                                                        \
-		.msgq = &tx_##idx##_queue,                               \
-		.state = I2S_STATE_NOT_READY,                                \
-		.tx_stop_without_draining = false,                                         \
-		.dev_dma = DEVICE_DT_GET(DT_INST_DMAS_CTLR_BY_NAME(idx, tx)),		\
-		.dma_channel = DT_INST_DMAS_CELL_BY_NAME(idx, tx, channel),  \
-		.data_pin = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, tx_data, 0),	\
-		.dma_cfg = {							\
-			.block_count = 1, /* block_count > 1 not supported */	\
-			.channel_direction = MEMORY_TO_PERIPHERAL,		\
-			.source_data_size = 4,  /* 32bit hard coded */		\
-			.dest_data_size = 4,    /* TODO: 32bit hard coded */		\
-			/* single transfers (burst length = data size) */	\
-			.source_burst_length = 1, /* unused i think */			\
-			.dest_burst_length = 1,	/* unused i think */			\
-			.channel_priority = 1, /* TODO: hardcoded */		\
-			.dma_callback = dma_tx_callback			\
-		},								\
-		.res = {.sm = (size_t)-1, .prog = NULL},        \
-        },                                             \
-        .rx = {                                                        \
-		.msgq = &rx_##idx##_queue,                               \
-		.state = I2S_STATE_NOT_READY,                                \
-		.tx_stop_without_draining = false,                                         \
-		.dev_dma = DEVICE_DT_GET(DT_INST_DMAS_CTLR_BY_NAME(idx, rx)),		\
-		.dma_channel = DT_INST_DMAS_CELL_BY_NAME(idx, rx, channel),  \
-		.data_pin = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, rx_data, 0),	\
-		.dma_cfg = {							\
-			.block_count = 1, /* block_count > 1 not supported */	\
-			.channel_direction = PERIPHERAL_TO_MEMORY,		\
-			.source_data_size = 4,  /* 32bit hard coded */		\
-			.dest_data_size = 4,    /* TODO: 32bit hard coded */		\
-			/* single transfers (burst length = data size) */	\
-			.source_burst_length = 1, /* unused i think */			\
-			.dest_burst_length = 1,	/* unused i think */			\
-			.channel_priority = 1, /* TODO: hardcoded */		\
-			.dma_callback = dma_rx_callback			\
-		},								\
-		.res = {.sm = (size_t)-1, .prog = NULL},        \
-        },                                             \
-        .clks_res = {.sm = (size_t)-1, .prog = NULL}                       \
-    };					\
-	DEVICE_DT_INST_DEFINE(idx, pio_i2s_init, NULL, &pio_i2s##idx##_data,			\
-			      &pio_i2s##idx##_config, POST_KERNEL,				\
-			      CONFIG_I2S_INIT_PRIORITY,					\
+#define PIO_I2S_INIT(idx)                                                                          \
+	PINCTRL_DT_INST_DEFINE(idx);                                                               \
+	static const struct pio_i2s_config pio_i2s##idx##_config = {                               \
+		.piodev = DEVICE_DT_GET(DT_INST_PARENT(idx)),                                      \
+		.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(idx),                                       \
+		.clock_pin = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, clks, 0),           \
+		.ws_pin = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, ws, 0)                 \
+	};                                                                                         \
+	K_MSGQ_DEFINE(tx_##idx##_queue, sizeof(struct queue_item),                                 \
+	        32, 4);                                                                            \
+	K_MSGQ_DEFINE(rx_##idx##_queue, sizeof(struct queue_item),	                           \
+	        32, 4);                                                                            \
+	static struct pio_i2s_data pio_i2s##idx##_data = {                                         \
+        .tx = {                                                                                    \
+		.msgq = &tx_##idx##_queue,                                                         \
+		.state = I2S_STATE_NOT_READY,                                                      \
+		.tx_stop_without_draining = false,                                                 \
+		.dev_dma = DEVICE_DT_GET(DT_INST_DMAS_CTLR_BY_NAME(idx, tx)),                      \
+		.dma_channel = DT_INST_DMAS_CELL_BY_NAME(idx, tx, channel),                        \
+		.data_pin = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, tx_data, 0),         \
+		.dma_cfg = {                                                                       \
+			.block_count = 1, /* block_count > 1 not supported */                      \
+			.channel_direction = MEMORY_TO_PERIPHERAL,                                 \
+			.source_data_size = 4,  /* 32bit hard coded */                             \
+			.dest_data_size = 4,    /* TODO: 32bit hard coded */                       \
+			/* single transfers (burst length = data size) */                          \
+			.source_burst_length = 1, /* unused i think */                             \
+			.dest_burst_length = 1,	/* unused i think */                               \
+			.channel_priority = 1, /* TODO: hardcoded */                               \
+			.dma_callback = dma_tx_callback                                            \
+		},                                                                                 \
+		.res = {.sm = (size_t)-1, .prog = NULL},                                           \
+        },                                                                                         \
+        .rx = {                                                                                    \
+		.msgq = &rx_##idx##_queue,                                                         \
+		.state = I2S_STATE_NOT_READY,                                                      \
+		.tx_stop_without_draining = false,                                                 \
+		.dev_dma = DEVICE_DT_GET(DT_INST_DMAS_CTLR_BY_NAME(idx, rx)),                      \
+		.dma_channel = DT_INST_DMAS_CELL_BY_NAME(idx, rx, channel),                        \
+		.data_pin = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, rx_data, 0),         \
+		.dma_cfg = {                                                                       \
+			.block_count = 1, /* block_count > 1 not supported */                      \
+			.channel_direction = PERIPHERAL_TO_MEMORY,                                 \
+			.source_data_size = 4,  /* 32bit hard coded */                             \
+			.dest_data_size = 4,    /* TODO: 32bit hard coded */                       \
+			/* single transfers (burst length = data size) */                          \
+			.source_burst_length = 1, /* unused i think */                             \
+			.dest_burst_length = 1,	/* unused i think */                               \
+			.channel_priority = 1, /* TODO: hardcoded */                               \
+			.dma_callback = dma_rx_callback                                            \
+		},                                                                                 \
+		.res = {.sm = (size_t)-1, .prog = NULL},                                           \
+        },                                                                                         \
+        .clks_res = {.sm = (size_t)-1, .prog = NULL}                                               \
+    };                                                                                             \
+	DEVICE_DT_INST_DEFINE(idx, pio_i2s_init, NULL, &pio_i2s##idx##_data,                       \
+			      &pio_i2s##idx##_config, POST_KERNEL,                                 \
+			      CONFIG_I2S_INIT_PRIORITY,                                            \
 			      &i2s_rpi_pico_driver_api);
 
 DT_INST_FOREACH_STATUS_OKAY(PIO_I2S_INIT)
