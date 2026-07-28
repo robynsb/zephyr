@@ -602,7 +602,6 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
 
 	stream->dma_cfg.user_data = (void*) dev;
-	// TODO: think about this dma_slot and the one in the overlay.
 	stream->dma_cfg.dma_slot = RPI_PICO_DMA_DREQ_TO_SLOT(pio_get_dreq(pio, stream->res.sm, dir == I2S_DIR_TX));
 	memcpy(&stream->cfg, i2s_cfg, sizeof(struct i2s_config));
 

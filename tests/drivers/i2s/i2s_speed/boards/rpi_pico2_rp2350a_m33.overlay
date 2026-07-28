@@ -43,8 +43,8 @@
 		#address-cells = <1>;
 		#size-cells = <0>;
 
-		dmas = <&dma 7 RPI_PICO_DMA_SLOT_PIO1_TX0 0>,
-		       <&dma 8 RPI_PICO_DMA_SLOT_PIO1_RX0 0>;
+		dmas = <&dma 7 0 0>,
+		       <&dma 8 0 0>;
 		dma-names = "tx", "rx";
 	};
 };

@@ -7,19 +7,6 @@
 	};
 };
 
-/*
- * Single-device loopback: tx_data and rx_data are the same pin, so the loopback
- * happens on the pad and this configuration needs no external wiring at all.
- *
- * The pins are deliberately kept clear of GP7..GP12, which the two-device
- * variant (rpi_pico2_rp2350a_m33_two_dev.overlay) uses and jumpers together.
- * Leaving those jumpers fitted must not perturb this test: they would otherwise
- * hang a wire and a second pad off every signal here, and GP8 in particular is
- * both driven and sampled within a fraction of a bit-clock period.
- *
- * BCLK must be rx_data + 1: rx_target reads data at in_base+0 and the bit clock
- * at in_base+1 (i2s_rpi_pico_pio.c:413-414).
- */
 &pinctrl {
 	pio1_i2s: pio1_i2s {
 		tx_data: tx_data {
@@ -27,9 +14,6 @@
 		};
 		rx_data: rx_data {
 			pinmux = <PIO1_P16>;
-			/* Enable the pad input buffer so the PIO `in pins` can sample
-			 * the RX data line (off by default).
-			 */
 			input-enable;
 		};
 		clks: clks {
@@ -56,8 +40,8 @@
 		#address-cells = <1>;
 		#size-cells = <0>;
 
-		dmas = <&dma 7 RPI_PICO_DMA_SLOT_PIO1_TX0 0>,
-		       <&dma 8 RPI_PICO_DMA_SLOT_PIO1_RX0 0>;
+		dmas = <&dma 7 0 0>,
+		       <&dma 8 0 0>;
 		dma-names = "tx", "rx";
 	};
 };

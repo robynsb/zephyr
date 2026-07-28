@@ -114,8 +114,8 @@
 		#size-cells = <0>;
 
 		/* Channels 7/8 are taken by pio1_i2s0 in the base overlay. */
-		dmas = <&dma 5 RPI_PICO_DMA_SLOT_PIO0_TX0 0>,
-		       <&dma 6 RPI_PICO_DMA_SLOT_PIO0_RX0 0>;
+		dmas = <&dma 5 0 0>,
+		       <&dma 6 0 0>;
 		dma-names = "tx", "rx";
 	};
 };
