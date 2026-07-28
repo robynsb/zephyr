@@ -1,3 +1,4 @@
+# TODO: make gpio_loopback.two_dev into a snippet???
 tests:
   drivers.i2s:
     depends_on: i2s
@@ -36,6 +37,21 @@ tests:
       - phyboard_atlas/mimxrt1176/cm7
     harness_config:
       fixture: gpio_loopback
+  drivers.i2s.gpio_loopback.two_dev:
+    depends_on:
+      - i2s
+      - gpio
+    tags:
+      - drivers
+      - userspace
+    filter: CONFIG_I2S_TEST_USE_GPIO_LOOPBACK
+    harness: ztest
+    harness_config:
+      fixture: gpio_loopback
+    platform_allow: rpi_pico2/rp2350a/m33
+    extra_args:
+      - EXTRA_CONF_FILE="boards/rpi_pico2_rp2350a_m33_two_dev.conf"
+      - EXTRA_DTC_OVERLAY_FILE="boards/rpi_pico2_rp2350a_m33_two_dev.overlay"
   drivers.i2s.gpio_loopback.nrf54h:
     depends_on: i2s
     tags:

@@ -24,7 +24,7 @@
 // TODO: claude claims: RX doesn't stop when told, if TX is mid-drain. dma_rx_callback gates its stop path on
 //       dev_data->tx.state != I2S_STATE_STOPPING (i2s_rpi_pico_pio.c:805). After TX DRAIN + RX STOP, RX
 //       keeps allocating and capturing until the TX drain completes. With a slab sized to the test's
-//       exact needs, that's what exhausted it.
+//       exact needs, that's what exhausted it. - WARNINGS?!?!
 
 #include "zephyr/sys/__assert.h"
 #include <stdint.h>
@@ -208,6 +208,7 @@ RPI_PICO_PIO_DEFINE_PROGRAM(rx_target, 0, 10,
 static const uint32_t clks_cycles_factor = 2u; /* k=2: 2 PIO cycles per BCLK period */
 static const uint32_t clks_entry_point = 0;
 
+// TODO: delete sm_res_init?
 static int sm_res_init(const struct device *piodev, struct pio_sm_res *res,
 		       const pio_program_t *prog)
 {
@@ -250,13 +251,6 @@ static void sm_res_release(const struct device *piodev, struct pio_sm_res *res,
 		pio_sm_set_enabled(pio, res->sm, false);
 
 		if (out_pins != 0) {
-			/* Only an SM can drive the SET that changes pindirs, so
-			 * borrow the one being unclaimed. It is stopped on the
-			 * line above, so injecting an instruction cannot disturb
-			 * a transfer — the clks SM in particular is left
-			 * free-running by pio_i2s_clks_start() and may still be
-			 * executing on entry.
-			 */
 			pio_sm_set_pindirs_with_mask(pio, res->sm, 0, out_pins);
 		}
 
@@ -479,11 +473,6 @@ static void drop_queue(struct stream *stream) {
 	}
 }
 
-// TODO: verify target vs loopback modes.
-// TODO: Comprehensive checks against bad cfgs.
-// TODO: fail safe.
-// TODO: test case: configure as controller, reconfigure as target. clocks need to be stopped in that case.
-// TODO: Make sure no warnings during test scenario appear.
 static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 			       const struct i2s_config *i2s_cfg)
 {
@@ -511,11 +500,6 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 		return -EINVAL;
 	}
 
-	if (other_stream->state != I2S_STATE_NOT_READY && other_stream->state != I2S_STATE_READY) {
-		LOG_ERR("other stream in invalid state (%d)", other_stream->state);
-		return -EINVAL;
-	}
-
 	if (i2s_cfg->frame_clk_freq == 0U) {
 		drop_queue(stream);
 
@@ -531,6 +515,11 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 				       (1u << dev_config->ws_pin));
 		}
 		return 0;
+	}
+
+	if (other_stream->state != I2S_STATE_NOT_READY && other_stream->state != I2S_STATE_READY) {
+		LOG_ERR("other stream in invalid state (%d)", other_stream->state);
+		return -EINVAL;
 	}
 
 	if (i2s_cfg->format != I2S_FMT_DATA_FORMAT_I2S) {
@@ -622,7 +611,6 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 
 	pio_i2s_setup_stream(dev, stream, dir, is_controller);
 
-	// TODO: Think about if this guard is correct.
 	if (i2s_cfg_is_controller) {
 		dev_data->sampling_freq = i2s_cfg->frame_clk_freq;
 		pio_i2s_setup_clks(dev);
@@ -940,7 +928,7 @@ int i2s_start_tx_stream_dma(const struct device *dev, struct stream *stream) {
 
 	ret = start_dma(stream->dev_dma, stream->dma_channel,
 			&stream->dma_cfg,
-			stream->mem_block, true, /* TODO: scr addr increment setting? */
+			stream->mem_block, true,
 			(void *)&pio->txf[stream->res.sm],
 			false,
 			mem_block_size);
