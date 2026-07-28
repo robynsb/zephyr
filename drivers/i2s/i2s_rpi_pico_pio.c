@@ -576,6 +576,7 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 
 		uint64_t divider =
 			calculate_divider_shift_8(i2s_cfg->frame_clk_freq, channel_length) >> 8u;
+		// TODO: I guess that this is actually not strict enough.
 		if (divider == 0) {
 			LOG_ERR("sampling frequency is too high");
 			return -EINVAL;
@@ -665,7 +666,6 @@ static int start_dma(const struct device *dev_dma, uint32_t channel,
 	} else {
 		blk_cfg.dest_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
 	}
-	// blk_cfg.fifo_mode_control = fifo_threshold; // TODO: i guess this does nothing for pico?
 
 	dcfg->head_block = &blk_cfg;
 
@@ -691,7 +691,6 @@ void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	struct pio_i2s_data *data = dev->data;
 	// uint dma_channel = data->tx.dma_channel;
 	PIO pio = pio_rpi_pico_get_pio(config->piodev);
-	// TODO: Use a spinlock here?
 
 	int retval;
 
@@ -700,7 +699,7 @@ void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	if (status < 0) {
 		LOG_ERR("Something went wrong with DMA. status=%d", status);
 		stream->state = I2S_STATE_ERROR;
-		return; // TODO: abort DMA?
+		return;
 	}
 
 	// TODO: Should we free only if no error or in all cases?
@@ -708,29 +707,12 @@ void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	stream->mem_block = NULL;
 
 	// I2S_TRIGGER_STOP
-	// TODO: combine the two if statements together?
-	if(stream->state == I2S_STATE_STOPPING && stream->tx_stop_without_draining) {
-		// TODO: dma_stop seems useless?!
-		retval = dma_stop(stream->dev_dma, stream->dma_channel);
-		if(retval < 0) {
-			stream->state = I2S_STATE_ERROR;
-			return;
-		}
-		stream->state = I2S_STATE_READY;
-		return;
-	}
-
 	// I2S_TRIGGER_DRAIN
-	if(stream->state == I2S_STATE_STOPPING && queue_is_empty(stream->msgq)) {
-		retval = dma_stop(stream->dev_dma, stream->dma_channel);
-		if(retval < 0) {
-			stream->state = I2S_STATE_ERROR;
-			return;
-		}
+	if(stream->state == I2S_STATE_STOPPING && (stream->tx_stop_without_draining ||
+	   queue_is_empty(stream->msgq))) {
 		stream->state = I2S_STATE_READY;
 		return;
 	}
-
 
 	struct queue_item item;
 	size_t mem_block_size;
@@ -738,7 +720,7 @@ void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	if (ret < 0) {
 		LOG_ERR("TX buffer underrun.");
 		stream->state = I2S_STATE_ERROR;
-		return; // TODO: abort DMA?
+		return;
 	}
 
 	stream->mem_block = item.mem_block;
@@ -764,7 +746,6 @@ void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	struct pio_i2s_data *dev_data = dev->data;
 	// uint dma_channel = dev_data->rx.dma_channel;
 	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
-	// TODO: Use a spinlock here?
 
 	int retval;
 
@@ -773,7 +754,7 @@ void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	if (status < 0) {
 		LOG_ERR("Something went wrong with DMA. status=%d", status);
 		stream->state = I2S_STATE_ERROR;
-		return; // TODO: abort DMA?
+		return;
 	}
 
 	if (stream->state == I2S_STATE_ERROR) {
@@ -794,18 +775,11 @@ void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	stream->mem_block = NULL;
 
 	if(stream->state == I2S_STATE_STOPPING && dev_data->tx.state != I2S_STATE_STOPPING) {
-		retval = dma_stop(stream->dev_dma, stream->dma_channel);
-		if(retval < 0) {
-			stream->state = I2S_STATE_ERROR;
-			return;
-		}
-
 		stream->state = I2S_STATE_READY;
 
 		return;
 	}
 
-	/* Prepare to receive the next data block */
 	retval = k_mem_slab_alloc(stream->cfg.mem_slab, &stream->mem_block,
 			       K_NO_WAIT);
 	if (retval < 0) {
