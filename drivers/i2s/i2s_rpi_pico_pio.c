@@ -97,8 +97,6 @@ struct pio_i2s_data {
     struct k_spinlock lock;
 };
 
-
-
 static int i2s_rpi_pico_write(const struct device *dev, void *mem_block, size_t size)
 {
 	// const struct pio_i2s_config *config = dev->config;
@@ -390,7 +388,6 @@ static void pio_i2s_setup_stream(const struct device *dev, struct stream *stream
 	const struct pio_i2s_config *dev_config = dev->config;
 	struct pio_i2s_data *dev_data = dev->data;
 	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
-	uint32_t channel_length = dev_data->channel_length;
 	uint32_t bclk_pin = dev_config->clock_pin;
 	uint32_t ws_pin = dev_config->ws_pin;
 	struct pio_sm_res *res = &stream->res;
@@ -407,7 +404,7 @@ static void pio_i2s_setup_stream(const struct device *dev, struct stream *stream
 		sm_config_set_in_pins(&c, bclk_pin);
 		sm_config_set_in_pin_count(&c, 1);
 		sm_config_set_jmp_pin(&c, ws_pin);
-		sm_config_set_out_shift(&c, false, false, channel_length == 16 ? 32 : 1);
+		sm_config_set_out_shift(&c, false, false, 1);
 		sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
 		pio_sm_init(pio, res->sm, res->offset, &c);
 		/* Followers run as fast as possible; they gate on the clock pins. */
@@ -422,7 +419,7 @@ static void pio_i2s_setup_stream(const struct device *dev, struct stream *stream
 		sm_config_set_in_pins(&c, stream->data_pin);
 		sm_config_set_in_pin_count(&c, 2); /* data at +0, BCLK at +1 */
 		sm_config_set_jmp_pin(&c, ws_pin);
-		sm_config_set_in_shift(&c, false, false, channel_length == 16 ? 32 : 1);
+		sm_config_set_in_shift(&c, false, false, 1);
 		sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
 		pio_sm_init(pio, res->sm, res->offset, &c);
 		pio_sm_set_clkdiv_int_frac(pio, res->sm, 1, 0);
@@ -605,6 +602,9 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 
 	stream->dma_cfg.user_data = (void*) dev;
 	stream->dma_cfg.dma_slot = RPI_PICO_DMA_DREQ_TO_SLOT(pio_get_dreq(pio, stream->res.sm, dir == I2S_DIR_TX));
+	stream->dma_cfg.source_data_size = channel_length == 16 ? 2 : 4;
+	stream->dma_cfg.dest_data_size = channel_length == 16 ? 2 : 4;
+
 	memcpy(&stream->cfg, i2s_cfg, sizeof(struct i2s_config));
 
 	dev_data->channel_length = channel_length;
@@ -765,6 +765,7 @@ void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	struct queue_item item = {.mem_block = stream->mem_block, .size = stream->cfg.block_size};
 
 	retval = k_msgq_put(stream->msgq, &item, K_NO_WAIT);
+
 	if (retval < 0) {
 		LOG_ERR("RX overrun");
 		stream->state = I2S_STATE_ERROR;
@@ -818,7 +819,7 @@ static int pio_i2s_init(const struct device *dev)
 
 int i2s_start_rx_stream_dma(const struct device *dev, struct stream *stream) {
 	const struct pio_i2s_config *config = dev->config;
-	struct pio_i2s_data *data = dev->data;
+	// struct pio_i2s_data *data = dev->data;
 	PIO pio = pio_rpi_pico_get_pio(config->piodev);
 
 	// struct stream *stream = &data->tx;
@@ -837,8 +838,7 @@ int i2s_start_rx_stream_dma(const struct device *dev, struct stream *stream) {
 	pio_sm_exec(pio, stream->res.sm, pio_encode_jmp(stream->res.offset));
 	pio_sm_set_enabled(pio, stream->res.sm, true);
 
-	uint32_t priming_words = data->channel_length == 32 ? 2 : 1;
-	for (uint32_t i = 0; i < priming_words; i++) {
+	for (uint32_t i = 0; i < 2; i++) {
 		pio_sm_get_blocking(pio, stream->res.sm);
 	}
 
@@ -860,7 +860,7 @@ int i2s_start_rx_stream_dma(const struct device *dev, struct stream *stream) {
 
 int i2s_start_tx_stream_dma(const struct device *dev, struct stream *stream) {
 	const struct pio_i2s_config *config = dev->config;
-	struct pio_i2s_data *data = dev->data;
+	// struct pio_i2s_data *data = dev->data;
 	PIO pio = pio_rpi_pico_get_pio(config->piodev);
 
 	// struct stream *stream = &data->tx;
@@ -868,6 +868,7 @@ int i2s_start_tx_stream_dma(const struct device *dev, struct stream *stream) {
 
 	size_t mem_block_size;
 	struct queue_item item;
+
 	int ret = k_msgq_get(stream->msgq, &item, SYS_TIMEOUT_MS(0));
 
 
@@ -885,12 +886,10 @@ int i2s_start_tx_stream_dma(const struct device *dev, struct stream *stream) {
 	pio_sm_exec(pio, stream->res.sm, pio_encode_jmp(stream->res.offset));
 
 	/* PIO will start sending data inbetween a WS cycle.
-	* We write 1 or 2 priming words before writing data
+	* We write 2 priming words before writing data
 	* to prevent the first L/R pair from being corrupted
 	* and allow the PIO program to sync with the WS line. */
-	uint32_t priming_words = data->channel_length == 32 ? 2 : 1;
-
-	for (uint32_t i = 0; i < priming_words; i++) {
+	for (uint32_t i = 0; i < 2; i++) {
 		pio_sm_put_blocking(pio, stream->res.sm, 0);
 	}
 
@@ -1068,7 +1067,7 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 		.dma_cfg = {                                                                       \
 			.block_count = 1,                                                          \
 			.channel_direction = MEMORY_TO_PERIPHERAL,                                 \
-			.source_data_size = 4,                                                     \
+			.source_data_size = 4,                              /*  TODO: dumb! */     \
 			.dest_data_size = 4,                                                       \
 			.source_burst_length = 1,                                                  \
 			.dest_burst_length = 1,                                                    \
