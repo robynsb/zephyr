@@ -36,6 +36,7 @@
 #include <hardware/pio.h>
 #include <zephyr/drivers/dma.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/timing/timing.h>
 #include <hardware/clocks.h>
 #include <math.h>
 #if defined(CONFIG_SOC_SERIES_RP2040)
@@ -86,6 +87,8 @@ struct stream {
 	const uint32_t data_pin;
 
 	struct pio_sm_res res;
+	// DEBUG STUFF
+	uint64_t total_cycles_max, a_cycles, b_cycles, c_cycles, d_cycles;
 };
 
 struct pio_i2s_data {
@@ -693,12 +696,17 @@ void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	// uint dma_channel = data->tx.dma_channel;
 	PIO pio = pio_rpi_pico_get_pio(config->piodev);
 
+	timing_t start_time, end_time, a_time, b_time, c_time;
+	start_time = timing_counter_get();
+
 	int retval;
 
 	struct stream *stream = &data->tx;
 
 	k_mem_slab_free(stream->cfg.mem_slab, stream->mem_block);
 	stream->mem_block = NULL;
+
+	a_time = timing_counter_get();
 
 	if (status < 0) {
 		LOG_ERR("Something went wrong with DMA. status=%d", status);
@@ -711,8 +719,15 @@ void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	if(stream->state == I2S_STATE_STOPPING && (stream->tx_stop_without_draining ||
 	   queue_is_empty(stream->msgq))) {
 		stream->state = I2S_STATE_READY;
+		LOG_ERR("tx max: %llu = %llu + %llu + %llu + %llu", timing_cycles_to_ns(stream->total_cycles_max),
+			                                  timing_cycles_to_ns(stream->a_cycles),
+			                                  timing_cycles_to_ns(stream->b_cycles),
+			                                  timing_cycles_to_ns(stream->c_cycles),
+			                                  timing_cycles_to_ns(stream->d_cycles));
 		return;
 	}
+
+	b_time = timing_counter_get();
 
 	struct queue_item item;
 	size_t mem_block_size;
@@ -726,12 +741,26 @@ void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	stream->mem_block = item.mem_block;
 	mem_block_size = item.size;
 
+	c_time = timing_counter_get();
+
 
 	retval = reload_dma(stream->dev_dma, stream->dma_channel,
 		&stream->dma_cfg,
 		stream->mem_block,
 		(void *)&pio->txf[data->tx.res.sm],
 		mem_block_size);
+
+	end_time = timing_counter_get();
+
+	uint64_t total_cycles = timing_cycles_get(&start_time, &end_time);
+	if(total_cycles > stream->total_cycles_max) {
+		stream->total_cycles_max = total_cycles;
+		stream->a_cycles = timing_cycles_get(&start_time, &a_time);
+		stream->b_cycles = timing_cycles_get(&a_time, &b_time);
+		stream->c_cycles = timing_cycles_get(&b_time, &c_time);
+		stream->d_cycles = timing_cycles_get(&c_time, &end_time);
+	}
+
 
 	if (retval < 0) {
 		LOG_ERR("Failed to start TX DMA transfer: %d", retval);
@@ -747,6 +776,9 @@ void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	struct pio_i2s_data *dev_data = dev->data;
 	// uint dma_channel = dev_data->rx.dma_channel;
 	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
+
+	timing_t start_time, end_time, a_time, b_time;
+	start_time = timing_counter_get();
 
 	int retval;
 
@@ -772,11 +804,15 @@ void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 		return;
 	}
 
+
 	stream->mem_block = NULL;
 
 	if(stream->state == I2S_STATE_STOPPING && dev_data->tx.state != I2S_STATE_STOPPING) {
 		stream->state = I2S_STATE_READY;
-
+		LOG_ERR("rx max: %llu = %llu + %llu + %llu", timing_cycles_to_ns(stream->total_cycles_max),
+			                                  timing_cycles_to_ns(stream->a_cycles),
+			                                  timing_cycles_to_ns(stream->b_cycles),
+			                                  timing_cycles_to_ns(stream->c_cycles));
 		return;
 	}
 
@@ -787,6 +823,7 @@ void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 		LOG_ERR("RX callback failed to allocate block");
 		return;
 	}
+
 
 	retval = reload_dma(stream->dev_dma, stream->dma_channel,
 			&stream->dma_cfg,
@@ -799,6 +836,17 @@ void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 		stream->state = I2S_STATE_ERROR;
 		return;
 	}
+
+	end_time = timing_counter_get();
+
+	uint64_t total_cycles = timing_cycles_get(&start_time, &end_time);
+	if(total_cycles > stream->total_cycles_max) {
+		stream->total_cycles_max = total_cycles;
+		stream->a_cycles = timing_cycles_get(&start_time, &a_time);
+		stream->b_cycles = timing_cycles_get(&a_time, &b_time);
+		stream->c_cycles = timing_cycles_get(&b_time, &end_time);
+	}
+
 
 	return;
 }
