@@ -11,19 +11,20 @@
  *
  * Required jumpers:
  *
- *   GP12 (node1 tx_data) <---> GP8 (node0 rx_data)
- *   GP11 (node1 clks)    <---> GP9 (node0 clks)
- *   GP13 (node1 ws)      <---> GP7 (node0 ws)
+ *   GP13 (node1 tx_data) <---> GP7 (node0 rx_data)
+ *   GP11 (node1 clks)    <---> GP8 (node0 clks)
+ *   GP12 (node1 ws)      <---> GP9 (node0 ws)
  *
- * Pin-assignment constraint (driver, not arbitrary): the rx_target program does
- * `in pins, 1` at in_base+0 and `wait n pin, 1` at in_base+1, with in_base set
- * from rx_data (i2s_rpi_pico_pio.c:444-445). So clks must be rx_data + 1, and
- * the driver asserts it at build time for every instance whose "rx" DMA channel
- * is named -- hence 8/9 on pio0 and 10/11 on pio1. That assert is why pio1's
- * rx_data is repointed below even though this test never receives on pio1: the
- * base overlay parks rx_data on tx_data's pin for its single-device internal
- * loopback, which is nowhere near the clks pin used here. The TX side has no
- * such adjacency requirement.
+ * Pin-assignment constraint (driver, not arbitrary): the single target program
+ * shared by both directions does `in pins, 1` at in_base+0, `wait n pin, 1` at
+ * in_base+1 and `wait n pin, 2` at in_base+2, so rx_data / clks / ws have to be
+ * three consecutive pins in that order -- hence 7/8/9 on pio0 and 10/11/12 on
+ * pio1. The driver asserts clks + 1 == ws for every instance and rx_data ==
+ * clks - 1 for every instance whose "rx" DMA channel is named. Those asserts
+ * are why pio1's rx_data is repointed below even though this test never
+ * receives on pio1: the base overlay parks rx_data on tx_data's pin for its
+ * single-device internal loopback, which is nowhere near the clks pin used
+ * here. The TX side has no such adjacency requirement.
  *
  * This overlay is layered on top of boards/rpi_pico2_rp2350a_m33.overlay, which
  * twister applies automatically for this board target. It repoints the existing
@@ -52,11 +53,11 @@
 	pinmux = <PIO1_P11>;
 };
 
-&tx_data {
+&ws {
 	pinmux = <PIO1_P12>;
 };
 
-&ws {
+&tx_data {
 	pinmux = <PIO1_P13>;
 };
 
@@ -67,16 +68,15 @@
 			pinmux = <PIO0_P6>;
 		};
 
-		pio0_ws: ws {
+		pio0_rx_data: rx_data {
 			pinmux = <PIO0_P7>;
 			input-enable;
 		};
-
-		pio0_rx_data: rx_data {
+		pio0_clks: clks {
 			pinmux = <PIO0_P8>;
 			input-enable;
 		};
-		pio0_clks: clks {
+		pio0_ws: ws {
 			pinmux = <PIO0_P9>;
 			input-enable;
 		};
