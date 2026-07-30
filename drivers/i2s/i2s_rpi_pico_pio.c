@@ -111,7 +111,7 @@ static int i2s_rpi_pico_write(const struct device *dev, void *mem_block, size_t 
 	struct pio_i2s_data *data = dev->data;
 	const struct stream *stream = &data->tx;
 	enum i2s_state state = stream->state;
-	int err = 0;
+	int retval = 0;
 
 	if (!stream_is_present(stream)) {
 		LOG_DBG("TX not enabled");
@@ -130,11 +130,10 @@ static int i2s_rpi_pico_write(const struct device *dev, void *mem_block, size_t 
 
 	struct queue_item item = {.mem_block = mem_block, .size = size};
 
-	err = k_msgq_put(stream->msgq, &item,
-			 K_MSEC(stream->cfg.timeout));
-	if (err < 0) {
+	retval = k_msgq_put(stream->msgq, &item, SYS_TIMEOUT_MS(stream->cfg.timeout));
+	if (retval < 0) {
 		LOG_ERR("TX queue full");
-		return err;
+		return retval;
 	}
 
     return 0;
@@ -158,7 +157,10 @@ static int i2s_rpi_pico_read(const struct device *dev, void **mem_block, size_t 
 	}
 
 	struct queue_item item;
-	int retval = k_msgq_get(stream->msgq, &item, (state == I2S_STATE_ERROR) ? K_NO_WAIT : K_MSEC(stream->cfg.timeout));
+	int retval = k_msgq_get(stream->msgq, &item,
+				(state == I2S_STATE_ERROR)
+					? K_NO_WAIT
+					: SYS_TIMEOUT_MS(stream->cfg.timeout));
 
 	if (retval < 0) {
 		if (retval == -ENOMSG) {
