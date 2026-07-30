@@ -21,10 +21,6 @@
 //       And check that the state machines are correctly deallocated and stuff like that...
 // TODO: write test for the sampling frequency check works
 // TODO: check for code smell involving functions with only one call site.
-// TODO: claude claims: RX doesn't stop when told, if TX is mid-drain. dma_rx_callback gates its stop path on
-//       dev_data->tx.state != I2S_STATE_STOPPING (i2s_rpi_pico_pio.c:805). After TX DRAIN + RX STOP, RX
-//       keeps allocating and capturing until the TX drain completes. With a slab sized to the test's
-//       exact needs, that's what exhausted it. - WARNINGS?!?!
 
 #include "zephyr/sys/__assert.h"
 #include <stdint.h>
@@ -36,7 +32,6 @@
 #include <hardware/pio.h>
 #include <zephyr/drivers/dma.h>
 #include <zephyr/logging/log.h>
-#include <zephyr/timing/timing.h>
 #include <hardware/clocks.h>
 #include <math.h>
 #if defined(CONFIG_SOC_SERIES_RP2040)
@@ -87,8 +82,6 @@ struct stream {
 	const uint32_t data_pin;
 
 	struct pio_sm_res res;
-	// DEBUG STUFF
-	uint64_t total_cycles_max, a_cycles, b_cycles, c_cycles, d_cycles;
 };
 
 struct pio_i2s_data {
@@ -696,17 +689,12 @@ void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	// uint dma_channel = data->tx.dma_channel;
 	PIO pio = pio_rpi_pico_get_pio(config->piodev);
 
-	timing_t start_time, end_time, a_time, b_time, c_time;
-	start_time = timing_counter_get();
-
 	int retval;
 
 	struct stream *stream = &data->tx;
 
-	k_mem_slab_free(stream->cfg.mem_slab, stream->mem_block);
+	void *temp_mem_block = stream->mem_block;
 	stream->mem_block = NULL;
-
-	a_time = timing_counter_get();
 
 	if (status < 0) {
 		LOG_ERR("Something went wrong with DMA. status=%d", status);
@@ -719,15 +707,8 @@ void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	if(stream->state == I2S_STATE_STOPPING && (stream->tx_stop_without_draining ||
 	   queue_is_empty(stream->msgq))) {
 		stream->state = I2S_STATE_READY;
-		LOG_ERR("tx max: %llu = %llu + %llu + %llu + %llu", timing_cycles_to_ns(stream->total_cycles_max),
-			                                  timing_cycles_to_ns(stream->a_cycles),
-			                                  timing_cycles_to_ns(stream->b_cycles),
-			                                  timing_cycles_to_ns(stream->c_cycles),
-			                                  timing_cycles_to_ns(stream->d_cycles));
-		return;
+		goto free_item;
 	}
-
-	b_time = timing_counter_get();
 
 	struct queue_item item;
 	size_t mem_block_size;
@@ -735,13 +716,11 @@ void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	if (ret < 0) {
 		LOG_ERR("TX buffer underrun.");
 		stream->state = I2S_STATE_ERROR;
-		return;
+		goto free_item;
 	}
 
 	stream->mem_block = item.mem_block;
 	mem_block_size = item.size;
-
-	c_time = timing_counter_get();
 
 
 	retval = reload_dma(stream->dev_dma, stream->dma_channel,
@@ -750,23 +729,15 @@ void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 		(void *)&pio->txf[data->tx.res.sm],
 		mem_block_size);
 
-	end_time = timing_counter_get();
-
-	uint64_t total_cycles = timing_cycles_get(&start_time, &end_time);
-	if(total_cycles > stream->total_cycles_max) {
-		stream->total_cycles_max = total_cycles;
-		stream->a_cycles = timing_cycles_get(&start_time, &a_time);
-		stream->b_cycles = timing_cycles_get(&a_time, &b_time);
-		stream->c_cycles = timing_cycles_get(&b_time, &c_time);
-		stream->d_cycles = timing_cycles_get(&c_time, &end_time);
-	}
-
-
 	if (retval < 0) {
 		LOG_ERR("Failed to start TX DMA transfer: %d", retval);
 		stream->state = I2S_STATE_ERROR;
-		return;
+		goto free_item;
 	}
+
+free_item:
+	k_mem_slab_free(stream->cfg.mem_slab, temp_mem_block);
+
 }
 
 void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
@@ -776,9 +747,6 @@ void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	struct pio_i2s_data *dev_data = dev->data;
 	// uint dma_channel = dev_data->rx.dma_channel;
 	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
-
-	timing_t start_time, end_time, a_time, b_time;
-	start_time = timing_counter_get();
 
 	int retval;
 
@@ -795,25 +763,11 @@ void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	}
 
 	struct queue_item item = {.mem_block = stream->mem_block, .size = stream->cfg.block_size};
-
-	retval = k_msgq_put(stream->msgq, &item, K_NO_WAIT);
-
-	if (retval < 0) {
-		LOG_ERR("RX overrun");
-		stream->state = I2S_STATE_ERROR;
-		return;
-	}
-
-
 	stream->mem_block = NULL;
 
-	if(stream->state == I2S_STATE_STOPPING && dev_data->tx.state != I2S_STATE_STOPPING) {
+	if (stream->state == I2S_STATE_STOPPING) {
 		stream->state = I2S_STATE_READY;
-		LOG_ERR("rx max: %llu = %llu + %llu + %llu", timing_cycles_to_ns(stream->total_cycles_max),
-			                                  timing_cycles_to_ns(stream->a_cycles),
-			                                  timing_cycles_to_ns(stream->b_cycles),
-			                                  timing_cycles_to_ns(stream->c_cycles));
-		return;
+		goto put_item;
 	}
 
 	retval = k_mem_slab_alloc(stream->cfg.mem_slab, &stream->mem_block,
@@ -821,9 +775,8 @@ void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	if (retval < 0) {
 		stream->state = I2S_STATE_ERROR;
 		LOG_ERR("RX callback failed to allocate block");
-		return;
+		goto put_item;
 	}
-
 
 	retval = reload_dma(stream->dev_dma, stream->dma_channel,
 			&stream->dma_cfg,
@@ -834,21 +787,17 @@ void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	if (retval < 0) {
 		LOG_ERR("Failed to start RX DMA transfer: %d", retval);
 		stream->state = I2S_STATE_ERROR;
+		goto put_item;
+	}
+
+put_item:
+	retval = k_msgq_put(stream->msgq, &item, K_NO_WAIT);
+
+	if (retval < 0) {
+		LOG_ERR("RX overrun");
+		stream->state = I2S_STATE_ERROR;
 		return;
 	}
-
-	end_time = timing_counter_get();
-
-	uint64_t total_cycles = timing_cycles_get(&start_time, &end_time);
-	if(total_cycles > stream->total_cycles_max) {
-		stream->total_cycles_max = total_cycles;
-		stream->a_cycles = timing_cycles_get(&start_time, &a_time);
-		stream->b_cycles = timing_cycles_get(&a_time, &b_time);
-		stream->c_cycles = timing_cycles_get(&b_time, &end_time);
-	}
-
-
-	return;
 }
 
 static int pio_i2s_init(const struct device *dev)
@@ -1138,7 +1087,7 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 			.dest_data_size = 4,                                                       \
 			.source_burst_length = 1,                                                  \
 			.dest_burst_length = 1,                                                    \
-			.channel_priority = 1, /* TODO: hardcoded */                               \
+			.channel_priority = 2, /* TODO: hardcoded */                               \
 			.dma_callback = dma_rx_callback                                            \
 		},                                                                                 \
 		.res = {.sm = (size_t)-1, .prog = NULL},                                           \
