@@ -186,6 +186,9 @@ RPI_PICO_PIO_DEFINE_PROGRAM(clks, 0, 3,
 		//     .wrap
 );
 
+static const uint32_t clks_cycles_factor = 2u; /* 2 PIO cycles per BCLK period */
+static const uint32_t clks_entry_point = 0;
+
 RPI_PICO_PIO_DEFINE_PROGRAM(target, 4, 12,
 	0x20a2, //  0: wait   1 pin, 2
 	0x2022, //  1: wait   0 pin, 2
@@ -206,12 +209,6 @@ RPI_PICO_PIO_DEFINE_PROGRAM(target, 4, 12,
 	0x0005, // 14: jmp    5
 );
 
-static const uint32_t clks_cycles_factor = 2u; /* k=2: 2 PIO cycles per BCLK period */
-static const uint32_t clks_entry_point = 0;
-
-/* Load `prog` into instruction memory, or take another reference to it if it is
- * already loaded. All users share `res->offset`.
- */
 static int prog_load(const struct device *piodev, struct pio_prog *res, const pio_program_t *prog)
 {
 	PIO pio = pio_rpi_pico_get_pio(piodev);
@@ -248,9 +245,6 @@ static void prog_unload(const struct device *piodev, struct pio_prog *res)
 	res->prog = NULL;
 }
 
-/* Claim a state machine to run `prog`. The program is loaded on demand; several
- * state machines may end up sharing the same copy of it.
- */
 static int sm_claim(const struct device *piodev, size_t *sm, struct pio_prog *prog_res,
 		    const pio_program_t *prog)
 {
@@ -296,13 +290,7 @@ static void sm_release(const struct device *piodev, size_t *sm, struct pio_prog 
 	prog_unload(piodev, prog_res);
 }
 
-/*
- * Atomically claim 2/3 state machines.
- * TODO: Think about a different name.
- */
-
-//TODO pretty sure this func can now be cleaned up
-static int sm_claim_dir(const struct device *dev, enum i2s_dir dir, bool need_clk_sm)
+static int sm_atomic_set_stream_and_clk(const struct device *dev, enum i2s_dir dir, bool need_clk_sm)
 {
 	const struct pio_i2s_config *dev_config = dev->config;
 	struct pio_i2s_data *dev_data = dev->data;
@@ -623,7 +611,7 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 	/* --- configure the stream --- */
 
 
-	retval = sm_claim_dir(dev, dir, is_controller);
+	retval = sm_atomic_set_stream_and_clk(dev, dir, is_controller);
 	if (retval < 0) {
 		return retval;
 	}
