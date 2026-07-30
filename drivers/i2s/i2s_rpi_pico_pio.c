@@ -21,6 +21,7 @@
 //       And check that the state machines are correctly deallocated and stuff like that...
 // TODO: write test for the sampling frequency check works
 // TODO: check for code smell involving functions with only one call site.
+// TODO: check all the functions are static.
 
 #include "zephyr/sys/__assert.h"
 #include <stdint.h>
@@ -45,10 +46,24 @@
 #define LOG_LEVEL CONFIG_I2S_LOG_LEVEL
 LOG_MODULE_REGISTER(i2s_pico_pio);
 
-static bool queue_is_empty(struct k_msgq *q)
-{
-	return (k_msgq_num_used_get(q) == 0) ? true : false;
-}
+/*
+ * Each direction is optional and is enabled by naming its DMA channel in
+ * "dma-names" ("tx" / "rx"). A direction with no DMA channel is simply unused,
+ * whatever pinctrl groups the node happens to declare; a direction that does
+ * name one must also declare its data pins, which PIO_I2S_INIT asserts. The
+ * "clks" and "ws" groups are always required.
+ *
+ * PIO_I2S_IS_DIR_EN(dir) is true when any status-okay instance enables that
+ * direction. It gates the DMA callbacks, which are otherwise unreferenced:
+ * the only thing naming them is the per-instance stream initializer, which is
+ * omitted in exactly the same cases.
+ */
+#define PIO_I2S_NUM_INST_OK DT_NUM_INST_STATUS_OKAY(raspberrypi_pico_i2s_pio)
+
+#define PIO_I2S_IS_DIR_INST_EN(idx, dir) DT_INST_DMAS_HAS_NAME(idx, dir)
+
+#define PIO_I2S_IS_DIR_EN(dir)                                                                     \
+	(LISTIFY(PIO_I2S_NUM_INST_OK, PIO_I2S_IS_DIR_INST_EN, (||), dir))
 
 struct queue_item {
 	void *mem_block;
@@ -93,6 +108,11 @@ struct pio_i2s_data {
     struct k_spinlock lock;
 };
 
+static bool stream_is_present(const struct stream *stream)
+{
+	return stream->dev_dma != NULL;
+}
+
 static int i2s_rpi_pico_write(const struct device *dev, void *mem_block, size_t size)
 {
 	// const struct pio_i2s_config *config = dev->config;
@@ -100,6 +120,11 @@ static int i2s_rpi_pico_write(const struct device *dev, void *mem_block, size_t 
 	const struct stream *stream = &data->tx;
 	enum i2s_state state = stream->state;
 	int err = 0;
+
+	if (!stream_is_present(stream)) {
+		LOG_DBG("TX not enabled");
+		return -EIO;
+	}
 
 	if (state != I2S_STATE_RUNNING && state != I2S_STATE_READY) {
 		LOG_DBG("Invalid state: %d", (int)state);
@@ -129,6 +154,11 @@ static int i2s_rpi_pico_read(const struct device *dev, void **mem_block, size_t 
 	struct pio_i2s_data *dev_data = dev->data;
 	const struct stream *stream = &dev_data->rx;
 	enum i2s_state state = stream->state;
+
+	if (!stream_is_present(stream)) {
+		LOG_DBG("RX not enabled");
+		return -EIO;
+	}
 
 	if (state == I2S_STATE_NOT_READY) {
 		LOG_DBG("Invalid state: %d", (int)state);
@@ -419,7 +449,11 @@ static void pio_i2s_setup_stream(const struct device *dev, struct stream *stream
 		sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
 		pio_sm_init(pio, res->sm, res->offset, &c);
 		pio_sm_set_clkdiv_int_frac(pio, res->sm, 1, 0);
-		if (dev_data->tx.data_pin != dev_data->rx.data_pin) {
+
+		bool loopback = stream_is_present(&dev_data->tx) &&
+				dev_data->tx.data_pin == dev_data->rx.data_pin;
+
+		if (!loopback) {
 			/* rx_data stays an input; in loopback it is the TX out pin
 			 * and driven by the TX follower instead. */
 			pio_sm_set_pindirs_with_mask(pio, res->sm, 0, 1u << stream->data_pin);
@@ -481,6 +515,11 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 
 	struct stream *stream = dir == I2S_DIR_RX ? &dev_data->rx : &dev_data->tx;
 	struct stream *other_stream = dir == I2S_DIR_RX ? &dev_data->tx : &dev_data->rx;
+
+	if (!stream_is_present(stream)) {
+		LOG_DBG("%s not enabled", dir == I2S_DIR_RX ? "RX" : "TX");
+		return -EINVAL;
+	}
 
 	bool other_is_controller = other_stream->state != I2S_STATE_NOT_READY &&
 				!(other_stream->cfg.options &
@@ -681,7 +720,8 @@ static int start_dma(const struct device *dev_dma, uint32_t channel,
 	return ret;
 }
 
-void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
+#if PIO_I2S_IS_DIR_EN(tx)
+static void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 				      int status) {
 	const struct device *dev = (const struct device *)arg;
 	const struct pio_i2s_config *config = dev->config;
@@ -705,7 +745,7 @@ void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 	// I2S_TRIGGER_STOP
 	// I2S_TRIGGER_DRAIN
 	if(stream->state == I2S_STATE_STOPPING && (stream->tx_stop_without_draining ||
-	   queue_is_empty(stream->msgq))) {
+	   k_msgq_num_used_get(stream->msgq) == 0)) {
 		stream->state = I2S_STATE_READY;
 		goto free_item;
 	}
@@ -739,8 +779,10 @@ free_item:
 	k_mem_slab_free(stream->cfg.mem_slab, temp_mem_block);
 
 }
+#endif /* PIO_I2S_IS_DIR_EN(tx) */
 
-void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
+#if PIO_I2S_IS_DIR_EN(rx)
+static void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 				      int status) {
 	const struct device *dev = (const struct device *)arg;
 	const struct pio_i2s_config *dev_config = dev->config;
@@ -799,6 +841,7 @@ put_item:
 		return;
 	}
 }
+#endif /* PIO_I2S_IS_DIR_EN(rx) */
 
 static int pio_i2s_init(const struct device *dev)
 {
@@ -814,7 +857,7 @@ static int pio_i2s_init(const struct device *dev)
 	return 0;
 }
 
-int i2s_start_rx_stream_dma(const struct device *dev, struct stream *stream) {
+static int i2s_start_rx_stream_dma(const struct device *dev, struct stream *stream) {
 	const struct pio_i2s_config *config = dev->config;
 	// struct pio_i2s_data *data = dev->data;
 	PIO pio = pio_rpi_pico_get_pio(config->piodev);
@@ -855,7 +898,7 @@ int i2s_start_rx_stream_dma(const struct device *dev, struct stream *stream) {
 
 }
 
-int i2s_start_tx_stream_dma(const struct device *dev, struct stream *stream) {
+static int i2s_start_tx_stream_dma(const struct device *dev, struct stream *stream) {
 	const struct pio_i2s_config *config = dev->config;
 	// struct pio_i2s_data *data = dev->data;
 	PIO pio = pio_rpi_pico_get_pio(config->piodev);
@@ -921,6 +964,12 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 	}
 
 	struct stream *stream = dir == I2S_DIR_RX ? &dev_data->rx : &dev_data->tx;
+
+	if (!stream_is_present(stream)) {
+		LOG_DBG("%s not enabled", dir == I2S_DIR_RX ? "RX" : "TX");
+		return -EINVAL;
+	}
+
 	LOG_INF("i2s_rpi_pico_trigger dir=%d cmd=%d", dir, cmd);
 
 	key = k_spin_lock(&dev_data->lock);
@@ -1031,36 +1080,51 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 	.trigger = i2s_rpi_pico_trigger,
 };
 
-/*  TODO:
- *  BCLK (clks group), WS (ws group) and the data pins are independent in the overlay.
- *  The one hardware constraint that remains is rx_data == BCLK - 1, because rx_target
- *  reads data at in_base+0 and BCLK at in_base+1 off the same input base. This asserts
- *  the overlay honours the adjacency rather than failing silently at runtime.
- *  Add a build assert such as possibly this:
- *  BUILD_ASSERT(PIO_I2S_RX_DATA_PIN(idx) == PIO_I2S_BCLK_PIN(idx) - 1,                  \
-         "I2S rx_data pin must be bit-clock pin - 1 "                                \
-         "(rx_target reads data at in_base+0 and BCLK at in_base+1); fix the overlay");\
- */
+#define PIO_I2S_BCLK_PIN(idx)    DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, clks, 0)
+#define PIO_I2S_WS_PIN(idx)      DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, ws, 0)
+#define PIO_I2S_TX_DATA_PIN(idx) DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, tx_data, 0)
+#define PIO_I2S_RX_DATA_PIN(idx) DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, rx_data, 0)
+
+#define PIO_I2S_HAS_GROUP(idx, group)                                                              \
+	DT_NODE_EXISTS(DT_CHILD(DT_PINCTRL_BY_NAME(DT_DRV_INST(idx), default, 0), group))
+
+#define PIO_I2S_HAS_TX(idx) PIO_I2S_IS_DIR_INST_EN(idx, tx)
+#define PIO_I2S_HAS_RX(idx) PIO_I2S_IS_DIR_INST_EN(idx, rx)
+
 #define PIO_I2S_INIT(idx)                                                                          \
+	BUILD_ASSERT(PIO_I2S_HAS_TX(idx) || PIO_I2S_HAS_RX(idx),                                   \
+		     "I2S node needs at least one of the \"tx\" / \"rx\" dma-names.");             \
+	BUILD_ASSERT(!PIO_I2S_HAS_TX(idx) || PIO_I2S_HAS_GROUP(idx, tx_data),                      \
+		     "I2S tx_data pins not defined.");                                             \
+	BUILD_ASSERT(!PIO_I2S_HAS_RX(idx) || PIO_I2S_HAS_GROUP(idx, rx_data),                      \
+		     "I2S rx_data pins not defined.");                                             \
+	IF_ENABLED(PIO_I2S_HAS_RX(idx),                                                            \
+		(BUILD_ASSERT(PIO_I2S_RX_DATA_PIN(idx) == PIO_I2S_BCLK_PIN(idx) - 1,               \
+			      "I2S rx_data pin must be equal to bit-clock pin - 1 "                \
+			      "due to limitations in the PIO program.");))                         \
 	PINCTRL_DT_INST_DEFINE(idx);                                                               \
 	static const struct pio_i2s_config pio_i2s##idx##_config = {                               \
 		.piodev = DEVICE_DT_GET(DT_INST_PARENT(idx)),                                      \
 		.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(idx),                                       \
-		.clock_pin = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, clks, 0),           \
-		.ws_pin = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, ws, 0)                 \
+		.clock_pin = PIO_I2S_BCLK_PIN(idx),                                                \
+		.ws_pin = PIO_I2S_WS_PIN(idx)                                                      \
 	};                                                                                         \
-	K_MSGQ_DEFINE(tx_##idx##_queue, sizeof(struct queue_item),                                 \
-	        CONFIG_I2S_RPI_PICO_PIO_TX_QUEUE_SIZE, 1);                                         \
-	K_MSGQ_DEFINE(rx_##idx##_queue, sizeof(struct queue_item),	                           \
-	        CONFIG_I2S_RPI_PICO_PIO_RX_QUEUE_SIZE, 1);                                         \
+	IF_ENABLED(PIO_I2S_HAS_TX(idx),                                                            \
+		(K_MSGQ_DEFINE(tx_##idx##_queue, sizeof(struct queue_item),                        \
+			       CONFIG_I2S_RPI_PICO_PIO_TX_QUEUE_SIZE, 1);))                        \
+	IF_ENABLED(PIO_I2S_HAS_RX(idx),                                                            \
+		(K_MSGQ_DEFINE(rx_##idx##_queue, sizeof(struct queue_item),                        \
+			       CONFIG_I2S_RPI_PICO_PIO_RX_QUEUE_SIZE, 1);))                        \
 	static struct pio_i2s_data pio_i2s##idx##_data = {                                         \
         .tx = {                                                                                    \
-		.msgq = &tx_##idx##_queue,                                                         \
+		.msgq = COND_CODE_1(PIO_I2S_HAS_TX(idx), (&tx_##idx##_queue), (NULL)),             \
 		.state = I2S_STATE_NOT_READY,                                                      \
 		.tx_stop_without_draining = false,                                                 \
-		.dev_dma = DEVICE_DT_GET(DT_INST_DMAS_CTLR_BY_NAME(idx, tx)),                      \
-		.dma_channel = DT_INST_DMAS_CELL_BY_NAME(idx, tx, channel),                        \
-		.data_pin = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, tx_data, 0),         \
+		.dev_dma = UTIL_AND(DT_INST_DMAS_HAS_NAME(idx, tx),                                \
+				    DEVICE_DT_GET(DT_INST_DMAS_CTLR_BY_NAME(idx, tx))),            \
+		.dma_channel = UTIL_AND(DT_INST_DMAS_HAS_NAME(idx, tx),                            \
+					DT_INST_DMAS_CELL_BY_NAME(idx, tx, channel)),              \
+		.data_pin = COND_CODE_1(PIO_I2S_HAS_TX(idx), (PIO_I2S_TX_DATA_PIN(idx)), (0)),     \
 		.dma_cfg = {                                                                       \
 			.block_count = 1,                                                          \
 			.channel_direction = MEMORY_TO_PERIPHERAL,                                 \
@@ -1069,17 +1133,19 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 			.source_burst_length = 1,                                                  \
 			.dest_burst_length = 1,                                                    \
 			.channel_priority = 1, /* TODO: hardcoded */                               \
-			.dma_callback = dma_tx_callback                                            \
+			.dma_callback = COND_CODE_1(PIO_I2S_HAS_TX(idx), (dma_tx_callback), (NULL))\
 		},                                                                                 \
 		.res = {.sm = (size_t)-1, .prog = NULL},                                           \
         },                                                                                         \
         .rx = {                                                                                    \
-		.msgq = &rx_##idx##_queue,                                                         \
+		.msgq = COND_CODE_1(PIO_I2S_HAS_RX(idx), (&rx_##idx##_queue), (NULL)),             \
 		.state = I2S_STATE_NOT_READY,                                                      \
 		.tx_stop_without_draining = false,                                                 \
-		.dev_dma = DEVICE_DT_GET(DT_INST_DMAS_CTLR_BY_NAME(idx, rx)),                      \
-		.dma_channel = DT_INST_DMAS_CELL_BY_NAME(idx, rx, channel),                        \
-		.data_pin = DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, rx_data, 0),         \
+		.dev_dma = UTIL_AND(DT_INST_DMAS_HAS_NAME(idx, rx),                                \
+				    DEVICE_DT_GET(DT_INST_DMAS_CTLR_BY_NAME(idx, rx))),            \
+		.dma_channel = UTIL_AND(DT_INST_DMAS_HAS_NAME(idx, rx),                            \
+					DT_INST_DMAS_CELL_BY_NAME(idx, rx, channel)),              \
+		.data_pin = COND_CODE_1(PIO_I2S_HAS_RX(idx), (PIO_I2S_RX_DATA_PIN(idx)), (0)),     \
 		.dma_cfg = {                                                                       \
 			.block_count = 1,                                                          \
 			.channel_direction = PERIPHERAL_TO_MEMORY,                                 \
@@ -1088,7 +1154,7 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 			.source_burst_length = 1,                                                  \
 			.dest_burst_length = 1,                                                    \
 			.channel_priority = 2, /* TODO: hardcoded */                               \
-			.dma_callback = dma_rx_callback                                            \
+			.dma_callback = COND_CODE_1(PIO_I2S_HAS_RX(idx), (dma_rx_callback), (NULL))\
 		},                                                                                 \
 		.res = {.sm = (size_t)-1, .prog = NULL},                                           \
         },                                                                                         \
