@@ -46,22 +46,8 @@
 #define LOG_LEVEL CONFIG_I2S_LOG_LEVEL
 LOG_MODULE_REGISTER(i2s_pico_pio);
 
-/*
- * Each direction is optional and is enabled by naming its DMA channel in
- * "dma-names" ("tx" / "rx"). A direction with no DMA channel is simply unused,
- * whatever pinctrl groups the node happens to declare; a direction that does
- * name one must also declare its data pins, which PIO_I2S_INIT asserts. The
- * "clks" and "ws" groups are always required.
- *
- * PIO_I2S_IS_DIR_EN(dir) is true when any status-okay instance enables that
- * direction. It gates the DMA callbacks, which are otherwise unreferenced:
- * the only thing naming them is the per-instance stream initializer, which is
- * omitted in exactly the same cases.
- */
 #define PIO_I2S_NUM_INST_OK DT_NUM_INST_STATUS_OKAY(raspberrypi_pico_i2s_pio)
-
 #define PIO_I2S_IS_DIR_INST_EN(idx, dir) DT_INST_DMAS_HAS_NAME(idx, dir)
-
 #define PIO_I2S_IS_DIR_EN(dir)                                                                     \
 	(LISTIFY(PIO_I2S_NUM_INST_OK, PIO_I2S_IS_DIR_INST_EN, (||), dir))
 
@@ -1128,11 +1114,9 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 		.dma_cfg = {                                                                       \
 			.block_count = 1,                                                          \
 			.channel_direction = MEMORY_TO_PERIPHERAL,                                 \
-			.source_data_size = 4,                              /*  TODO: dumb! */     \
-			.dest_data_size = 4,                                                       \
 			.source_burst_length = 1,                                                  \
 			.dest_burst_length = 1,                                                    \
-			.channel_priority = 1, /* TODO: hardcoded */                               \
+			.channel_priority = 1,                                                     \
 			.dma_callback = COND_CODE_1(PIO_I2S_HAS_TX(idx), (dma_tx_callback), (NULL))\
 		},                                                                                 \
 		.res = {.sm = (size_t)-1, .prog = NULL},                                           \
@@ -1149,11 +1133,9 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 		.dma_cfg = {                                                                       \
 			.block_count = 1,                                                          \
 			.channel_direction = PERIPHERAL_TO_MEMORY,                                 \
-			.source_data_size = 4,                                                     \
-			.dest_data_size = 4,                                                       \
 			.source_burst_length = 1,                                                  \
 			.dest_burst_length = 1,                                                    \
-			.channel_priority = 2, /* TODO: hardcoded */                               \
+			.channel_priority = 1,                                                     \
 			.dma_callback = COND_CODE_1(PIO_I2S_HAS_RX(idx), (dma_rx_callback), (NULL))\
 		},                                                                                 \
 		.res = {.sm = (size_t)-1, .prog = NULL},                                           \
