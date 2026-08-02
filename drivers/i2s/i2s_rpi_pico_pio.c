@@ -6,19 +6,9 @@
 
 /*
 	TOOO:
-	 - Check that all errors are handled properly
-		- check that i2s_config->timeout is always respected.
-	 - Respect all properties of config
-	 - RX stream functionality
-	 - Support all trigger commands
 	 - Change LOG statements to be more inline with the rest of zephyr
-	 - When there are multiple PIO programs written, make static KConfig options for
-	      enabling support for various PIO programs. Only the statically enabled ones
-	      can be used in the configure function.
 */
 
-// TODO: Write raspberry pi specific tests for failing to allocate multiple i2s periperals on the same pio and stuff like that.
-//       And check that the state machines are correctly deallocated and stuff like that...
 // TODO: write test for the sampling frequency check works
 // TODO: check for code smell involving functions with only one call site.
 // TODO: check all the functions are static.
@@ -1033,7 +1023,6 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 	return ret;
 }
 
-// TODO: Test this function
 static const struct i2s_config *i2s_rpi_pico_config_get(const struct device *dev,
 						     enum i2s_dir dir)
 {
