@@ -454,6 +454,8 @@ static void drop_stream(const struct device *dev, struct stream *stream) {
 
 	pio_sm_set_enabled(pio, stream->sm, false);
 
+	dma_stop(stream->dev_dma, stream->dma_channel);
+
 	struct queue_item item;
 	while (k_msgq_get(stream->msgq, &item, K_NO_WAIT) == 0) {
 		k_mem_slab_free(stream->cfg.mem_slab, item.mem_block);
@@ -463,6 +465,12 @@ static void drop_stream(const struct device *dev, struct stream *stream) {
 		stream->mem_block = NULL;
 	}
 
+	struct dma_status stat;
+	if (!WAIT_FOR(dma_get_status(stream->dev_dma, stream->dma_channel, &stat) == 0 && !stat.busy,
+              1000, k_busy_wait(1))) {
+		LOG_WRN("DMA ch%u did not become idle after stop", stream->dma_channel);
+		return;
+	}
 }
 
 static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
@@ -978,8 +986,6 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 			break;
 		}
 
-		dma_stop(stream->dev_dma, stream->dma_channel);
-
 		drop_stream(dev, stream);
 		stream->state = I2S_STATE_READY;
 		break;
@@ -990,8 +996,6 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 			ret = -EIO;
 			break;
 		}
-
-		dma_stop(stream->dev_dma, stream->dma_channel);
 
 		drop_stream(dev, stream);
 		stream->state = I2S_STATE_READY;
