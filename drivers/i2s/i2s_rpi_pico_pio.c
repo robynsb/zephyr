@@ -417,7 +417,7 @@ static void pio_i2s_setup_stream(const struct device *dev, struct stream *stream
 		pio_sm_init(pio, sm, offset, &c);
 		pio_sm_set_clkdiv_int_frac(pio, sm, 1, 0);
 
-		bool loopback = dev_data->tx.state != I2S_STATE_NOT_READY &&
+		bool loopback = dev_data->tx.dev_dma != NULL &&
 				dev_data->tx.data_pin == dev_data->rx.data_pin;
 
 		if (!loopback) {
@@ -448,13 +448,24 @@ static void pio_i2s_clks_start(const struct device *dev)
 	pio_sm_set_enabled(pio, sm, true);
 }
 
-static void drop_stream(const struct device *dev, struct stream *stream) {
+static void drop_stream(const struct device *dev, struct stream *stream)
+{
 	const struct pio_i2s_config *dev_config = dev->config;
 	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
 
-	pio_sm_set_enabled(pio, stream->sm, false);
+	if (stream->sm == (size_t)-1) {
+		return;
+	}
 
 	dma_stop(stream->dev_dma, stream->dma_channel);
+
+	struct dma_status stat;
+	if (!WAIT_FOR(dma_get_status(stream->dev_dma, stream->dma_channel, &stat) == 0 && !stat.busy,
+              5, k_busy_wait(1))) {
+		LOG_WRN("DMA ch%u did not become idle after stop", stream->dma_channel);
+	}
+
+	pio_sm_set_enabled(pio, stream->sm, false);
 
 	struct queue_item item;
 	while (k_msgq_get(stream->msgq, &item, K_NO_WAIT) == 0) {
@@ -465,12 +476,6 @@ static void drop_stream(const struct device *dev, struct stream *stream) {
 		stream->mem_block = NULL;
 	}
 
-	struct dma_status stat;
-	if (!WAIT_FOR(dma_get_status(stream->dev_dma, stream->dma_channel, &stat) == 0 && !stat.busy,
-              1000, k_busy_wait(1))) {
-		LOG_WRN("DMA ch%u did not become idle after stop", stream->dma_channel);
-		return;
-	}
 }
 
 static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
@@ -511,13 +516,14 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 		sm_release(dev_config->piodev, &stream->sm, &dev_data->target_prog,
 			   dir == I2S_DIR_TX ? (1u << stream->data_pin) : 0);
 		memset(&stream->cfg, 0, sizeof(struct i2s_config));
-		stream->state = I2S_STATE_NOT_READY;
 
 		if (!other_is_controller) {
 			/* clks drives BCLK + WS (see pio_i2s_setup_clks). */
 			sm_release(dev_config->piodev, &dev_data->clks_sm, &dev_data->clks_prog,
 				   (1u << dev_config->clock_pin) | (1u << dev_config->ws_pin));
 		}
+
+		stream->state = I2S_STATE_NOT_READY;
 		return 0;
 	}
 
