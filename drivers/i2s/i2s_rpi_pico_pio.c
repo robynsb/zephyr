@@ -711,13 +711,10 @@ static void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t ch
 
 	struct stream *stream = &data->tx;
 
-	void *temp_mem_block = stream->mem_block;
-	stream->mem_block = NULL;
-
 	if (status < 0) {
 		LOG_ERR("Something went wrong with DMA. status=%d", status);
 		stream->state = I2S_STATE_ERROR;
-		goto cleanup;
+		return;
 	}
 
 	// I2S_TRIGGER_STOP
@@ -725,7 +722,9 @@ static void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t ch
 	if(stream->state == I2S_STATE_STOPPING && (stream->tx_stop_without_draining ||
 	   k_msgq_num_used_get(stream->msgq) == 0)) {
 		stream->state = I2S_STATE_READY;
-		goto cleanup;
+		k_mem_slab_free(stream->cfg.mem_slab, stream->mem_block);
+		stream->mem_block = NULL;
+		return;
 	}
 
 	struct queue_item item;
@@ -734,27 +733,24 @@ static void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t ch
 	if (ret < 0) {
 		LOG_ERR("TX buffer underrun.");
 		stream->state = I2S_STATE_ERROR;
-		goto cleanup;
+		return;
 	}
 
-	stream->mem_block = item.mem_block;
 	mem_block_size = item.size;
-
 
 	retval = reload_dma(stream->dev_dma, stream->dma_channel,
 		&stream->dma_cfg,
-		stream->mem_block,
+		item.mem_block,
 		(void *)&pio->txf[stream->sm],
 		mem_block_size);
 
 	if (retval < 0) {
 		LOG_ERR("Failed to start TX DMA transfer: %d", retval);
 		stream->state = I2S_STATE_ERROR;
-		goto cleanup;
 	}
 
-cleanup:
-	k_mem_slab_free(stream->cfg.mem_slab, temp_mem_block);
+	k_mem_slab_free(stream->cfg.mem_slab, stream->mem_block);
+	stream->mem_block = item.mem_block;
 
 }
 #endif /* PIO_I2S_IS_DIR_EN(tx) */
@@ -816,6 +812,7 @@ put_item:
 	if (retval < 0) {
 		LOG_ERR("RX overrun");
 		stream->state = I2S_STATE_ERROR;
+		k_mem_slab_free(stream->cfg.mem_slab, item.mem_block);
 		return;
 	}
 }
