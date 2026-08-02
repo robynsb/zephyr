@@ -717,7 +717,7 @@ static void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t ch
 	if (status < 0) {
 		LOG_ERR("Something went wrong with DMA. status=%d", status);
 		stream->state = I2S_STATE_ERROR;
-		return;
+		goto cleanup;
 	}
 
 	// I2S_TRIGGER_STOP
@@ -725,7 +725,7 @@ static void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t ch
 	if(stream->state == I2S_STATE_STOPPING && (stream->tx_stop_without_draining ||
 	   k_msgq_num_used_get(stream->msgq) == 0)) {
 		stream->state = I2S_STATE_READY;
-		goto free_item;
+		goto cleanup;
 	}
 
 	struct queue_item item;
@@ -734,7 +734,7 @@ static void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t ch
 	if (ret < 0) {
 		LOG_ERR("TX buffer underrun.");
 		stream->state = I2S_STATE_ERROR;
-		goto free_item;
+		goto cleanup;
 	}
 
 	stream->mem_block = item.mem_block;
@@ -750,10 +750,10 @@ static void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t ch
 	if (retval < 0) {
 		LOG_ERR("Failed to start TX DMA transfer: %d", retval);
 		stream->state = I2S_STATE_ERROR;
-		goto free_item;
+		goto cleanup;
 	}
 
-free_item:
+cleanup:
 	k_mem_slab_free(stream->cfg.mem_slab, temp_mem_block);
 
 }
