@@ -463,7 +463,12 @@ static void pio_i2s_clks_start(const struct device *dev)
 	pio_sm_set_enabled(pio, sm, true);
 }
 
-static void drop_stream(struct stream *stream) {
+static void drop_stream(const struct device *dev, struct stream *stream) {
+	const struct pio_i2s_config *dev_config = dev->config;
+	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
+
+	pio_sm_set_enabled(pio, stream->sm, false);
+
 	struct queue_item item;
 	while (k_msgq_get(stream->msgq, &item, K_NO_WAIT) == 0) {
 		k_mem_slab_free(stream->cfg.mem_slab, item.mem_block);
@@ -508,7 +513,7 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 	}
 
 	if (i2s_cfg->frame_clk_freq == 0U) {
-		drop_stream(stream);
+		drop_stream(dev, stream);
 
 		sm_release(dev_config->piodev, &stream->sm, &dev_data->target_prog,
 			   dir == I2S_DIR_TX ? (1u << stream->data_pin) : 0);
@@ -998,7 +1003,7 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 
 		dma_stop(stream->dev_dma, stream->dma_channel);
 
-		drop_stream(stream);
+		drop_stream(dev, stream);
 		stream->state = I2S_STATE_READY;
 		break;
 
@@ -1009,7 +1014,9 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 			break;
 		}
 
-		drop_stream(stream);
+		dma_stop(stream->dev_dma, stream->dma_channel);
+
+		drop_stream(dev, stream);
 		stream->state = I2S_STATE_READY;
 		break;
 
