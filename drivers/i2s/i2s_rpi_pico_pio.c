@@ -90,11 +90,6 @@ struct pio_i2s_data {
     struct k_spinlock lock;
 };
 
-static bool stream_is_present(const struct stream *stream)
-{
-	return stream->dev_dma != NULL;
-}
-
 static int i2s_rpi_pico_write(const struct device *dev, void *mem_block, size_t size)
 {
 	// const struct pio_i2s_config *config = dev->config;
@@ -102,11 +97,6 @@ static int i2s_rpi_pico_write(const struct device *dev, void *mem_block, size_t 
 	const struct stream *stream = &data->tx;
 	enum i2s_state state = stream->state;
 	int retval = 0;
-
-	if (!stream_is_present(stream)) {
-		LOG_DBG("TX not enabled");
-		return -EIO;
-	}
 
 	if (state != I2S_STATE_RUNNING && state != I2S_STATE_READY) {
 		LOG_DBG("Invalid state: %d", (int)state);
@@ -135,11 +125,6 @@ static int i2s_rpi_pico_read(const struct device *dev, void **mem_block, size_t 
 	struct pio_i2s_data *dev_data = dev->data;
 	const struct stream *stream = &dev_data->rx;
 	enum i2s_state state = stream->state;
-
-	if (!stream_is_present(stream)) {
-		LOG_DBG("RX not enabled");
-		return -EIO;
-	}
 
 	if (state == I2S_STATE_NOT_READY) {
 		LOG_DBG("Invalid state: %d", (int)state);
@@ -432,7 +417,7 @@ static void pio_i2s_setup_stream(const struct device *dev, struct stream *stream
 		pio_sm_init(pio, sm, offset, &c);
 		pio_sm_set_clkdiv_int_frac(pio, sm, 1, 0);
 
-		bool loopback = stream_is_present(&dev_data->tx) &&
+		bool loopback = dev_data->tx.state != I2S_STATE_NOT_READY &&
 				dev_data->tx.data_pin == dev_data->rx.data_pin;
 
 		if (!loopback) {
@@ -495,8 +480,8 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 	struct stream *stream = dir == I2S_DIR_RX ? &dev_data->rx : &dev_data->tx;
 	struct stream *other_stream = dir == I2S_DIR_RX ? &dev_data->tx : &dev_data->rx;
 
-	if (!stream_is_present(stream)) {
-		LOG_DBG("%s not enabled", dir == I2S_DIR_RX ? "RX" : "TX");
+	if (stream->dev_dma == NULL) {
+		LOG_ERR("%s not enabled", dir == I2S_DIR_RX ? "RX" : "TX");
 		return -EINVAL;
 	}
 
@@ -937,11 +922,6 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 	}
 
 	struct stream *stream = dir == I2S_DIR_RX ? &dev_data->rx : &dev_data->tx;
-
-	if (!stream_is_present(stream)) {
-		LOG_DBG("%s not enabled", dir == I2S_DIR_RX ? "RX" : "TX");
-		return -EINVAL;
-	}
 
 	LOG_INF("i2s_rpi_pico_trigger dir=%d cmd=%d", dir, cmd);
 
