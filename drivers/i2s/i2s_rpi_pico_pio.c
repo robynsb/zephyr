@@ -543,11 +543,12 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 		return -EINVAL;
 	}
 
-	if (!(16 <= i2s_cfg->word_size && i2s_cfg->word_size <= 32)) {
-		LOG_ERR("I2S word size (%d) is unsupported.", i2s_cfg->word_size);
+	if (i2s_cfg->word_size != 16 && i2s_cfg->word_size != 32) {
+		LOG_ERR("I2S word size (%d) is unsupported, must be 16 or 32.",
+			i2s_cfg->word_size);
 		return -EINVAL;
 	}
-	uint32_t channel_length = i2s_cfg->word_size > 16 ? 32 : 16;
+	uint32_t channel_length = i2s_cfg->word_size;
 
 	if (i2s_cfg->options & I2S_OPT_LOOPBACK) {
 		LOG_ERR("I2S loopback mode unsupported.");
