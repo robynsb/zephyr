@@ -642,21 +642,6 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 	return 0;
 }
 
-static int reload_dma(const struct device *dev_dma, uint32_t channel,
-		      struct dma_config *dcfg, void *src, void *dst,
-		      uint32_t blk_size)
-{
-	int ret;
-
-	ret = dma_reload(dev_dma, channel, (uint32_t)src, (uint32_t)dst, blk_size);
-	if (ret < 0) {
-		LOG_ERR("dma_reload failed with ret=%d", ret);
-		return ret;
-	}
-
-	return ret;
-}
-
 #if PIO_I2S_IS_DIR_EN(tx)
 static void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 				      int status) {
@@ -697,14 +682,13 @@ static void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t ch
 
 	mem_block_size = item.size;
 
-	retval = reload_dma(stream->dev_dma, stream->dma_channel,
-		&stream->dma_cfg,
-		item.mem_block,
-		(void *)&pio->txf[stream->sm],
+	retval = dma_reload(stream->dev_dma, stream->dma_channel,
+		(uint32_t)item.mem_block,
+		(uint32_t)&pio->txf[stream->sm],
 		mem_block_size);
 
 	if (retval < 0) {
-		LOG_ERR("Failed to start TX DMA transfer: %d", retval);
+		LOG_ERR("Failed to reload TX DMA transfer: %d", retval);
 		stream->state = I2S_STATE_ERROR;
 	}
 
@@ -753,14 +737,13 @@ static void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t ch
 		goto put_item;
 	}
 
-	retval = reload_dma(stream->dev_dma, stream->dma_channel,
-			&stream->dma_cfg,
-			(void *)&pio->rxf[stream->sm],
-			stream->mem_block,
+	retval = dma_reload(stream->dev_dma, stream->dma_channel,
+			(uint32_t)&pio->rxf[stream->sm],
+			(uint32_t)stream->mem_block,
 			stream->cfg.block_size);
 
 	if (retval < 0) {
-		LOG_ERR("Failed to start RX DMA transfer: %d", retval);
+		LOG_ERR("Failed to reload RX DMA transfer: %d", retval);
 		stream->state = I2S_STATE_ERROR;
 		goto put_item;
 	}
