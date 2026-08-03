@@ -826,13 +826,28 @@ put_item:
 static int pio_i2s_init(const struct device *dev)
 {
 	const struct pio_i2s_config *dev_config = dev->config;
-	// struct pio_i2s_data *dev_data = dev->data;
+	struct pio_i2s_data *dev_data = dev->data;
 	int retval;
+
+	if (!device_is_ready(dev_config->piodev)) {
+		LOG_ERR("%s: PIO device not ready", dev->name);
+		return -ENODEV;
+	}
+
+	if (dev_data->tx.dev_dma != NULL && !device_is_ready(dev_data->tx.dev_dma)) {
+		LOG_ERR("%s: TX DMA device not ready", dev->name);
+		return -ENODEV;
+	}
+
+	if (dev_data->rx.dev_dma != NULL && !device_is_ready(dev_data->rx.dev_dma)) {
+		LOG_ERR("%s: RX DMA device not ready", dev->name);
+		return -ENODEV;
+	}
 
 	retval = pinctrl_apply_state(dev_config->pcfg, PINCTRL_STATE_DEFAULT);
 	if (retval < 0) {
 		LOG_ERR("pinctrl_apply_state failed with ret = %d", retval);
-        	return retval;
+		return retval;
 	}
 	return 0;
 }
