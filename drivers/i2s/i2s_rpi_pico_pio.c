@@ -673,7 +673,7 @@ static void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t ch
 
 	struct queue_item item;
 	size_t mem_block_size;
-	int ret = k_msgq_get(stream->msgq, &item, SYS_TIMEOUT_MS(0));
+	int ret = k_msgq_get(stream->msgq, &item, K_NO_WAIT);
 	if (ret < 0) {
 		LOG_ERR("TX buffer underrun.");
 		stream->state = I2S_STATE_ERROR;
@@ -861,7 +861,7 @@ static int i2s_start_tx_stream_dma(const struct device *dev, struct stream *stre
 	size_t mem_block_size;
 	struct queue_item item;
 
-	int ret = k_msgq_get(stream->msgq, &item, SYS_TIMEOUT_MS(0));
+	int ret = k_msgq_get(stream->msgq, &item, K_NO_WAIT);
 
 
 	if (ret < 0) {
