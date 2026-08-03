@@ -653,12 +653,6 @@ static int reload_dma(const struct device *dev_dma, uint32_t channel,
 		return ret;
 	}
 
-	ret = dma_start(dev_dma, channel);
-	if (ret < 0) {
-		LOG_ERR("dma_start failed with ret=%d", ret);
-		return ret;
-	}
-
 	return ret;
 }
 
