@@ -329,7 +329,7 @@ static uint64_t calculate_divider_shift_8(uint64_t sample_freq, uint64_t channel
 	/* Number of channels is always 2 for I2S data format */
 	/* Only I2S supported at this time. */
 	const uint64_t num_channels = 2;
-	uint64_t system_clock_frequency = sys_clock_hw_cycles_per_sec();
+	uint64_t system_clock_frequency = clock_get_hz(clk_sys);
 	/* 8.8 fixed-point divider: (f_sys << 8) / (k * f_s * channel_length * num_channels) */
 	uint64_t divider = (system_clock_frequency << 8u) /
 		(clks_cycles_factor * sample_freq * channel_length * num_channels);
@@ -583,18 +583,25 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 			LOG_ERR("simultaneously configured controller streams have different frame_clk_freq (%d) (%d)", i2s_cfg->frame_clk_freq, other_stream->cfg.frame_clk_freq);
 			return -EINVAL;
 		}
+	}
 
-		uint64_t divider =
-			calculate_divider_shift_8(i2s_cfg->frame_clk_freq, channel_length) >> 8u;
-		// TODO: I guess that this is actually not strict enough.
-		if (divider == 0) {
-			LOG_ERR("sampling frequency is too high");
-			return -EINVAL;
-		}
-		if (divider > UINT16_MAX) {
-			LOG_ERR("sampling frequency is too low");
-			return -EINVAL;
-		}
+	const uint64_t min_divider = 8u;
+	uint64_t divider =
+		calculate_divider_shift_8(i2s_cfg->frame_clk_freq, channel_length) >> 8u;
+
+	if (divider < min_divider) {
+		LOG_ERR("frame_clk_freq %u Hz gives a bit-clock half-period of %llu system "
+			"clocks, the data state machine needs %llu. Maximum with %u-bit "
+			"channels is %llu Hz.",
+			i2s_cfg->frame_clk_freq, divider, min_divider, channel_length,
+			(uint64_t)clock_get_hz(clk_sys) / (4u * channel_length * min_divider));
+		return -EINVAL;
+	}
+
+	if (i2s_cfg_is_controller && divider > UINT16_MAX) {
+		LOG_ERR("frame_clk_freq %u Hz needs a clks divider of %llu, maximum is %u",
+			i2s_cfg->frame_clk_freq, divider, UINT16_MAX);
+		return -EINVAL;
 	}
 
 	if (other_stream->state != I2S_STATE_NOT_READY && i2s_cfg->word_size != other_stream->cfg.word_size) {
