@@ -268,6 +268,7 @@ static void sm_release(const struct device *piodev, size_t *sm, struct pio_prog 
 	prog_unload(piodev, prog_res);
 }
 
+// TODO: Think of another name.
 static int sm_atomic_set_stream_and_clk(const struct device *dev, enum i2s_dir dir, bool need_clk_sm)
 {
 	const struct pio_i2s_config *dev_config = dev->config;
@@ -1033,6 +1034,8 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 #define PIO_I2S_HAS_TX(idx) PIO_I2S_IS_DIR_INST_EN(idx, tx)
 #define PIO_I2S_HAS_RX(idx) PIO_I2S_IS_DIR_INST_EN(idx, rx)
 
+#define PIO_I2S_PIN_LIMIT 32
+
 #define PIO_I2S_INIT(idx)                                                                          \
 	BUILD_ASSERT(PIO_I2S_HAS_TX(idx) || PIO_I2S_HAS_RX(idx),                                   \
 		     "I2S node needs at least one of the \"tx\" / \"rx\" dma-names.");             \
@@ -1045,10 +1048,19 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 		     "due to limitations in the PIO program.");                                    \
 	BUILD_ASSERT(PIO_I2S_BCLK_PIN(idx) >= 1,                                                   \
 		     "I2S bck pin must be >= 1 due to limitations in the PIO program.");           \
+	BUILD_ASSERT(PIO_I2S_BCLK_PIN(idx) < PIO_I2S_PIN_LIMIT,                                    \
+		     "I2S bck pin must be in the first PIO pin bank (GPIO 0..31).");               \
+	BUILD_ASSERT(PIO_I2S_WS_PIN(idx) < PIO_I2S_PIN_LIMIT,                                      \
+		     "I2S ws pin must be in the first PIO pin bank (GPIO 0..31).");                \
+	IF_ENABLED(PIO_I2S_HAS_TX(idx),                                                            \
+		(BUILD_ASSERT(PIO_I2S_TX_DATA_PIN(idx) < PIO_I2S_PIN_LIMIT,                        \
+			      "I2S tx_data pin must be in the first PIO pin bank (GPIO 0..31).");)) \
 	IF_ENABLED(PIO_I2S_HAS_RX(idx),                                                            \
 		(BUILD_ASSERT(PIO_I2S_RX_DATA_PIN(idx) == PIO_I2S_BCLK_PIN(idx) - 1,               \
 			      "I2S rx_data pin must be equal to bit-clock pin - 1 "                \
-			      "due to limitations in the PIO program.");))                         \
+			      "due to limitations in the PIO program.");                            \
+		 BUILD_ASSERT(PIO_I2S_RX_DATA_PIN(idx) < PIO_I2S_PIN_LIMIT,                        \
+			      "I2S rx_data pin must be in the first PIO pin bank (GPIO 0..31).");)) \
 	PINCTRL_DT_INST_DEFINE(idx);                                                               \
 	static const struct pio_i2s_config pio_i2s##idx##_config = {                               \
 		.piodev = DEVICE_DT_GET(DT_INST_PARENT(idx)),                                      \
