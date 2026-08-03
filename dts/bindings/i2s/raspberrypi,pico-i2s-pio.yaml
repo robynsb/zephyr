@@ -1,5 +1,37 @@
+# Copyright (c) 2026 Robin Sachsenweger Ballantyne <makenenjoy@gmail.com>
+# SPDX-License-Identifier: Apache-2.0
+
 description: Raspberry Pi Pico PIO I2S
 
 compatible: "raspberrypi,pico-i2s-pio"
 
-include: [i2s-controller.yaml, pinctrl-device.yaml]
+include: [i2s-controller.yaml, "raspberrypi,pico-pio-device.yaml"]
+# TODO: Finish documenting driver here.
+properties:
+  pinctrl-0:
+    required: true
+    description: |
+      Must name a node containing the groups `clks`, `ws` and one or both of `tx_data` and/or
+      `rx_data`.
+
+  pinctrl-names:
+    required: true
+
+  dmas:
+    required: true
+    description: |
+      TX and/or RX DMA channel specifiers. At least one is required.
+
+      Note: the DREQ slot cell is ignored. raspberrypi,pico-dma.yaml fixes
+      #dma-cells at 3, but the driver derives the slot from pio_get_dreq() once
+      the state machine has been allocated, which is not known until
+      i2s_configure() runs. Write 0 as the placeholder. A named
+      RPI_PICO_DMA_SLOT_* constant is not wrong, but it is misleading, since it
+      is only ever correct when the dynamically allocated state machine happens
+      to be the one the constant names.
+# TODO: Write example above
+
+  dma-names:
+    required: true
+    description: |
+      `tx`, `rx`, or both.
