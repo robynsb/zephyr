@@ -70,6 +70,7 @@ struct stream {
 	uint32_t dma_channel;
 	const struct device *dev_dma;
 	struct dma_config dma_cfg;
+	struct dma_block_config dma_blk_cfg;
 
 	struct i2s_config cfg;
 	void *mem_block;
@@ -656,47 +657,6 @@ static int reload_dma(const struct device *dev_dma, uint32_t channel,
 	return ret;
 }
 
-static int start_dma(const struct device *dev_dma, uint32_t channel,
-		     struct dma_config *dcfg, void *src,
-		     bool src_addr_increment, void *dst,
-		     bool dst_addr_increment,
-		     uint32_t blk_size)
-{
-	struct dma_block_config blk_cfg;
-	int ret;
-
-	memset(&blk_cfg, 0, sizeof(blk_cfg));
-	blk_cfg.block_size = blk_size;
-	blk_cfg.source_address = (uint32_t)src;
-	blk_cfg.dest_address = (uint32_t)dst;
-	if (src_addr_increment) {
-		blk_cfg.source_addr_adj = DMA_ADDR_ADJ_INCREMENT;
-	} else {
-		blk_cfg.source_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
-	}
-	if (dst_addr_increment) {
-		blk_cfg.dest_addr_adj = DMA_ADDR_ADJ_INCREMENT;
-	} else {
-		blk_cfg.dest_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
-	}
-
-	dcfg->head_block = &blk_cfg;
-
-	ret = dma_config(dev_dma, channel, dcfg);
-	if (ret < 0) {
-		LOG_ERR("dma_config failed with error %d", ret);
-		return ret;
-	}
-
-	ret = dma_start(dev_dma, channel);
-	if (ret < 0) {
-		LOG_ERR("dma_start failed with error %d", ret);
-		return ret;
-	}
-
-	return ret;
-}
-
 #if PIO_I2S_IS_DIR_EN(tx)
 static void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t channel,
 				      int status) {
@@ -867,6 +827,7 @@ static int i2s_start_rx_stream_dma(const struct device *dev, struct stream *stre
 	PIO pio = pio_rpi_pico_get_pio(config->piodev);
 
 	// struct stream *stream = &data->tx;
+	struct dma_block_config *blk_cfg = &stream->dma_blk_cfg;
 	int retval;
 
 	retval = k_mem_slab_alloc(stream->cfg.mem_slab, &stream->mem_block,
@@ -878,13 +839,22 @@ static int i2s_start_rx_stream_dma(const struct device *dev, struct stream *stre
 
 	i2s_reset_stream_sm(dev, stream);
 
-	retval = start_dma(stream->dev_dma, stream->dma_channel,
-			&stream->dma_cfg,
-			(void *)&pio->rxf[stream->sm],
-			false, stream->mem_block,
-			true, stream->cfg.block_size
-	);
+	memset(blk_cfg, 0, sizeof(*blk_cfg));
+	blk_cfg->block_size = stream->cfg.block_size;
+	blk_cfg->source_address = (uint32_t)&pio->rxf[stream->sm];
+	blk_cfg->source_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
+	blk_cfg->dest_address = (uint32_t)stream->mem_block;
+	blk_cfg->dest_addr_adj = DMA_ADDR_ADJ_INCREMENT;
 
+	stream->dma_cfg.head_block = blk_cfg;
+
+	retval = dma_config(stream->dev_dma, stream->dma_channel, &stream->dma_cfg);
+	if (retval < 0) {
+		LOG_ERR("Failed to configure RX DMA transfer: %d", retval);
+		return retval;
+	}
+
+	retval = dma_start(stream->dev_dma, stream->dma_channel);
 	if (retval < 0) {
 		LOG_ERR("Failed to start RX DMA transfer: %d", retval);
 		return retval;
@@ -904,6 +874,7 @@ static int i2s_start_tx_stream_dma(const struct device *dev, struct stream *stre
 	// struct stream *stream = &data->tx;
 
 
+	struct dma_block_config *blk_cfg = &stream->dma_blk_cfg;
 	size_t mem_block_size;
 	struct queue_item item;
 
@@ -916,16 +887,26 @@ static int i2s_start_tx_stream_dma(const struct device *dev, struct stream *stre
 	}
 
 	stream->mem_block = item.mem_block;
-    	mem_block_size = item.size;
+	mem_block_size = item.size;
 
 	i2s_reset_stream_sm(dev, stream);
 
-	ret = start_dma(stream->dev_dma, stream->dma_channel,
-			&stream->dma_cfg,
-			stream->mem_block, true,
-			(void *)&pio->txf[stream->sm],
-			false,
-			mem_block_size);
+	memset(blk_cfg, 0, sizeof(*blk_cfg));
+	blk_cfg->block_size = mem_block_size;
+	blk_cfg->source_address = (uint32_t)stream->mem_block;
+	blk_cfg->source_addr_adj = DMA_ADDR_ADJ_INCREMENT;
+	blk_cfg->dest_address = (uint32_t)&pio->txf[stream->sm];
+	blk_cfg->dest_addr_adj = DMA_ADDR_ADJ_NO_CHANGE;
+
+	stream->dma_cfg.head_block = blk_cfg;
+
+	ret = dma_config(stream->dev_dma, stream->dma_channel, &stream->dma_cfg);
+	if (ret < 0) {
+		LOG_ERR("Failed to configure TX DMA transfer: %d", ret);
+		return ret;
+	}
+
+	ret = dma_start(stream->dev_dma, stream->dma_channel);
 	if (ret < 0) {
 		LOG_ERR("Failed to start TX DMA transfer: %d", ret);
 		return ret;
