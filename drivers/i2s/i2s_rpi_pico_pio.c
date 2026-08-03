@@ -164,6 +164,8 @@ RPI_PICO_PIO_DEFINE_PROGRAM(clks, 0, 3,
 static const uint32_t clks_cycles_factor = 2u; /* 2 PIO cycles per BCLK period */
 static const uint32_t clks_entry_point = 0;
 
+// TODO: Give a brief explanation of this pio program.
+// TODO: change numbers in comments to binary where appropriate.
 RPI_PICO_PIO_DEFINE_PROGRAM(target, 4, 12,
 	0x20a2, //  0: wait   1 pin, 2
 	0x2022, //  1: wait   0 pin, 2
