@@ -355,7 +355,6 @@ static void pio_i2s_setup_clks(const struct device *dev)
 	sm_config_set_sideset(&c, 1, false, false);
 	sm_config_set_out_pins(&c, ws_pin, 1);
 	sm_config_set_in_pins(&c, ws_pin);
-	sm_config_set_in_pin_count(&c, 1);
 	pio_sm_init(pio, sm, offset, &c);
 
 	/* clks drives BCLK + WS; they are independent pins, so set both bits. */
@@ -398,7 +397,6 @@ static void pio_i2s_setup_stream(const struct device *dev, struct stream *stream
 		sm_config_set_wrap(&c, offset + target_wrap_target, offset + target_wrap);
 		sm_config_set_out_pins(&c, tx_out_pin, 1);
 		sm_config_set_in_pins(&c, dev_config->in_base_pin);
-		sm_config_set_in_pin_count(&c, 3);
 		sm_config_set_jmp_pin(&c, ws_pin);
 		sm_config_set_out_shift(&c, false, false, 1);
 		sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
@@ -410,7 +408,6 @@ static void pio_i2s_setup_stream(const struct device *dev, struct stream *stream
 		c = pio_get_default_sm_config();
 		sm_config_set_wrap(&c, offset + target_wrap_target, offset + target_wrap);
 		sm_config_set_in_pins(&c, dev_config->in_base_pin);
-		sm_config_set_in_pin_count(&c, 3);
 		sm_config_set_jmp_pin(&c, ws_pin);
 		sm_config_set_in_shift(&c, false, false, 1);
 		sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
@@ -1072,6 +1069,8 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 	BUILD_ASSERT(PIO_I2S_WS_PIN(idx) == PIO_I2S_BCLK_PIN(idx) + 1,                             \
 		     "I2S ws pin must be equal to bit-clock pin + 1 "                              \
 		     "due to limitations in the PIO program.");                                    \
+	BUILD_ASSERT(PIO_I2S_BCLK_PIN(idx) >= 1,                                                   \
+		     "I2S bck pin must be >= 1 due to limitations in the PIO program.");           \
 	IF_ENABLED(PIO_I2S_HAS_RX(idx),                                                            \
 		(BUILD_ASSERT(PIO_I2S_RX_DATA_PIN(idx) == PIO_I2S_BCLK_PIN(idx) - 1,               \
 			      "I2S rx_data pin must be equal to bit-clock pin - 1 "                \
@@ -1082,7 +1081,7 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 		.pcfg = PINCTRL_DT_INST_DEV_CONFIG_GET(idx),                                       \
 		.clock_pin = PIO_I2S_BCLK_PIN(idx),                                                \
 		.ws_pin = PIO_I2S_WS_PIN(idx),                                                     \
-		.in_base_pin = PIO_I2S_RX_DATA_PIN(idx)                                            \
+		.in_base_pin = PIO_I2S_BCLK_PIN(idx) - 1                                           \
 	};                                                                                         \
 	IF_ENABLED(PIO_I2S_HAS_TX(idx),                                                            \
 		(K_MSGQ_DEFINE(tx_##idx##_queue, sizeof(struct queue_item),                        \
