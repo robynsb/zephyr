@@ -817,7 +817,7 @@ static int i2s_start_rx_stream_dma(const struct device *dev, struct stream *stre
 			       K_NO_WAIT);
 	if (retval < 0) {
 		LOG_ERR("While starting rx stream dma, failed to allocate mem slab");
-		return retval;
+		return -ENOMEM;
 	}
 
 	i2s_reset_stream_sm(dev, stream);
@@ -863,10 +863,9 @@ static int i2s_start_tx_stream_dma(const struct device *dev, struct stream *stre
 
 	int ret = k_msgq_get(stream->msgq, &item, K_NO_WAIT);
 
-
 	if (ret < 0) {
 		LOG_ERR("TX buffer is empty.");
-		return ret;
+		return -ENOMEM;
 	}
 
 	stream->mem_block = item.mem_block;
