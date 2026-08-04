@@ -32,8 +32,7 @@
 
 #include <zephyr/sys/util.h>
 
-#define LOG_LEVEL CONFIG_I2S_LOG_LEVEL
-LOG_MODULE_REGISTER(i2s_pico_pio);
+LOG_MODULE_REGISTER(i2s_pico_pio, CONFIG_I2S_LOG_LEVEL);
 
 #define PIO_I2S_NUM_INST_OK DT_NUM_INST_STATUS_OKAY(raspberrypi_pico_i2s_pio)
 #define PIO_I2S_IS_DIR_INST_EN(idx, dir) DT_INST_DMAS_HAS_NAME(idx, dir)
@@ -111,7 +110,7 @@ static int i2s_rpi_pico_write(const struct device *dev, void *mem_block, size_t 
 
 	retval = k_msgq_put(stream->msgq, &item, SYS_TIMEOUT_MS(stream->cfg.timeout));
 	if (retval < 0) {
-		LOG_ERR("TX queue full");
+		LOG_DBG("TX queue full");
 		return retval;
 	}
 
@@ -521,25 +520,25 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 	}
 
 	if (i2s_cfg->channels != 2) {
-		LOG_ERR("Number of channels not 2 when configured with I2S data format.");
+		LOG_ERR("Number of channels not 2 when configured with I2S data format");
 		return -EINVAL;
 	}
 
 	if (i2s_cfg->word_size != 16 && i2s_cfg->word_size != 32) {
-		LOG_ERR("I2S word size (%d) is unsupported, must be 16 or 32.",
+		LOG_ERR("I2S word size (%d) is unsupported, must be 16 or 32",
 			i2s_cfg->word_size);
 		return -EINVAL;
 	}
 	uint32_t channel_length = i2s_cfg->word_size;
 
 	if (i2s_cfg->options & I2S_OPT_LOOPBACK) {
-		LOG_ERR("I2S loopback mode unsupported.");
+		LOG_ERR("I2S loopback mode unsupported");
 		LOG_DBG("To enable loopback, use the same SD for TX and RX pinctrl");
 		return -EINVAL;
 	}
 
 	if (i2s_cfg->options & I2S_OPT_PINGPONG) {
-		LOG_ERR("I2S_OPT_PINGPONG is unsupported.");
+		LOG_ERR("I2S_OPT_PINGPONG is unsupported");
 		return -EINVAL;
 	}
 
@@ -547,7 +546,7 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 	bool is_frame_clk_target = i2s_cfg->options & I2S_OPT_FRAME_CLK_TARGET;
 
 	if (is_bit_clk_target != is_frame_clk_target) {
-		LOG_ERR("I2S bit CLK and frame CLK must be either both target or both controller.");
+		LOG_ERR("I2S bit CLK and frame CLK must be either both target or both controller");
 		return -EINVAL;
 	}
 
@@ -558,12 +557,15 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 
 	if(i2s_cfg_is_controller) {
 		if (i2s_cfg->options & I2S_OPT_BIT_CLK_GATED) {
-			LOG_ERR("Gated bit clock is unsupported.");
+			LOG_ERR("Gated bit clock is unsupported");
 			return -EINVAL;
 		}
 
-		if (other_is_controller && i2s_cfg->frame_clk_freq != other_stream->cfg.frame_clk_freq) {
-			LOG_ERR("simultaneously configured controller streams have different frame_clk_freq (%d) (%d)", i2s_cfg->frame_clk_freq, other_stream->cfg.frame_clk_freq);
+		if (other_is_controller &&
+		    i2s_cfg->frame_clk_freq != other_stream->cfg.frame_clk_freq) {
+			LOG_ERR("Simultaneously configured controller streams have different "
+				"frame_clk_freq (%u) (%u)",
+				i2s_cfg->frame_clk_freq, other_stream->cfg.frame_clk_freq);
 			return -EINVAL;
 		}
 	}
@@ -575,7 +577,7 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 	if (divider < min_divider) {
 		LOG_ERR("frame_clk_freq %u Hz gives a bit-clock half-period of %llu system "
 			"clocks, the data state machine needs %llu. Maximum with %u-bit "
-			"channels is %llu Hz.",
+			"channels is %llu Hz",
 			i2s_cfg->frame_clk_freq, divider, min_divider, channel_length,
 			(uint64_t)clock_get_hz(clk_sys) / (4u * channel_length * min_divider));
 		return -EINVAL;
@@ -587,8 +589,10 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 		return -EINVAL;
 	}
 
-	if (other_stream->state != I2S_STATE_NOT_READY && i2s_cfg->word_size != other_stream->cfg.word_size) {
-		LOG_ERR("simultaneously configured streams have different word_size (%d) (%d)", i2s_cfg->word_size, other_stream->cfg.word_size);
+	if (other_stream->state != I2S_STATE_NOT_READY &&
+	    i2s_cfg->word_size != other_stream->cfg.word_size) {
+		LOG_ERR("Simultaneously configured streams have different word_size (%d) (%d)",
+			i2s_cfg->word_size, other_stream->cfg.word_size);
 		return -EINVAL;
 	}
 
@@ -634,7 +638,7 @@ static void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t ch
 	struct stream *stream = &data->tx;
 
 	if (status < 0) {
-		LOG_ERR("Something went wrong with DMA. status=%d", status);
+		LOG_ERR("TX DMA transfer failed: %d", status);
 		stream->state = I2S_STATE_ERROR;
 		return;
 	}
@@ -653,7 +657,7 @@ static void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t ch
 	size_t mem_block_size;
 	int ret = k_msgq_get(stream->msgq, &item, K_NO_WAIT);
 	if (ret < 0) {
-		LOG_ERR("TX buffer underrun.");
+		LOG_ERR("TX buffer underrun");
 		stream->state = I2S_STATE_ERROR;
 		return;
 	}
@@ -689,7 +693,7 @@ static void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t ch
 	struct stream *stream = &dev_data->rx;
 
 	if (status < 0) {
-		LOG_ERR("Something went wrong with DMA. status=%d", status);
+		LOG_ERR("RX DMA transfer failed: %d", status);
 		stream->state = I2S_STATE_ERROR;
 		return;
 	}
@@ -835,7 +839,7 @@ static int i2s_start_tx_stream_dma(const struct device *dev, struct stream *stre
 	int ret = k_msgq_get(stream->msgq, &item, K_NO_WAIT);
 
 	if (ret < 0) {
-		LOG_ERR("TX buffer is empty.");
+		LOG_ERR("TX buffer is empty");
 		return -ENOMEM;
 	}
 
@@ -879,7 +883,7 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 	int ret = 0;
 
 	if (dir != I2S_DIR_RX && dir != I2S_DIR_TX) {
-		LOG_ERR("Unsupported trigger direction %d", dir);
+		LOG_DBG("Unsupported trigger direction %d", dir);
 		return -ENOSYS;
 	}
 
@@ -890,7 +894,7 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 	switch (cmd) {
 	case I2S_TRIGGER_START:
 		if (stream->state != I2S_STATE_READY) {
-			LOG_ERR("START trigger: invalid state %d", stream->state);
+			LOG_DBG("START trigger: invalid state %d", stream->state);
 			ret = -EIO;
 			break;
 		}
@@ -903,7 +907,7 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 		}
 
 		if (ret < 0) {
-			LOG_ERR("START trigger failed %d", ret);
+			LOG_DBG("START trigger failed %d", ret);
 			break;
 		}
 
@@ -912,7 +916,7 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 
 	case I2S_TRIGGER_STOP:
 		if (stream->state != I2S_STATE_RUNNING) {
-			LOG_ERR("STOP trigger: invalid state %d", stream->state);
+			LOG_DBG("STOP trigger: invalid state %d", stream->state);
 			ret = -EIO;
 			break;
 		}
@@ -923,7 +927,7 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 
 	case I2S_TRIGGER_DRAIN:
 		if (stream->state != I2S_STATE_RUNNING) {
-			LOG_ERR("DRAIN trigger: invalid state %d", stream->state);
+			LOG_DBG("DRAIN trigger: invalid state %d", stream->state);
 			ret = -EIO;
 			break;
 		}
@@ -933,7 +937,7 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 
 	case I2S_TRIGGER_DROP:
 		if (stream->state == I2S_STATE_NOT_READY) {
-			LOG_ERR("DROP trigger: invalid state %d", stream->state);
+			LOG_DBG("DROP trigger: invalid state %d", stream->state);
 			ret = -EIO;
 			break;
 		}
@@ -944,7 +948,7 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 
 	case I2S_TRIGGER_PREPARE:
 		if (stream->state != I2S_STATE_ERROR) {
-			LOG_ERR("PREPARE trigger: invalid state %d", stream->state);
+			LOG_DBG("PREPARE trigger: invalid state %d", stream->state);
 			ret = -EIO;
 			break;
 		}
@@ -954,7 +958,7 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 		break;
 
 	default:
-		LOG_ERR("Unsupported trigger command");
+		LOG_DBG("Unsupported trigger command: %d", (int)cmd);
 		ret = -EINVAL;
 	}
 
