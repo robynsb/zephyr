@@ -374,6 +374,10 @@ static void pio_i2s_setup_clks(const struct device *dev)
 
 	pio_sm_set_clkdiv_int_frac(pio, sm, div_int, div_frac);
 
+	pio_sm_exec(pio, sm, pio_encode_set(pio_y, channel_length - 2));
+	pio_sm_exec(pio, sm, pio_encode_jmp(offset + clks_entry_point));
+	pio_sm_set_enabled(pio, sm, true);
+
 	return;
 }
 
@@ -428,20 +432,6 @@ static void pio_i2s_setup_stream(const struct device *dev, struct stream *stream
 	}
 
 	return;
-}
-
-static void pio_i2s_clks_start(const struct device *dev)
-{
-	const struct pio_i2s_config *dev_config = dev->config;
-	struct pio_i2s_data *dev_data = dev->data;
-	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
-	uint32_t channel_length = dev_data->channel_length;
-	size_t sm = dev_data->clks_sm;
-
-	pio_sm_set_enabled(pio, sm, false);
-	pio_sm_exec(pio, sm, pio_encode_set(pio_y, channel_length - 2));
-	pio_sm_exec(pio, sm, pio_encode_jmp(dev_data->clks_prog.offset + clks_entry_point));
-	pio_sm_set_enabled(pio, sm, true);
 }
 
 static void drop_stream(const struct device *dev, struct stream *stream)
@@ -499,8 +489,6 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 				  (I2S_OPT_BIT_CLK_TARGET | I2S_OPT_FRAME_CLK_TARGET));
 
 
-	/* --- config check --- */
-
 	if (stream->state != I2S_STATE_NOT_READY && stream->state != I2S_STATE_READY) {
 		LOG_ERR("stream in invalid state (%d)", stream->state);
 		return -EINVAL;
@@ -514,7 +502,6 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 		memset(&stream->cfg, 0, sizeof(struct i2s_config));
 
 		if (!other_is_controller) {
-			/* clks drives BCLK + WS (see pio_i2s_setup_clks). */
 			sm_release(dev_config->piodev, &dev_data->clks_sm, &dev_data->clks_prog,
 				   (1u << dev_config->clock_pin) | (1u << dev_config->ws_pin));
 		}
@@ -569,7 +556,6 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 
 	bool is_controller = i2s_cfg_is_controller || other_is_controller;
 
-	/* check clk configuration */
 	if(i2s_cfg_is_controller) {
 		if (i2s_cfg->options & I2S_OPT_BIT_CLK_GATED) {
 			LOG_ERR("Gated bit clock is unsupported.");
@@ -606,9 +592,6 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 		return -EINVAL;
 	}
 
-	/* --- configure the stream --- */
-
-
 	retval = sm_set_stream_and_clk(dev, dir, is_controller);
 	if (retval < 0) {
 		return retval;
@@ -631,7 +614,6 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 	if (i2s_cfg_is_controller) {
 		dev_data->sampling_freq = i2s_cfg->frame_clk_freq;
 		pio_i2s_setup_clks(dev);
-		pio_i2s_clks_start(dev);
 	}
 
 	stream->state = I2S_STATE_READY;
