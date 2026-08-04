@@ -9,9 +9,7 @@
 	 - Change LOG statements to be more inline with the rest of zephyr
 */
 
-// TODO: write test for the sampling frequency check works
 // TODO: check for code smell involving functions with only one call site.
-// TODO: check all the functions are static.
 // TODO: get claude to do a run where it reads debug output in my app to see if it any empty pulls/pushes happen.
 
 #include "zephyr/sys/__assert.h"
@@ -269,8 +267,7 @@ static void sm_release(const struct device *piodev, size_t *sm, struct pio_prog 
 	prog_unload(piodev, prog_res);
 }
 
-// TODO: Think of another name.
-static int sm_atomic_set_stream_and_clk(const struct device *dev, enum i2s_dir dir, bool need_clk_sm)
+static int sm_set_stream_and_clk(const struct device *dev, enum i2s_dir dir, bool need_clk_sm)
 {
 	const struct pio_i2s_config *dev_config = dev->config;
 	struct pio_i2s_data *dev_data = dev->data;
@@ -615,7 +612,7 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 	/* --- configure the stream --- */
 
 
-	retval = sm_atomic_set_stream_and_clk(dev, dir, is_controller);
+	retval = sm_set_stream_and_clk(dev, dir, is_controller);
 	if (retval < 0) {
 		return retval;
 	}
