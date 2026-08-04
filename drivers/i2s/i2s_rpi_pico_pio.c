@@ -4,11 +4,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-/*
-	TOOO:
-	 - Change LOG statements to be more inline with the rest of zephyr
-*/
-
 // TODO: check for code smell involving functions with only one call site.
 // TODO: get claude to do a run where it reads debug output in my app to see if it any empty pulls/pushes happen.
 
