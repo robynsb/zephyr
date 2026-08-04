@@ -92,7 +92,6 @@ struct pio_i2s_data {
 
 static int i2s_rpi_pico_write(const struct device *dev, void *mem_block, size_t size)
 {
-	// const struct pio_i2s_config *config = dev->config;
 	struct pio_i2s_data *data = dev->data;
 	const struct stream *stream = &data->tx;
 	enum i2s_state state = stream->state;
@@ -349,7 +348,6 @@ static void pio_i2s_setup_clks(const struct device *dev)
 	size_t sm = dev_data->clks_sm;
 	uint32_t offset = dev_data->clks_prog.offset;
 	pio_sm_config c;
-	// int retval;
 
 	c = pio_get_default_sm_config();
 	sm_config_set_wrap(&c, offset + clks_wrap_target, offset + clks_wrap);
@@ -390,7 +388,6 @@ static void pio_i2s_setup_stream(const struct device *dev, struct stream *stream
 	size_t sm = stream->sm;
 	uint32_t offset = dev_data->target_prog.offset;
 	pio_sm_config c;
-	// int retval;
 
 	if (dir == I2S_DIR_TX) {
 		uint32_t tx_out_pin = stream->data_pin;
@@ -648,7 +645,6 @@ static void dma_tx_callback(const struct device *dma_dev, void *arg, uint32_t ch
 	const struct device *dev = (const struct device *)arg;
 	const struct pio_i2s_config *config = dev->config;
 	struct pio_i2s_data *data = dev->data;
-	// uint dma_channel = data->tx.dma_channel;
 	PIO pio = pio_rpi_pico_get_pio(config->piodev);
 
 	int retval;
@@ -704,7 +700,6 @@ static void dma_rx_callback(const struct device *dma_dev, void *arg, uint32_t ch
 	const struct device *dev = (const struct device *)arg;
 	const struct pio_i2s_config *dev_config = dev->config;
 	struct pio_i2s_data *dev_data = dev->data;
-	// uint dma_channel = dev_data->rx.dma_channel;
 	PIO pio = pio_rpi_pico_get_pio(dev_config->piodev);
 
 	int retval;
@@ -806,10 +801,8 @@ static void i2s_reset_stream_sm(const struct device *dev, struct stream *stream)
 
 static int i2s_start_rx_stream_dma(const struct device *dev, struct stream *stream) {
 	const struct pio_i2s_config *config = dev->config;
-	// struct pio_i2s_data *data = dev->data;
 	PIO pio = pio_rpi_pico_get_pio(config->piodev);
 
-	// struct stream *stream = &data->tx;
 	struct dma_block_config *blk_cfg = &stream->dma_blk_cfg;
 	int retval;
 
@@ -851,11 +844,7 @@ static int i2s_start_rx_stream_dma(const struct device *dev, struct stream *stre
 
 static int i2s_start_tx_stream_dma(const struct device *dev, struct stream *stream) {
 	const struct pio_i2s_config *config = dev->config;
-	// struct pio_i2s_data *data = dev->data;
 	PIO pio = pio_rpi_pico_get_pio(config->piodev);
-
-	// struct stream *stream = &data->tx;
-
 
 	struct dma_block_config *blk_cfg = &stream->dma_blk_cfg;
 	size_t mem_block_size;
@@ -903,7 +892,6 @@ static int i2s_start_tx_stream_dma(const struct device *dev, struct stream *stre
 static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 			     enum i2s_trigger_cmd cmd)
 {
-	// const struct pio_i2s_config *dev_config = dev->config;
 	struct pio_i2s_data *dev_data = dev->data;
 	k_spinlock_key_t key;
 	int ret = 0;
@@ -914,8 +902,6 @@ static int i2s_rpi_pico_trigger(const struct device *dev, enum i2s_dir dir,
 	}
 
 	struct stream *stream = dir == I2S_DIR_RX ? &dev_data->rx : &dev_data->tx;
-
-	LOG_INF("i2s_rpi_pico_trigger dir=%d cmd=%d", dir, cmd);
 
 	key = k_spin_lock(&dev_data->lock);
 
