@@ -159,8 +159,8 @@ static const uint32_t clks_cycles_factor = 2u;
 static const uint32_t clks_entry_point = 0;
 
 /* TX/RX I2S target program.
- * Each pull/push transfers one 16/32 bit sample.
- * DMA is configured with narrow writes when each sample is not 32 bits long. */
+ * Each pull/push transfers one 16/32 bit word.
+ * DMA is configured with narrow writes when words are not 32 bits long. */
 RPI_PICO_PIO_DEFINE_PROGRAM(target, 4, 12,
 	0x20a2, //  0: wait   1 pin, 2
 	0x2022, //  1: wait   0 pin, 2
