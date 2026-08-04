@@ -12,6 +12,7 @@
 // TODO: write test for the sampling frequency check works
 // TODO: check for code smell involving functions with only one call site.
 // TODO: check all the functions are static.
+// TODO: get claude to do a run where it reads debug output in my app to see if it any empty pulls/pushes happen.
 
 #include "zephyr/sys/__assert.h"
 #include <stdint.h>
@@ -1024,10 +1025,10 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 	.trigger = i2s_rpi_pico_trigger,
 };
 
-#define PIO_I2S_BCLK_PIN(idx)    DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, clks, 0)
-#define PIO_I2S_WS_PIN(idx)      DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, ws, 0)
-#define PIO_I2S_TX_DATA_PIN(idx) DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, tx_data, 0)
-#define PIO_I2S_RX_DATA_PIN(idx) DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, rx_data, 0)
+#define PIO_I2S_BCLK_PIN(idx)    DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, bclk_pins, 0)
+#define PIO_I2S_WS_PIN(idx)      DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, ws_pins, 0)
+#define PIO_I2S_TX_DATA_PIN(idx) DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, sdout_pins, 0)
+#define PIO_I2S_RX_DATA_PIN(idx) DT_INST_RPI_PICO_PIO_PIN_BY_NAME(idx, default, 0, sdin_pins, 0)
 
 #define PIO_I2S_HAS_GROUP(idx, group)                                                              \
 	DT_NODE_EXISTS(DT_CHILD(DT_PINCTRL_BY_NAME(DT_DRV_INST(idx), default, 0), group))
@@ -1040,28 +1041,30 @@ static DEVICE_API(i2s, i2s_rpi_pico_driver_api) = {
 #define PIO_I2S_INIT(idx)                                                                          \
 	BUILD_ASSERT(PIO_I2S_HAS_TX(idx) || PIO_I2S_HAS_RX(idx),                                   \
 		     "I2S node needs at least one of the \"tx\" / \"rx\" dma-names.");             \
-	BUILD_ASSERT(!PIO_I2S_HAS_TX(idx) || PIO_I2S_HAS_GROUP(idx, tx_data),                      \
-		     "I2S tx_data pins not defined.");                                             \
-	BUILD_ASSERT(!PIO_I2S_HAS_RX(idx) || PIO_I2S_HAS_GROUP(idx, rx_data),                      \
-		     "I2S rx_data pins not defined.");                                             \
+	BUILD_ASSERT(!PIO_I2S_HAS_TX(idx) || PIO_I2S_HAS_GROUP(idx, sdout_pins),                   \
+		     "I2S sdout_pins not defined.");                                               \
+	BUILD_ASSERT(!PIO_I2S_HAS_RX(idx) || PIO_I2S_HAS_GROUP(idx, sdin_pins),                    \
+		     "I2S sdin_pins not defined.");                                                \
 	BUILD_ASSERT(PIO_I2S_WS_PIN(idx) == PIO_I2S_BCLK_PIN(idx) + 1,                             \
-		     "I2S ws pin must be equal to bit-clock pin + 1 "                              \
+		     "I2S ws_pins pin must be equal to bit-clock pin + 1 "                         \
 		     "due to limitations in the PIO program.");                                    \
 	BUILD_ASSERT(PIO_I2S_BCLK_PIN(idx) >= 1,                                                   \
-		     "I2S bck pin must be >= 1 due to limitations in the PIO program.");           \
+		     "I2S bclk_pins pin must be >= 1 due to limitations in the PIO program.");     \
 	BUILD_ASSERT(PIO_I2S_BCLK_PIN(idx) < PIO_I2S_PIN_LIMIT,                                    \
-		     "I2S bck pin must be in the first PIO pin bank (GPIO 0..31).");               \
+		     "I2S bclk_pins pin must be in the first PIO pin bank (GPIO 0..31).");         \
 	BUILD_ASSERT(PIO_I2S_WS_PIN(idx) < PIO_I2S_PIN_LIMIT,                                      \
-		     "I2S ws pin must be in the first PIO pin bank (GPIO 0..31).");                \
+		     "I2S ws_pins pin must be in the first PIO pin bank (GPIO 0..31).");           \
 	IF_ENABLED(PIO_I2S_HAS_TX(idx),                                                            \
 		(BUILD_ASSERT(PIO_I2S_TX_DATA_PIN(idx) < PIO_I2S_PIN_LIMIT,                        \
-			      "I2S tx_data pin must be in the first PIO pin bank (GPIO 0..31).");)) \
+			      "I2S sdout_pins pin must be in the first PIO pin bank "              \
+			      "(GPIO 0..31).");))                                                  \
 	IF_ENABLED(PIO_I2S_HAS_RX(idx),                                                            \
 		(BUILD_ASSERT(PIO_I2S_RX_DATA_PIN(idx) == PIO_I2S_BCLK_PIN(idx) - 1,               \
-			      "I2S rx_data pin must be equal to bit-clock pin - 1 "                \
+			      "I2S sdin_pins pin must be equal to bit-clock pin - 1 "              \
 			      "due to limitations in the PIO program.");                            \
 		 BUILD_ASSERT(PIO_I2S_RX_DATA_PIN(idx) < PIO_I2S_PIN_LIMIT,                        \
-			      "I2S rx_data pin must be in the first PIO pin bank (GPIO 0..31).");)) \
+			      "I2S sdin_pins pin must be in the first PIO pin bank "               \
+			      "(GPIO 0..31).");))                                                  \
 	PINCTRL_DT_INST_DEFINE(idx);                                                               \
 	static const struct pio_i2s_config pio_i2s##idx##_config = {                               \
 		.piodev = DEVICE_DT_GET(DT_INST_PARENT(idx)),                                      \

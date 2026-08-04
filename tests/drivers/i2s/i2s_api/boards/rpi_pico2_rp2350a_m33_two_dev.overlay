@@ -11,26 +11,27 @@
  *
  * Required jumpers:
  *
- *   GP13 (node1 tx_data) <---> GP7 (node0 rx_data)
- *   GP11 (node1 clks)    <---> GP8 (node0 clks)
- *   GP12 (node1 ws)      <---> GP9 (node0 ws)
+ *   GP13 (node1 sdout) <---> GP7 (node0 sdin)
+ *   GP11 (node1 bclk)  <---> GP8 (node0 bclk)
+ *   GP12 (node1 ws)    <---> GP9 (node0 ws)
  *
  * Pin-assignment constraint (driver, not arbitrary): the single target program
  * shared by both directions does `in pins, 1` at in_base+0, `wait n pin, 1` at
- * in_base+1 and `wait n pin, 2` at in_base+2, so rx_data / clks / ws have to be
- * three consecutive pins in that order -- hence 7/8/9 on pio0 and 10/11/12 on
- * pio1. The driver asserts clks + 1 == ws for every instance and rx_data ==
- * clks - 1 for every instance whose "rx" DMA channel is named. Those asserts
- * are why pio1's rx_data is repointed below even though this test never
- * receives on pio1: the base overlay parks rx_data on tx_data's pin for its
- * single-device internal loopback, which is nowhere near the clks pin used
- * here. The TX side has no such adjacency requirement.
+ * in_base+1 and `wait n pin, 2` at in_base+2, so sdin_pins / bclk_pins / ws_pins
+ * have to be three consecutive pins in that order -- hence 7/8/9 on pio0 and
+ * 10/11/12 on pio1. The driver asserts bclk_pins + 1 == ws_pins for every
+ * instance and sdin_pins == bclk_pins - 1 for every instance whose "rx" DMA
+ * channel is named. Those asserts are why pio1's sdin_pins is repointed below
+ * even though this test never receives on pio1: the base overlay parks
+ * sdin_pins on sdout_pins' pin for its single-device internal loopback, which
+ * is nowhere near the bclk_pins pin used here. The TX side has no such
+ * adjacency requirement.
  *
  * This overlay is layered on top of boards/rpi_pico2_rp2350a_m33.overlay, which
  * twister applies automatically for this board target. It repoints the existing
- * pio1 pinctrl groups rather than redefining them; all four have to move, since
- * the base overlay's tx_data/rx_data share a pin and pio1 now needs four
- * distinct ones.
+ * pio1 pinctrl groups by label rather than redefining them; all four have to
+ * move, since the base overlay's sdout_pins/sdin_pins share a pin and pio1 now
+ * needs four distinct ones.
  */
 
 #include <dt-bindings/pinctrl/rpi-pico-rp2350a-pinctrl.h>
@@ -45,38 +46,38 @@
 };
 
 
-&rx_data {
+&pio1_i2s0_sdin {
 	pinmux = <PIO1_P10>;
 };
 
-&clks {
+&pio1_i2s0_bclk {
 	pinmux = <PIO1_P11>;
 };
 
-&ws {
+&pio1_i2s0_ws {
 	pinmux = <PIO1_P12>;
 };
 
-&tx_data {
+&pio1_i2s0_sdout {
 	pinmux = <PIO1_P13>;
 };
 
 
 &pinctrl {
-	pio0_i2s: pio0_i2s {
-		pio0_tx_data: tx_data {
+	pio0_i2s0_default: pio0_i2s0_default {
+		sdout_pins {
 			pinmux = <PIO0_P6>;
 		};
 
-		pio0_rx_data: rx_data {
+		sdin_pins {
 			pinmux = <PIO0_P7>;
 			input-enable;
 		};
-		pio0_clks: clks {
+		bclk_pins {
 			pinmux = <PIO0_P8>;
 			input-enable;
 		};
-		pio0_ws: ws {
+		ws_pins {
 			pinmux = <PIO0_P9>;
 			input-enable;
 		};
@@ -90,7 +91,7 @@
 		compatible = "raspberrypi,pico-i2s-pio";
 		status = "okay";
 
-		pinctrl-0 = <&pio0_i2s>;
+		pinctrl-0 = <&pio0_i2s0_default>;
 		pinctrl-names = "default";
 
 		#address-cells = <1>;

@@ -8,22 +8,19 @@
 };
 
 &pinctrl {
-	pio1_i2s: pio1_i2s {
-		tx_data: tx_data {
+	pio1_i2s0_default: pio1_i2s0_default {
+		sdout_pins {
 			pinmux = <PIO1_P16>;
 		};
-		rx_data: rx_data {
+		sdin_pins {
 			pinmux = <PIO1_P16>;
-			/* Enable the pad input buffer so the PIO `in pins` can sample
-			 * the RX data line (off by default).
-			 */
 			input-enable;
 		};
-		clks: clks {
+		bclk_pins {
 			pinmux = <PIO1_P17>;
 			input-enable;
 		};
-		ws: ws {
+		ws_pins {
 			pinmux = <PIO1_P18>;
 			input-enable;
 		};
@@ -37,7 +34,7 @@
 		compatible = "raspberrypi,pico-i2s-pio";
 		status = "okay";
 
-		pinctrl-0 = <&pio1_i2s>;
+		pinctrl-0 = <&pio1_i2s0_default>;
 		pinctrl-names = "default";
 
 		#address-cells = <1>;
