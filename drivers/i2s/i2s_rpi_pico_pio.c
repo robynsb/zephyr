@@ -4,9 +4,6 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-// TODO: check for code smell involving functions with only one call site.
-// TODO: get claude to do a run where it reads debug output in my app to see if it any empty pulls/pushes happen.
-
 #include "zephyr/sys/__assert.h"
 #include <stdint.h>
 #define DT_DRV_COMPAT raspberrypi_pico_i2s_pio
@@ -181,6 +178,10 @@ RPI_PICO_PIO_DEFINE_PROGRAM(target, 4, 12,
 	0x0005, // 14: jmp    5
 );
 
+/* The target PIO program needs to perform a maximum of 8 instructions (7,8,9,10,11,12,4,5)
+ * during a high BCLK which implies an upper bound on sampling frequency. */
+static const uint32_t target_prog_instr_per_bclk_toggle = 8u;
+
 static int prog_load(const struct device *piodev, struct pio_prog *res, const pio_program_t *prog)
 {
 	PIO pio = pio_rpi_pico_get_pio(piodev);
@@ -307,32 +308,29 @@ cleanup:
 	return -EBUSY;
 }
 
-/*
- * TODO: rewrite this with the used variable names
- * f_sys = system_clock_frequency
- * f_b = frequency of Bit CLK
- * f_pio = instruction frequency of PIO clk state machine
- * f_s = sampling frequency
- * k = number of PIO cycles per bit-clock period in the clks program (k = 2)
- *
- * f_b = f_s * channel_length * num_channels
- * f_pio = f_sys / divider
- * f_pio = k * f_b
- *
- * => k * f_b = f_sys / divider
- * => divider = f_sys / (k * f_b) = f_sys/(k * f_s * channel_length * num_channels)
- */
 static uint64_t calculate_divider_shift_8(uint64_t sample_freq, uint64_t channel_length) {
-	/* Number of channels is always 2 for I2S data format */
-	/* Only I2S supported at this time. */
+	/* system_clock_frequency = clock frequency of system
+	 * f_bclk = frequency of BCLK
+	 * f_pio = instruction frequency of state machine running clks program
+	 * sample_freq = sampling frequency
+	 * clks_cycles_factor = number of PIO cycles per BCLK period in clks program
+	 *
+	 * f_bclk = sample_freq * channel_length * num_channels
+	 * f_pio = system_clock_frequency / divider
+	 * f_pio = clks_cycles_factor * f_bclk
+	 *
+	 * => clks_cycles_factor * f_bclk = system_clock_frequency / divider
+	 * => divider = system_clock_frequency / (clks_cycles_factor * f_bclk)
+	 *            = system_clock_frequency /
+	 *                      (clks_cycles_factor * sample_freq * channel_length * num_channels) */
+
+	/* Only I2S supported at this time. Number of channels is always 2 for I2S data format */
 	const uint64_t num_channels = 2;
 	uint64_t system_clock_frequency = clock_get_hz(clk_sys);
-	/* 8.8 fixed-point divider: (f_sys << 8) / (k * f_s * channel_length * num_channels) */
-	uint64_t divider = (system_clock_frequency << 8u) /
+	uint64_t divider_shift_8 = (system_clock_frequency << 8u) /
 		(clks_cycles_factor * sample_freq * channel_length * num_channels);
-	return divider;
+	return divider_shift_8;
 }
-
 
 static void pio_i2s_setup_clks(const struct device *dev)
 {
@@ -567,16 +565,15 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 		}
 	}
 
-	const uint64_t min_divider = 8u;
 	uint64_t divider =
 		calculate_divider_shift_8(i2s_cfg->frame_clk_freq, channel_length) >> 8u;
 
-	if (divider < min_divider) {
+	if (divider < target_prog_instr_per_bclk_toggle) {
 		LOG_ERR("frame_clk_freq %u Hz gives a bit-clock half-period of %llu system "
-			"clocks, the data state machine needs %llu. Maximum with %u-bit "
+			"clocks, the data state machine needs %u. Maximum with %u-bit "
 			"channels is %llu Hz",
-			i2s_cfg->frame_clk_freq, divider, min_divider, channel_length,
-			(uint64_t)clock_get_hz(clk_sys) / (4u * channel_length * min_divider));
+			i2s_cfg->frame_clk_freq, divider, target_prog_instr_per_bclk_toggle, channel_length,
+			(uint64_t)clock_get_hz(clk_sys) / (4u * channel_length * target_prog_instr_per_bclk_toggle));
 		return -EINVAL;
 	}
 
