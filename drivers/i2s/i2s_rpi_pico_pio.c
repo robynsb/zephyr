@@ -159,7 +159,7 @@ static const uint32_t clks_cycles_factor = 2u;
 static const uint32_t clks_entry_point = 0;
 
 /* TX/RX I2S target program.
- * Each pull/push transfers one 16/32 bit word.
+ * Each pull/push transfers one 8/16/32 bit word.
  * DMA is configured with narrow writes when words are not 32 bits long. */
 RPI_PICO_PIO_DEFINE_PROGRAM(target, 4, 12,
 	0x20a2, //  0: wait   1 pin, 2
@@ -521,8 +521,8 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 		return -EINVAL;
 	}
 
-	if (i2s_cfg->word_size != 16 && i2s_cfg->word_size != 32) {
-		LOG_ERR("I2S word size (%d) is unsupported, must be 16 or 32",
+	if (i2s_cfg->word_size != 8 && i2s_cfg->word_size != 16 && i2s_cfg->word_size != 32) {
+		LOG_ERR("I2S word size (%d) is unsupported, must be 8, 16 or 32",
 			i2s_cfg->word_size);
 		return -EINVAL;
 	}
@@ -602,8 +602,8 @@ static int i2s_rpi_pico_configure(const struct device *dev, enum i2s_dir dir,
 
 	stream->dma_cfg.user_data = (void*) dev;
 	stream->dma_cfg.dma_slot = RPI_PICO_DMA_DREQ_TO_SLOT(pio_get_dreq(pio, stream->sm, dir == I2S_DIR_TX));
-	stream->dma_cfg.source_data_size = channel_length == 16 ? 2 : 4;
-	stream->dma_cfg.dest_data_size = channel_length == 16 ? 2 : 4;
+	stream->dma_cfg.source_data_size = channel_length / 8u;
+	stream->dma_cfg.dest_data_size = channel_length / 8u;
 
 	memcpy(&stream->cfg, i2s_cfg, sizeof(struct i2s_config));
 
