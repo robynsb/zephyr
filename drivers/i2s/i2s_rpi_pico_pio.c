@@ -53,7 +53,7 @@ struct pio_i2s_config {
 struct pio_prog {
 	const pio_program_t *prog; /* NULL = not loaded */
 	uint32_t offset;
-	uint8_t users;             /* state machines currently running it */
+	uint8_t users; /* state machines currently running it */
 };
 
 struct stream {
@@ -114,7 +114,6 @@ static int i2s_rpi_pico_write(const struct device *dev, void *mem_block, size_t 
 
 static int i2s_rpi_pico_read(const struct device *dev, void **mem_block, size_t *size)
 {
-	// const struct pio_i2s_config *dev_config = dev->config;
 	struct pio_i2s_data *dev_data = dev->data;
 	const struct stream *stream = &dev_data->rx;
 	enum i2s_state state = stream->state;
@@ -143,8 +142,10 @@ static int i2s_rpi_pico_read(const struct device *dev, void **mem_block, size_t 
 }
 
 
-/* Clock generator: 1-bit sideset = BCLK; `mov pins, !pins` toggles WS (out/in base).
- * Seeded by the y register (= channel_length - 2). 2 PIO cycles per BCLK period. */
+/* WS and BCLK program
+ * 1-bit sideset = BCLK
+ * `mov pins, !pins` toggles WS because OUT_BASE == IN_BASE == WS pin
+ * 2 PIO cycles per BCLK period. */
 RPI_PICO_PIO_DEFINE_PROGRAM(clks, 0, 3,
 		//     .wrap_target
 	0xb022, //  0: mov    x, y            side 1
@@ -154,11 +155,12 @@ RPI_PICO_PIO_DEFINE_PROGRAM(clks, 0, 3,
 		//     .wrap
 );
 
-static const uint32_t clks_cycles_factor = 2u; /* 2 PIO cycles per BCLK period */
+static const uint32_t clks_cycles_factor = 2u;
 static const uint32_t clks_entry_point = 0;
 
-// TODO: Give a brief explanation of this pio program.
-// TODO: change numbers in comments to binary where appropriate.
+/* TX/RX I2S target program.
+ * Each pull/push transfers one 16/32 bit sample.
+ * DMA is configured with narrow writes when each sample is not 32 bits long. */
 RPI_PICO_PIO_DEFINE_PROGRAM(target, 4, 12,
 	0x20a2, //  0: wait   1 pin, 2
 	0x2022, //  1: wait   0 pin, 2
