@@ -316,7 +316,6 @@ static int dma_rpi_pico_init(const struct device *dev)
 	const struct dma_rpi_pico_config *cfg = dev->config;
 
 	(void)reset_line_toggle_dt(&cfg->reset);
-
 	cfg->irq_configure();
 
 	return 0;
