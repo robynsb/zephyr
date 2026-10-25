@@ -8,10 +8,11 @@
 #include <zephyr/ztest.h>
 #include <zephyr/types.h>
 
+/** Bookkeeping shared with the timer expiry/stop callbacks. */
 struct timer_data {
-	int expire_cnt;
-	int stop_cnt;
-	int64_t timestamp;
+	int expire_cnt;     /**< Number of times the expiry function ran. */
+	int stop_cnt;       /**< Number of times the stop function ran. */
+	int64_t timestamp;  /**< Uptime captured at the last expiry. */
 };
 
 #define DURATION 100
@@ -64,6 +65,7 @@ static struct k_timer status_timer;
 static struct k_timer status_anytime_timer;
 static struct k_timer status_sync_timer;
 static struct k_timer remain_timer;
+static struct k_timer overdue_timer;
 
 static ZTEST_BMEM struct timer_data tdata;
 
@@ -186,8 +188,11 @@ static void status_stop(struct k_timer *timer)
  *
  * @ingroup kernel_timer_tests
  *
- * @see k_timer_init(), k_timer_start(), k_timer_stop(), k_uptime_get(),
- * k_busy_wait()
+ * @see k_timer_init()
+ * @see k_timer_start()
+ * @see k_timer_stop()
+ * @see k_uptime_get()
+ * @see k_busy_wait()
  */
 ZTEST_USER(timer_api, test_timer_duration_period)
 {
@@ -214,7 +219,9 @@ ZTEST_USER(timer_api, test_timer_duration_period)
  *
  * @ingroup kernel_timer_tests
  *
- * @see k_timer_init(), k_timer_start(), k_timer_status_get()
+ * @see k_timer_init()
+ * @see k_timer_start()
+ * @see k_timer_status_get()
  */
 ZTEST(timer_api, test_timer_init_runtime)
 {
@@ -244,8 +251,11 @@ ZTEST(timer_api, test_timer_init_runtime)
  *
  * @ingroup kernel_timer_tests
  *
- * @see k_timer_init(), k_timer_start(), k_timer_stop, k_uptime_get(),
- * k_busy_wait()
+ * @see k_timer_init()
+ * @see k_timer_start()
+ * @see k_timer_stop()
+ * @see k_uptime_get()
+ * @see k_busy_wait()
  *
  */
 ZTEST_USER(timer_api, test_timer_restart)
@@ -279,8 +289,11 @@ ZTEST_USER(timer_api, test_timer_restart)
  *
  * @ingroup kernel_timer_tests
  *
- * @see k_timer_init(), k_timer_start(), k_timer_stop(), k_uptime_get(),
- * k_busy_wait()
+ * @see k_timer_init()
+ * @see k_timer_start()
+ * @see k_timer_stop()
+ * @see k_uptime_get()
+ * @see k_busy_wait()
  */
 ZTEST_USER(timer_api, test_timer_period_0)
 {
@@ -316,8 +329,11 @@ ZTEST_USER(timer_api, test_timer_period_0)
  *
  * @ingroup kernel_timer_tests
  *
- * @see k_timer_init(), k_timer_start(), k_timer_stop(), k_uptime_get(),
- * k_busy_wait()
+ * @see k_timer_init()
+ * @see k_timer_start()
+ * @see k_timer_stop()
+ * @see k_uptime_get()
+ * @see k_busy_wait()
  */
 ZTEST_USER(timer_api, test_timer_period_k_forever)
 {
@@ -355,8 +371,11 @@ ZTEST_USER(timer_api, test_timer_period_k_forever)
  *
  * @ingroup kernel_timer_tests
  *
- * @see k_timer_init(), k_timer_start(), k_timer_stop(), k_uptime_get(),
- * k_busy_wait()
+ * @see k_timer_init()
+ * @see k_timer_start()
+ * @see k_timer_stop()
+ * @see k_uptime_get()
+ * @see k_busy_wait()
  */
 ZTEST_USER(timer_api, test_timer_expirefn_null)
 {
@@ -399,8 +418,12 @@ static void tick_sync(void)
  *
  * @ingroup kernel_timer_tests
  *
- * @see k_timer_init(), k_timer_start(), k_timer_status_sync(),
- * k_timer_stop(), k_uptime_get(), k_uptime_delta()
+ * @see k_timer_init()
+ * @see k_timer_start()
+ * @see k_timer_status_sync()
+ * @see k_timer_stop()
+ * @see k_uptime_get()
+ * @see k_uptime_delta()
  */
 ZTEST_USER(timer_api, test_timer_periodicity)
 {
@@ -467,8 +490,11 @@ ZTEST_USER(timer_api, test_timer_periodicity)
  *
  * @ingroup kernel_timer_tests
  *
- * @see k_timer_init(), k_timer_start(), k_timer_status_get(),
- * k_timer_remaining_get(), k_timer_stop()
+ * @see k_timer_init()
+ * @see k_timer_start()
+ * @see k_timer_status_get()
+ * @see k_timer_remaining_get()
+ * @see k_timer_stop()
  */
 ZTEST_USER(timer_api, test_timer_status_get)
 {
@@ -496,8 +522,11 @@ ZTEST_USER(timer_api, test_timer_status_get)
  *
  * @ingroup kernel_timer_tests
  *
- * @see k_timer_init(), k_timer_start(), k_timer_status_get(),
- * k_timer_stop(), k_busy_wait()
+ * @see k_timer_init()
+ * @see k_timer_start()
+ * @see k_timer_status_get()
+ * @see k_timer_stop()
+ * @see k_busy_wait()
  */
 ZTEST_USER(timer_api, test_timer_status_get_anytime)
 {
@@ -530,8 +559,10 @@ ZTEST_USER(timer_api, test_timer_status_get_anytime)
  *
  * @ingroup kernel_timer_tests
  *
- * @see k_timer_init(), k_timer_start(), k_timer_status_sync(),
- * k_timer_stop()
+ * @see k_timer_init()
+ * @see k_timer_start()
+ * @see k_timer_status_sync()
+ * @see k_timer_stop()
  */
 ZTEST_USER(timer_api, test_timer_status_sync)
 {
@@ -570,8 +601,11 @@ ZTEST_USER(timer_api, test_timer_status_sync)
  *
  * @ingroup kernel_timer_tests
  *
- * @see k_timer_start(), K_TIMER_DEFINE(), k_timer_stop()
- * k_uptime_get(), k_busy_wait()
+ * @see k_timer_start()
+ * @see K_TIMER_DEFINE()
+ * @see k_timer_stop()
+ * @see k_uptime_get()
+ * @see k_busy_wait()
  */
 ZTEST_USER(timer_api, test_timer_k_define)
 {
@@ -654,8 +688,11 @@ static void user_data_timer_handler(struct k_timer *timer)
  *
  * @ingroup kernel_timer_tests
  *
- * @see K_TIMER_DEFINE(), k_timer_user_data_set(), k_timer_start(),
- * k_timer_user_data_get(), k_timer_stop()
+ * @see K_TIMER_DEFINE()
+ * @see k_timer_user_data_set()
+ * @see k_timer_start()
+ * @see k_timer_user_data_get()
+ * @see k_timer_stop()
  */
 ZTEST_USER(timer_api, test_timer_user_data)
 {
@@ -706,8 +743,10 @@ ZTEST_USER(timer_api, test_timer_user_data)
  *
  * @ingroup kernel_timer_tests
  *
- * @see k_timer_init(), k_timer_start(), k_timer_stop(),
- * k_timer_remaining_get()
+ * @see k_timer_init()
+ * @see k_timer_start()
+ * @see k_timer_stop()
+ * @see k_timer_remaining_get()
  */
 
 ZTEST_USER(timer_api, test_timer_remaining)
@@ -781,6 +820,41 @@ ZTEST_USER(timer_api, test_timer_remaining)
 	zassert_between_inclusive((int64_t)rem_ticks -
 				  ((int64_t)exp_ticks - (int64_t)now),
 				  0, latency_ticks, NULL);
+}
+
+/**
+ * @brief Overdue timers must report 0 remaining ticks, not a wrapped value
+ *
+ * Start a 1-tick timer, then hold IRQs and busy-wait so announce cannot
+ * run while time still advances. Remaining ticks must saturate at 0.
+ *
+ * @ingroup kernel_timer_tests
+ *
+ * @see k_timer_remaining_ticks()
+ */
+ZTEST(timer_api, test_timer_remaining_overdue)
+{
+	k_ticks_t rem;
+	k_ticks_t expires;
+	int64_t t1;
+	unsigned int key;
+
+	if (IS_ENABLED(CONFIG_MULTITHREADING)) {
+		k_usleep(1); /* align to tick */
+	}
+
+	k_timer_start(&overdue_timer, K_TICKS(1), K_NO_WAIT);
+
+	key = irq_lock();
+	k_busy_wait(k_ticks_to_us_ceil32(3));
+	t1 = k_uptime_ticks();
+	expires = k_timer_expires_ticks(&overdue_timer);
+	rem = k_timer_remaining_ticks(&overdue_timer);
+	k_timer_stop(&overdue_timer);
+	irq_unlock(key);
+
+	zassume_true(t1 > expires, "busy wait did not overshoot the timeout");
+	zassert_equal(rem, 0, "overdue remaining was %lld", (long long)rem);
 }
 
 ZTEST_USER(timer_api, test_timeout_abs)
@@ -996,7 +1070,8 @@ static void isr_ctx_expire(struct k_timer *timer)
  * expired, verify the callback ran and that it observed itself running in
  * interrupt context.
  *
- * @see k_timer_start(), k_is_in_isr()
+ * @see k_timer_start()
+ * @see k_is_in_isr()
  */
 ZTEST(timer_api, test_timer_expiry_in_isr)
 {
@@ -1015,6 +1090,30 @@ ZTEST(timer_api, test_timer_expiry_in_isr)
 		     "timer expiry function did not run in interrupt context");
 
 	k_timer_stop(&isr_ctx_timer);
+}
+
+static struct k_timer cleanup_timer;
+
+/**
+ * @brief Test releasing the resources associated with a timer
+ *
+ * @ingroup kernel_timer_tests
+ *
+ * @details Start and stop a timer so it has no pending waiters, then call
+ * k_timer_cleanup() and verify it succeeds (returns 0), indicating the timer's
+ * resources may be released.
+ *
+ * @see k_timer_cleanup()
+ */
+ZTEST(timer_api, test_timer_cleanup)
+{
+	k_timer_init(&cleanup_timer, NULL, NULL);
+	k_timer_start(&cleanup_timer, K_MSEC(DURATION), K_NO_WAIT);
+	k_timer_stop(&cleanup_timer);
+
+	/* No threads are waiting on the timer, so cleanup must succeed. */
+	zassert_equal(k_timer_cleanup(&cleanup_timer), 0,
+		      "cleanup of an idle timer should succeed");
 }
 
 #if defined(CONFIG_MULTITHREADING)
@@ -1046,7 +1145,8 @@ static void cleanup_waiter(void *p1, void *p2, void *p3)
  * timer, call k_timer_cleanup() and verify it returns -EAGAIN, indicating the
  * cleanup could not be performed. Then stop the timer to release the waiter.
  *
- * @see k_timer_cleanup(), k_timer_status_sync()
+ * @see k_timer_cleanup()
+ * @see k_timer_status_sync()
  */
 ZTEST(timer_api, test_timer_cleanup_pending)
 {
@@ -1099,6 +1199,7 @@ void *setup_timer_api(void)
 	timer_init(&status_anytime_timer, NULL, NULL);
 	timer_init(&status_sync_timer, duration_expire, duration_stop);
 	timer_init(&remain_timer, duration_expire, duration_stop);
+	timer_init(&overdue_timer, NULL, NULL);
 
 	if (IS_ENABLED(CONFIG_MULTITHREADING)) {
 		k_thread_access_grant(k_current_get(), &ktimer, &timer0, &timer1,

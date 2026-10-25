@@ -344,11 +344,18 @@ struct net_linger {
 #if !defined(NET_CMSG_NXTHDR)
 /**
  * Returns the next valid cmsghdr after the passed cmsghdr. It returns NULL
- * when there isn't enough space left in the buffer.
+ * when there isn't enough space left in the buffer, or when the length of
+ * the passed cmsghdr is not valid: too small to hold a header, as is the
+ * case in the unused, zeroed part of a buffer, or larger than what is left
+ * of the buffer.
  */
 #define NET_CMSG_NXTHDR(msghdr, cmsg)					 \
 	(((cmsg) == NULL) ? NET_CMSG_FIRSTHDR(msghdr) :			 \
-	 (((uint8_t *)(cmsg) + NET_ALIGN_H((cmsg)->cmsg_len) +		 \
+	 (((cmsg)->cmsg_len < sizeof(struct net_cmsghdr) ||		 \
+	   (cmsg)->cmsg_len > (size_t)((uint8_t *)((msghdr)->msg_control) + \
+				       (msghdr)->msg_controllen -	 \
+				       (uint8_t *)(cmsg)) ||		 \
+	   (uint8_t *)(cmsg) + NET_ALIGN_H((cmsg)->cmsg_len) +		 \
 	   NET_ALIGN_D(sizeof(struct net_cmsghdr)) >			 \
 	   (uint8_t *)((msghdr)->msg_control) + (msghdr)->msg_controllen) ? \
 	  NULL :							 \
@@ -647,7 +654,7 @@ struct net_udp_hdr {
 	uint16_t chksum;
 } __packed;
 
-/** @brief UDP Options Maximum Reassembled Datagram Size (MRDS), RFC 9868.
+/** @brief UDP Options Maximum Reassembled Datagram Size (MRDS), @rfc{9868}.
  *
  * Value type for the @c ZSOCK_UDP_OPT_MRDS socket option and the
  * @c ZSOCK_UDP_OPT_CMSG_MRDS ancillary control message.
@@ -659,7 +666,7 @@ struct net_udp_opt_mrds {
 	uint8_t segs;
 };
 
-/** @brief UDP Options Timestamp (TIME), RFC 9868.
+/** @brief UDP Options Timestamp (TIME), @rfc{9868}.
  *
  * Value type for the @c ZSOCK_UDP_OPT_CMSG_TIME ancillary control message.
  */
@@ -810,6 +817,30 @@ struct net_ipv6_mreq {
 	/** Network interface index of the local IPv6 address */
 	int ipv6mr_ifindex;
 };
+
+/**
+ * @brief Struct used when setting a packet socket multicast filtering.
+ */
+struct net_packet_mreq {
+	/** Network interface index */
+	int mr_ifindex;
+
+	/** Packet type (action) */
+	uint16_t mr_type;
+
+	/** Address length */
+	uint16_t mr_alen;
+
+	/** Physical layer address */
+	uint8_t mr_address[NET_LINK_ADDR_MAX_LENGTH];
+};
+
+/**
+ * @brief Packet socket multicast filtering types.
+ */
+#define NET_PACKET_MR_MULTICAST 0 /**< Packet will receive only certain multicast packets */
+#define NET_PACKET_MR_PROMISC   1 /**< Packet will receive all packets */
+#define NET_PACKET_MR_ALLMULTI  2 /**< Packet will receive all multicast packets */
 
 /**
  * @brief Incoming IPv6 packet information.
@@ -1177,7 +1208,7 @@ static inline bool net_ipv6_addr_cmp_raw(const uint8_t *addr1,
 /** @cond INTERNAL_HIDDEN */
 static inline bool net_ipv6_is_ll_addr_raw(const uint8_t *addr)
 {
-	return UNALIGNED_GET((uint16_t *)addr) == net_htons(0xFE80);
+	return (UNALIGNED_GET((uint16_t *)addr) & net_htons(0xFFC0)) == net_htons(0xFE80);
 }
 /** @endcond */
 
@@ -1202,7 +1233,7 @@ static inline bool net_ipv6_is_ll_addr(const struct net_in6_addr *addr)
  */
 static inline bool net_ipv6_is_sl_addr(const struct net_in6_addr *addr)
 {
-	return UNALIGNED_GET(&addr->s6_addr16[0]) == net_htons(0xFEC0);
+	return (UNALIGNED_GET(&addr->s6_addr16[0]) & net_htons(0xFFC0)) == net_htons(0xFEC0);
 }
 
 
@@ -1424,7 +1455,7 @@ static inline bool net_ipv6_is_addr_solicited_node_raw(const uint8_t *addr)
 
 /**
  *  @brief Check if the IPv6 address is solicited node multicast address
- *  FF02:0:0:0:0:1:FFXX:XXXX defined in RFC 3513
+ *  FF02:0:0:0:0:1:FFXX:XXXX defined in @rfc{3513}
  *
  *  @param addr IPv6 address.
  *
@@ -1702,7 +1733,7 @@ net_ipv6_is_addr_mcast_link_all_nodes(const struct net_in6_addr *addr)
 
 /**
  *  @brief Create solicited node IPv6 multicast address
- *  FF02:0:0:0:0:1:FFXX:XXXX defined in RFC 3513
+ *  FF02:0:0:0:0:1:FFXX:XXXX defined in @rfc{3513}
  *
  *  @param src IPv6 address.
  *  @param dst IPv6 address.
@@ -1822,7 +1853,7 @@ static inline void net_ipv6_addr_get_v4_mapped(const struct net_in6_addr *addr6,
 /**
  *  @brief Generate IPv6 address using a prefix and interface identifier.
  *         Interface identifier is either generated from EUI-64 (MAC) defined
- *         in RFC 4291 or from randomized value defined in RFC 7217.
+ *         in @rfc{4291} or from randomized value defined in @rfc{7217}.
  *
  *  @param iface Network interface
  *  @param prefix IPv6 prefix, can be left out in which case fe80::/64 is used
@@ -2185,7 +2216,8 @@ static inline bool net_sockaddr_cmp(const struct net_sockaddr *a, const struct n
 		return false;
 	}
 
-	if (a->sa_family == NET_AF_INET) {
+	switch (a->sa_family) {
+	case NET_AF_INET: {
 		const struct net_sockaddr_in *a4 = net_sin(a);
 		const struct net_sockaddr_in *b4 = net_sin(b);
 
@@ -2196,7 +2228,7 @@ static inline bool net_sockaddr_cmp(const struct net_sockaddr *a, const struct n
 		return net_ipv4_addr_cmp(&a4->sin_addr, &b4->sin_addr);
 	}
 
-	if (b->sa_family == NET_AF_INET6) {
+	case NET_AF_INET6: {
 		const struct net_sockaddr_in6 *a6 = net_sin6(a);
 		const struct net_sockaddr_in6 *b6 = net_sin6(b);
 
@@ -2207,8 +2239,10 @@ static inline bool net_sockaddr_cmp(const struct net_sockaddr *a, const struct n
 		return net_ipv6_addr_cmp(&a6->sin6_addr, &b6->sin6_addr);
 	}
 
-	/* Invalid address family */
-	return false;
+	default:
+		/* Invalid address family */
+		return false;
+	}
 }
 
 /**

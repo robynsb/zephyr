@@ -245,6 +245,12 @@
 @{
 @}
 
+@defgroup sensor_interface_ext_zephyr Zephyr
+@ingroup sensor_interface_ext
+@brief Device-specific extensions for sensors from Zephyr.
+@{
+@}
+
 @defgroup misc_interfaces Miscellaneous Devices
 @ingroup io_interfaces
 @brief Interfaces for hardware peripherals that do not have a dedicated driver class.
@@ -296,6 +302,13 @@
 @brief Transport layers for MCUmgr: SMP, UART, etc.
 @defgroup mcumgr_transport Transport layers
 @ingroup mcumgr
+@{
+@}
+
+@brief Management Component Transport Protocol (MCTP)
+@defgroup mctp MCTP
+@ingroup device_mgmt
+@details Bus bindings connecting Zephyr transports to the libmctp protocol stack.
 @{
 @}
 

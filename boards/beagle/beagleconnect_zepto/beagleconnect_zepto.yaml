@@ -21,3 +21,5 @@ supported:
   - watchdog
   - counter
   - gpio
+  - rtc
+  - adc

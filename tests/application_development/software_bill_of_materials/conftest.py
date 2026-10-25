@@ -6,7 +6,6 @@
 import os
 
 import pytest
-import yaml
 from packaging import version
 from spdx_tools.spdx.parser.parse_anything import parse_file
 
@@ -118,7 +117,7 @@ def zephyr_version():
         pytest.skip(f"Cannot read {version_file}")
 
     try:
-        return (
+        version = (
             f"{int(values['VERSION_MAJOR'])}"
             f".{int(values['VERSION_MINOR'])}"
             f".{int(values['PATCHLEVEL'])}"
@@ -126,16 +125,7 @@ def zephyr_version():
     except (KeyError, ValueError):
         pytest.skip(f"Cannot parse version from {version_file}")
 
-
-@pytest.fixture(scope="session")
-def zephyr_meta_remote(build_dir):
-    """Fixture providing the zephyr SCM URL from zephyr.meta, if any."""
-    meta_path = os.path.join(build_dir, "zephyr", "zephyr.meta")
-    try:
-        with open(meta_path) as f:
-            content = yaml.safe_load(f)
-    except OSError:
-        return None
-
-    zephyr = content.get("zephyr", {}) if content else {}
-    return zephyr.get("remote") or zephyr.get("url")
+    extra = values.get("EXTRAVERSION", "")
+    if extra:
+        version += f"-{extra}"
+    return version

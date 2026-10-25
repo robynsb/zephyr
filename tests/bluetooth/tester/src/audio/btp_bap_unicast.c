@@ -93,7 +93,7 @@ static void print_codec_cfg(const struct bt_audio_codec_cfg *codec_cfg)
 		}
 
 		ret = bt_audio_codec_cfg_get_frame_dur(codec_cfg);
-		if (ret > 0) {
+		if (ret >= 0) {
 			LOG_DBG("  Frame Duration: %d us",
 				bt_audio_codec_cfg_frame_dur_to_frame_dur_us(ret));
 		}
@@ -1425,7 +1425,7 @@ static int server_configure_codec(struct btp_bap_unicast_connection *u_conn, str
 				  uint8_t ase_id, struct bt_audio_codec_cfg *codec_cfg)
 {
 	struct btp_bap_unicast_stream *stream;
-	int err = 0;
+	int err = -EINVAL;
 
 	stream = btp_bap_unicast_stream_find(u_conn, ase_id);
 	if (stream == NULL) {
@@ -1444,13 +1444,16 @@ static int server_configure_codec(struct btp_bap_unicast_connection *u_conn, str
 			stream = btp_bap_unicast_stream_alloc(u_conn);
 			if (stream == NULL) {
 				LOG_DBG("No streams available");
-
-				return -ENOMEM;
+				err = -ENOMEM;
+				break;
 			}
 
 			memcpy(&stream->codec_cfg, codec_cfg, sizeof(*codec_cfg));
 			err = server_stream_config(conn, stream_unicast_to_bap(stream),
 						   &stream->codec_cfg, &qos_pref);
+			if (err != 0) {
+				break;
+			}
 		}
 	} else {
 		/* Reconfigure a stream */
@@ -1475,11 +1478,18 @@ uint8_t btp_ascs_configure_codec(const void *cmd, uint16_t cmd_len, void *rsp, u
 	struct btp_bap_unicast_connection *u_conn;
 	struct bt_audio_codec_cfg codec_cfg;
 
-	ARG_UNUSED(cmd_len);
 	ARG_UNUSED(rsp);
 	ARG_UNUSED(rsp_len);
 
 	LOG_DBG("");
+
+	if ((cmd_len < sizeof(*cp)) || (cmd_len != sizeof(*cp) + cp->cc_ltvs_len)) {
+		return BTP_STATUS_FAILED;
+	}
+
+	if (cp->cc_ltvs_len > sizeof(codec_cfg.data)) {
+		return BTP_STATUS_FAILED;
+	}
 
 	conn = bt_conn_lookup_addr_le(BT_ID_DEFAULT, &cp->address);
 	if (!conn) {

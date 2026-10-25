@@ -28,7 +28,7 @@
  * Driver Init:
  *   Do PINCTRL
  *   Check selections matches current HW config
- *   If match return succes
+ *   If match return success
  *   Else
  *     Configure both to Silicon OSC
  *     Application can request change with optional callback
@@ -210,7 +210,7 @@ static void ht_clean(const struct device *dev)
 }
 
 static int ht_wait_ready(const struct device *dev, uint16_t counts,
-			 int (*is_ready)(const struct device *))
+			 int (*is_ready)(const struct device *dev))
 {
 	const struct xec_pcr_config *drvcfg = dev->config;
 	mem_addr_t ht_base = drvcfg->htmr_base;
@@ -243,7 +243,7 @@ static int ht_wait_ready(const struct device *dev, uint16_t counts,
 }
 
 static int ht_wait_ready_ms(const struct device *dev, uint32_t ms,
-			    int (*is_ready)(const struct device *))
+			    int (*is_ready)(const struct device *dev))
 {
 	int ret = 0;
 	uint16_t ht_counts = 0;
@@ -446,7 +446,7 @@ static void connect_periph_32k_source(const struct device *dev, uint8_t periph_s
 /* When PLL source is changed:
  * 1. HW switches to ring oscillator
  * 2. HW restarts PLL with new source.
- * 3. When PLL lock becomes true HW swithes from ring oscillator to PLL.
+ * 3. When PLL lock becomes true HW switches from ring oscillator to PLL.
  * During 1 & 2 the CPU/PCR clock source is the ring oscillator.
  * This means the clock monitor measurements will not be accurate until PLL is locked.
  */

@@ -114,6 +114,9 @@ static int llext_copy_region(struct llext_loader *ldr, struct llext *ext,
 				 */
 				region_alloc = ROUND_UP(region_alloc, LLEXT_PMP_GRANULARITY);
 				region_align = MAX(region_align, LLEXT_PMP_GRANULARITY);
+			} else if (IS_ENABLED(CONFIG_XTENSA_MPU)) {
+				region_alloc = ROUND_UP(region_alloc, LLEXT_PAGE_SIZE);
+				region_align = MAX(region_align, LLEXT_PAGE_SIZE);
 			} else {
 				LOG_ERR("region %d: no memory protection alignment "
 					"rule for this architecture", mem_idx);
@@ -135,10 +138,6 @@ static int llext_copy_region(struct llext_loader *ldr, struct llext *ext,
 			/* Region has data in the file, check if peek() is supported */
 			ext->mem[mem_idx] = llext_peek(ldr, region->sh_offset);
 			if (ext->mem[mem_idx]) {
-				if (mem_idx == LLEXT_MEM_TEXT) {
-					ext->text_in_elf = ext->mem[mem_idx];
-				}
-
 				if ((IS_ALIGNED(ext->mem[mem_idx], region_align) ||
 				     ldr_parm->pre_located) &&
 				    ((mem_idx != LLEXT_MEM_TEXT) ||
@@ -300,12 +299,10 @@ int llext_copy_regions(struct llext_loader *ldr, struct llext *ext,
 				if (name == NULL) {
 					LOG_WRN("-s (out of bounds section name string table "
 						"index) %#zx",
-						(size_t)ext->mem[mem_idx] +
-							ldr->sect_map[i].offset);
+						(size_t)llext_loaded_sect_ptr(ldr, ext, i));
 				} else {
 					LOG_DBG("-s %s %#zx", name,
-						(size_t)ext->mem[mem_idx] +
-							ldr->sect_map[i].offset);
+						(size_t)llext_loaded_sect_ptr(ldr, ext, i));
 				}
 			}
 		}
@@ -332,7 +329,6 @@ void llext_adjust_mmu_permissions(struct llext *ext)
 #ifdef CONFIG_LLEXT_VENEERS
 		case LLEXT_MEM_VENEER:
 #endif
-			sys_cache_instr_invd_range(addr, size);
 			flags = K_MEM_PERM_EXEC;
 			break;
 		case LLEXT_MEM_DATA:
@@ -346,6 +342,12 @@ void llext_adjust_mmu_permissions(struct llext *ext)
 			continue;
 		}
 		sys_cache_data_flush_range(addr, size);
+		if ((flags & K_MEM_PERM_EXEC) != 0) {
+			/* new code must reach PoU (flush above) before the
+			 * stale instruction lines are dropped
+			 */
+			sys_cache_instr_invd_range(addr, size);
+		}
 		k_mem_update_flags(addr, size, flags);
 	}
 

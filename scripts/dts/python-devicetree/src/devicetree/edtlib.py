@@ -101,6 +101,16 @@ def _compute_hash(path: str) -> str:
     hasher.update(path.encode())
     return base64.b64encode(hasher.digest(), altchars=b'__').decode().rstrip('=')
 
+
+@dataclass
+class _LocalProps:
+    # The properties a binding declares on its own, before any
+    # 'include:' is merged in, and the same for its 'child-binding:'.
+
+    props: dict
+    child: Optional["_LocalProps"]
+
+
 #
 # Public classes
 #
@@ -188,6 +198,11 @@ class Binding:
       for example, ["i2c"] or ["i3c", "i2c"]. Or an empty list if there is
       no 'bus:' in this binding.
 
+    classes:
+      A list of the device class names declared by the binding's 'class:'
+      key, or an empty list if there is no 'class:'. 'class:' values from
+      included bindings are unioned into this list.
+
     on_bus:
       If nodes with this binding's 'compatible' appear on a bus, a string
       describing the bus type (like "i2c"). None otherwise.
@@ -201,7 +216,8 @@ class Binding:
 
     def __init__(self, path: Optional[str], fname2path: dict[str, str],
                  raw: Any = None, require_compatible: bool = True,
-                 require_description: bool = True, require_title: bool = False):
+                 require_description: bool = True, require_title: bool = False,
+                 local_props: Optional[_LocalProps] = None):
         """
         Binding constructor.
 
@@ -235,6 +251,12 @@ class Binding:
           "title:" line. If False, a missing "title:" is not an error.
           Either way, "title:" must be a string if it is present in
           the binding.
+
+        local_props:
+          Optional properties declared before any "include:" was merged
+          in. Must be given when 'raw' has already been merged, as is
+          the case for child bindings. May be left out, in which case
+          it is taken from 'raw'.
         """
         self.path: Optional[str] = path
         self._fname2path: dict[str, str] = fname2path
@@ -245,6 +267,12 @@ class Binding:
                 _err("you must provide either a 'path' or a 'raw' argument")
             with open(path, encoding="utf-8") as f:
                 raw = yaml.load(f, Loader=_BindingLoader)
+
+        # Save the properties declared locally, for this binding and any
+        # nested child bindings, before included files are merged in.
+        if local_props is None:
+            local_props = _local_props(raw)
+        self._local_props: _LocalProps = local_props
 
         # Merge any included files into self.raw. This also pulls in
         # inherited child binding definitions, so it has to be done
@@ -262,7 +290,8 @@ class Binding:
                 path, fname2path,
                 raw=raw["child-binding"],
                 require_compatible=False,
-                require_description=False)
+                require_description=False,
+                local_props=local_props.child or _LocalProps({}, None))
         else:
             self.child_binding = None
 
@@ -316,6 +345,14 @@ class Binding:
         "See the class docstring"
         if self.raw.get('bus') is not None:
             return self._buses
+        else:
+            return []
+
+    @property
+    def classes(self) -> list[str]:
+        "See the class docstring"
+        if self.raw.get('class') is not None:
+            return self._classes
         else:
             return []
 
@@ -448,7 +485,8 @@ class Binding:
         # Allowed top-level keys. The 'include' key should have been
         # removed by _load_raw() already.
         ok_top = {"title", "description", "compatible", "bus",
-                  "on-bus", "properties", "child-binding", "examples"}
+                  "on-bus", "class", "properties", "child-binding",
+                  "examples"}
 
         # Descriptive errors for legacy bindings.
         legacy_errors = {
@@ -487,6 +525,27 @@ class Binding:
             _err(f"malformed 'on-bus:' value in {self.path}, "
                  "expected string")
 
+        if "class" in raw:
+            cls = raw["class"]
+            if isinstance(cls, str):
+                classes = [cls]
+            elif (isinstance(cls, list)
+                  and all(isinstance(elem, str) for elem in cls)):
+                classes = cls
+            else:
+                _err(f"malformed 'class:' value in {self.path}, "
+                     "expected string or list of strings")
+            for elem in classes:
+                if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", elem):
+                    _err(f"malformed device class name '{elem}' in "
+                         f"{self.path}, expected lowercase letters, "
+                         "digits, '-' and '_', starting with a letter "
+                         "or digit")
+            if len(set(classes)) != len(classes):
+                _err(f"duplicate device class names in 'class:' in "
+                     f"{self.path}")
+            self._classes = classes
+
         self._check_properties()
 
         for key, val in raw.items():
@@ -516,7 +575,8 @@ class Binding:
                          f"'properties: {prop_name}: ...' in {self.path}, "
                          f"expected one of {', '.join(ok_prop_keys)}")
 
-            _check_prop_by_type(prop_name, options, self.path)
+            _check_prop_by_type(prop_name, options, self.path,
+                                self._local_props.props.get(prop_name) or {})
 
             for true_false_opt in ["required", "deprecated"]:
                 if true_false_opt in options:
@@ -1173,6 +1233,10 @@ class Node:
       returning the value of the first 'bus:' key found. If none of the node's
       parents has a 'bus:' key, this attribute is an empty list.
 
+    classes:
+      A list of the device class names declared by the node's binding
+      (including the binding's included files), or an empty list.
+
     on_bus:
       Resolved bus type for this node, or None if the node is not on a bus.
       If the binding sets 'on-bus', that value is validated against the parent
@@ -1230,6 +1294,7 @@ class Node:
         self.dep_ordinal: int = -1
         self.compats: list[str] = compats
         self.ranges: list[Range] = []
+        self.dma_ranges: list[Range] = []
         self.regs: list[Register] = []
         self.props: dict[str, Property] = {}
         self.interrupts: list[ControllerAndData] = []
@@ -1240,6 +1305,7 @@ class Node:
         self._init_binding()
         self._init_regs()
         self._init_ranges()
+        self._init_dma_ranges()
 
     @property
     def name(self) -> str:
@@ -1398,6 +1464,13 @@ class Node:
         "See the class docstring"
         bus_node = self.bus_node
         return bus_node.buses if bus_node else []
+
+    @property
+    def classes(self) -> list[str]:
+        "See the class docstring"
+        if self._binding:
+            return self._binding.classes
+        return []
 
     @property
     def on_bus(self) -> Optional[str]:
@@ -1848,7 +1921,7 @@ class Node:
         prop_min_len = prop_spec.min_len
         prop_max_len = prop_spec.max_len
         if prop_min_len is not None or prop_max_len is not None:
-            if isinstance(val, (list, bytes)):
+            if isinstance(val, list | bytes):
                 val_len = len(val)
                 if prop_min_len is not None and val_len < prop_min_len:
                     _err(f"value of property '{name}' on {self.path} in "
@@ -2075,6 +2148,67 @@ class Node:
                     raw_range[(4*child_address_cells + 4*parent_address_cells):])
 
             self.ranges.append(Range(self, child_bus_cells, child_bus_addr,
+                                     parent_bus_cells, parent_bus_addr,
+                                     length_cells, length))
+
+    def _init_dma_ranges(self) -> None:
+        # Initializes self.dma_ranges
+        node = self._node
+
+        self.dma_ranges = []
+
+        if "dma-ranges" not in node.props:
+            return
+
+        raw_child_address_cells = node.props.get("#address-cells")
+        parent_address_cells = _address_cells(node)
+        if raw_child_address_cells is None:
+            child_address_cells = 2  # Default value per DT spec.
+        else:
+            child_address_cells = raw_child_address_cells.to_num()
+        raw_child_size_cells = node.props.get("#size-cells")
+        if raw_child_size_cells is None:
+            child_size_cells = 1  # Default value per DT spec.
+        else:
+            child_size_cells = raw_child_size_cells.to_num()
+
+        entry_cells = child_address_cells + parent_address_cells + child_size_cells
+
+        if entry_cells == 0:
+            if len(node.props["dma-ranges"].value) == 0:
+                return
+            else:
+                _err(f"'dma-ranges' should be empty in {self._node.path} since "
+                     f"<#address-cells> = {child_address_cells}, "
+                     f"<#address-cells for parent> = {parent_address_cells} and "
+                     f"<#size-cells> = {child_size_cells}")
+
+        for raw_range in _slice(node, "dma-ranges", 4*entry_cells,
+                                f"4*(<#address-cells> (= {child_address_cells}) + "
+                                "<#address-cells for parent> "
+                                f"(= {parent_address_cells}) + "
+                                f"<#size-cells> (= {child_size_cells}))"):
+
+            child_bus_cells = child_address_cells
+            if child_address_cells == 0:
+                child_bus_addr = None
+            else:
+                child_bus_addr = to_num(raw_range[:4*child_address_cells])
+            parent_bus_cells = parent_address_cells
+            if parent_address_cells == 0:
+                parent_bus_addr = None
+            else:
+                parent_bus_addr = to_num(
+                    raw_range[(4*child_address_cells):
+                              (4*child_address_cells + 4*parent_address_cells)])
+            length_cells = child_size_cells
+            if child_size_cells == 0:
+                length = None
+            else:
+                length = to_num(
+                    raw_range[(4*child_address_cells + 4*parent_address_cells):])
+
+            self.dma_ranges.append(Range(self, child_bus_cells, child_bus_addr,
                                      parent_bus_cells, parent_bus_addr,
                                      length_cells, length))
 
@@ -3027,6 +3161,24 @@ def _check_prop_filter(name: str, value: Optional[list[str]],
         _err(f"'{name}' value {value} in '{binding_path}' should be a list")
 
 
+def _local_props(raw: Any) -> _LocalProps:
+    # Returns the properties 'raw' declares on its own, and the same for
+    # any nested 'child-binding:'. Each entry is copied, as
+    # _merge_props() merges into them in place.
+
+    if not isinstance(raw, dict):
+        return _LocalProps({}, None)
+
+    return _LocalProps(
+        {
+            name: dict(options)
+            for name, options in (raw.get("properties") or {}).items()
+            if isinstance(options, dict)
+        },
+        _local_props(raw["child-binding"]) if "child-binding" in raw else None,
+    )
+
+
 def _merge_props(to_dict: dict,
                  from_dict: dict,
                  parent: Optional[str],
@@ -3036,6 +3188,11 @@ def _merge_props(to_dict: dict,
     #
     # If 'from_dict' and 'to_dict' contain a 'required:' key for the same
     # property, then the values are ORed together.
+    #
+    # 'class:' values at a binding root (top level or a child-binding
+    # level) are unioned instead of overwritten, so that a binding which
+    # includes several class base bindings is a member of all of their
+    # classes.
     #
     # If 'check_required' is True, then an error is raised if 'from_dict' has
     # 'required: true' while 'to_dict' has 'required: false'. This prevents
@@ -3057,6 +3214,8 @@ def _merge_props(to_dict: dict,
                          check_required)
         elif prop not in to_dict:
             to_dict[prop] = from_dict[prop]
+        elif prop == "class" and parent in (None, "child-binding"):
+            to_dict[prop] = _merge_class(to_dict[prop], from_dict[prop])
         elif _bad_overwrite(to_dict, from_dict, prop, check_required):
             _err(f"'{binding_path}' (in '{parent}'): '{prop}' "
                  f"from included file overwritten ('{from_dict[prop]}' "
@@ -3071,6 +3230,18 @@ def _merge_props(to_dict: dict,
 
             # 'required: true' takes precedence
             to_dict["required"] = to_dict["required"] or from_dict["required"]
+
+
+def _merge_class(to_val: Union[str, list], from_val: Union[str, list]) -> list:
+    # _merge_props() helper. Returns the union of two top-level 'class:'
+    # values, each a string or a list of strings, preserving order and
+    # dropping duplicates. Values in 'to_val' come first.
+
+    res = list(to_val) if isinstance(to_val, list) else [to_val]
+    for elem in (from_val if isinstance(from_val, list) else [from_val]):
+        if elem not in res:
+            res.append(elem)
+    return res
 
 
 def _bad_overwrite(to_dict: dict, from_dict: dict, prop: str,
@@ -3116,7 +3287,8 @@ def _is_plain_int(val: Any) -> TypeGuard[int]:
 
 def _check_prop_by_type(prop_name: str,
                         options: dict,
-                        binding_path: Optional[str]) -> None:
+                        binding_path: Optional[str],
+                        local_options: dict) -> None:
     # Binding._check_properties() helper. Checks 'type:', 'default:',
     # 'const:', 'specifier-space:', 'min:' and 'max:' for the property
     # named 'prop_name'
@@ -3241,7 +3413,9 @@ def _check_prop_by_type(prop_name: str,
              f"'type: {prop_type}' for '{prop_name}' in "
              f"'properties:' in '{binding_path}'")
 
-    if options.get("required"):
+    # Overriding an inherited 'default:' with 'required: true' is well
+    # defined, so only report a binding that declares both itself.
+    if local_options.get("required") and "default" in local_options:
         _LOG.warning(f"Property '{prop_name}' is required in '{binding_path}', "
                      "it should not have a default value")
 

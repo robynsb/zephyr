@@ -224,7 +224,7 @@ int mfd_rv3028_read_regs(const struct device *dev, uint8_t addr, void *buf, size
 
 	err = i2c_write_read_dt(&config->i2c, &addr, sizeof(addr), buf, len);
 	if (err) {
-		LOG_ERR("failed to read reg addr 0x%02x, len %d (err %d)", addr, len, err);
+		LOG_ERR("failed to read reg addr 0x%02x, len %zu (err %d)", addr, len, err);
 		return err;
 	}
 
@@ -247,7 +247,7 @@ int mfd_rv3028_write_regs(const struct device *dev, uint8_t addr, const void *bu
 
 	err = i2c_write_dt(&config->i2c, block, sizeof(block));
 	if (err) {
-		LOG_ERR("failed to write reg addr 0x%02x, len %d (err %d)", addr, len, err);
+		LOG_ERR("failed to write reg addr 0x%02x, len %zu (err %d)", addr, len, err);
 		return err;
 	}
 
@@ -531,7 +531,7 @@ static int mfd_rv3028_init(const struct device *dev)
 		.backup = RV3028_BACKUP_FROM_DT_INST(inst),                                        \
 		.cof = DT_INST_ENUM_IDX_OR(inst, clkout_frequency, RV3028_CLKOUT_FD_LOW),          \
 		IF_ENABLED(RV3028_INT_GPIOS_IN_USE, (.gpio_int = GPIO_DT_SPEC_INST_GET_OR(inst,    \
-						    int_gpios, {0}))),              \
+						    int_gpios, {0}),))                             \
 	};                                                                                         \
                                                                                                    \
 	static struct mfd_rv3028_data mfd_rv3028_data##inst;                                       \

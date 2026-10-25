@@ -587,8 +587,10 @@ int net_context_get(net_sa_family_t family, enum net_sock_type type, uint16_t pr
 			IS_ENABLED(CONFIG_NET_INITIAL_IPV4_MCAST_LOOP);
 #endif
 		if (IS_ENABLED(CONFIG_NET_IP)) {
-			(void)memset(&contexts[i].remote, 0, sizeof(struct net_sockaddr));
-			(void)memset(&contexts[i].local, 0, sizeof(struct net_sockaddr));
+			(void)memset(&contexts[i].remote_storage, 0,
+				     sizeof(contexts[i].remote_storage));
+			(void)memset(&contexts[i].local_storage, 0,
+				     sizeof(contexts[i].local_storage));
 
 			if (IS_ENABLED(CONFIG_NET_IPV6) && family == NET_AF_INET6) {
 				struct net_sockaddr_in6 *addr6 =
@@ -792,7 +794,7 @@ static int bind_default(struct net_context *context)
 	}
 
 	if (IS_ENABLED(CONFIG_NET_IPV6) && family == NET_AF_INET6) {
-		struct net_sockaddr_in6 addr6;
+		struct net_sockaddr_in6 addr6 = { 0 };
 
 		addr6.sin6_family = NET_AF_INET6;
 		memcpy(&addr6.sin6_addr, net_ipv6_unspecified_address(),
@@ -806,7 +808,7 @@ static int bind_default(struct net_context *context)
 	}
 
 	if (IS_ENABLED(CONFIG_NET_IPV4) && family == NET_AF_INET) {
-		struct net_sockaddr_in addr4;
+		struct net_sockaddr_in addr4 = { 0 };
 
 		addr4.sin_family = NET_AF_INET;
 		addr4.sin_addr.s_addr = NET_INADDR_ANY;
@@ -819,7 +821,7 @@ static int bind_default(struct net_context *context)
 	}
 
 	if (IS_ENABLED(CONFIG_NET_SOCKETS_PACKET) && family == NET_AF_PACKET) {
-		struct net_sockaddr_ll ll_addr;
+		struct net_sockaddr_ll ll_addr = { 0 };
 		struct net_if *iface = net_context_get_iface(context);
 
 		ll_addr.sll_family = NET_AF_PACKET;
@@ -1268,19 +1270,19 @@ int net_context_bind(struct net_context *context, const struct net_sockaddr *add
 
 static inline struct net_context *find_context(void *conn_handler)
 {
-	int i;
+	struct net_conn *conn = conn_handler;
+	struct net_context *context = conn->context;
 
-	for (i = 0; i < NET_MAX_CONTEXT; i++) {
-		if (!net_context_is_used(&contexts[i])) {
-			continue;
-		}
-
-		if (contexts[i].conn_handler == conn_handler) {
-			return &contexts[i];
-		}
+	/* The connection already points back at its owning context; just
+	 * apply the same validity checks the previous linear scan of
+	 * contexts[] performed.
+	 */
+	if (context == NULL || !net_context_is_used(context) ||
+	    context->conn_handler != conn_handler) {
+		return NULL;
 	}
 
-	return NULL;
+	return context;
 }
 
 int net_context_listen(struct net_context *context, int backlog)
@@ -1429,7 +1431,8 @@ int net_context_connect(struct net_context *context,
 			void *user_data)
 {
 	struct net_sockaddr *laddr = NULL;
-	struct net_sockaddr local_addr __unused;
+	struct net_sockaddr_storage local_addr_storage __maybe_unused = { 0 };
+	struct net_sockaddr *local_addr = net_sad(&local_addr_storage);
 	uint16_t lport, rport;
 	int ret;
 
@@ -1455,7 +1458,7 @@ int net_context_connect(struct net_context *context,
 	if (IS_ENABLED(CONFIG_NET_UDP) && addr->sa_family == NET_AF_UNSPEC &&
 	    net_context_get_type(context) == NET_SOCK_DGRAM) {
 		context->flags &= ~NET_CONTEXT_REMOTE_ADDR_SET;
-		memset(&context->remote, 0, sizeof(context->remote));
+		memset(&context->remote_storage, 0, sizeof(context->remote_storage));
 		ret = 0;
 		goto unlock;
 	}
@@ -1520,15 +1523,15 @@ int net_context_connect(struct net_context *context,
 		}
 
 		net_sin6(&context->local)->sin6_family = NET_AF_INET6;
-		net_sin6(&local_addr)->sin6_family = NET_AF_INET6;
-		net_sin6(&local_addr)->sin6_port = lport =
+		net_sin6(local_addr)->sin6_family = NET_AF_INET6;
+		net_sin6(local_addr)->sin6_port = lport =
 			net_sin6(&context->local)->sin6_port;
 
 		if (net_context_is_local_addr_set(context)) {
-			net_ipaddr_copy(&net_sin6(&local_addr)->sin6_addr,
+			net_ipaddr_copy(&net_sin6(local_addr)->sin6_addr,
 				     &net_sin6(&context->local)->sin6_addr);
 
-			laddr = &local_addr;
+			laddr = local_addr;
 		}
 	} else if (IS_ENABLED(CONFIG_NET_IPV4) &&
 		   net_context_get_family(context) == NET_AF_INET) {
@@ -1568,15 +1571,15 @@ int net_context_connect(struct net_context *context,
 		}
 
 		net_sin(&context->local)->sin_family = NET_AF_INET;
-		net_sin(&local_addr)->sin_family = NET_AF_INET;
-		net_sin(&local_addr)->sin_port = lport =
+		net_sin(local_addr)->sin_family = NET_AF_INET;
+		net_sin(local_addr)->sin_port = lport =
 			net_sin(&context->local)->sin_port;
 
 		if (net_context_is_local_addr_set(context)) {
-			net_ipaddr_copy(&net_sin(&local_addr)->sin_addr,
+			net_ipaddr_copy(&net_sin(local_addr)->sin_addr,
 				       &net_sin(&context->local)->sin_addr);
 
-			laddr = &local_addr;
+			laddr = local_addr;
 		}
 	} else {
 		ret = -EINVAL; /* Not IPv4 or IPv6 */
@@ -2394,6 +2397,39 @@ static int context_setup_udp_options(struct net_context *context,
 }
 #endif /* CONFIG_NET_UDP_OPTIONS */
 
+static bool get_msg_src_addr_hint(const struct net_msghdr *msg, net_sa_family_t family,
+				  struct net_in6_addr *src6, struct net_in_addr *src4)
+{
+	struct net_cmsghdr *cmsg;
+
+	if (msg == NULL || msg->msg_control == NULL) {
+		return false;
+	}
+
+	for (cmsg = NET_CMSG_FIRSTHDR(msg); cmsg != NULL; cmsg = NET_CMSG_NXTHDR(msg, cmsg)) {
+		if (IS_ENABLED(CONFIG_NET_IPV6) && family == NET_AF_INET6 &&
+		    cmsg->cmsg_level == NET_IPPROTO_IPV6 && cmsg->cmsg_type == ZSOCK_IPV6_PKTINFO &&
+		    cmsg->cmsg_len == NET_CMSG_LEN(sizeof(struct net_in6_pktinfo))) {
+			struct net_in6_pktinfo *info =
+				(struct net_in6_pktinfo *)NET_CMSG_DATA(cmsg);
+
+			*src6 = info->ipi6_addr;
+			return true;
+		}
+
+		if (IS_ENABLED(CONFIG_NET_IPV4) && family == NET_AF_INET &&
+		    cmsg->cmsg_level == NET_IPPROTO_IP && cmsg->cmsg_type == ZSOCK_IP_PKTINFO &&
+		    cmsg->cmsg_len == NET_CMSG_LEN(sizeof(struct net_in_pktinfo))) {
+			struct net_in_pktinfo *info = (struct net_in_pktinfo *)NET_CMSG_DATA(cmsg);
+
+			*src4 = info->ipi_spec_dst;
+			return true;
+		}
+	}
+
+	return false;
+}
+
 static int context_setup_udp_packet(struct net_context *context,
 				    net_sa_family_t family,
 				    struct net_pkt *pkt,
@@ -2406,20 +2442,37 @@ static int context_setup_udp_packet(struct net_context *context,
 {
 	int ret = -EINVAL;
 	uint16_t dst_port = 0U;
+	struct net_in6_addr src6;
+	struct net_in_addr src4;
+	bool have_src = get_msg_src_addr_hint(msg, family, &src6, &src4);
 
 	if (IS_ENABLED(CONFIG_NET_IPV6) && family == NET_AF_INET6) {
 		struct net_sockaddr_in6 *addr6 = (struct net_sockaddr_in6 *)dst_addr;
 
 		dst_port = addr6->sin6_port;
 
-		ret = context_create_ipv6_new(context, pkt, NULL,
+		/* Only honor the hint if the address is still owned by this
+		 * packet's interface; otherwise fall back to normal source
+		 * selection, e.g. if it was removed by a rebind in the meantime.
+		 */
+		if (have_src &&
+		    net_if_ipv6_addr_lookup_by_iface(net_pkt_iface(pkt), &src6) == NULL) {
+			have_src = false;
+		}
+
+		ret = context_create_ipv6_new(context, pkt, have_src ? &src6 : NULL,
 					      &addr6->sin6_addr, dont_fragment);
 	} else if (IS_ENABLED(CONFIG_NET_IPV4) && family == NET_AF_INET) {
 		struct net_sockaddr_in *addr4 = (struct net_sockaddr_in *)dst_addr;
 
 		dst_port = addr4->sin_port;
 
-		ret = context_create_ipv4_new(context, pkt, NULL,
+		if (have_src &&
+		    net_if_ipv4_addr_lookup_by_iface(net_pkt_iface(pkt), &src4) == NULL) {
+			have_src = false;
+		}
+
+		ret = context_create_ipv4_new(context, pkt, have_src ? &src4 : NULL,
 					      &addr4->sin_addr, dont_fragment);
 	}
 
@@ -2870,6 +2923,7 @@ static int context_sendto(struct net_context *context,
 	net_sa_family_t family;
 	size_t alloc_len;
 	size_t tmp_len;
+	uint16_t proto;
 	int ret;
 #if defined(CONFIG_NET_UDP_OPTIONS)
 	struct net_udp_opt_info udp_opts = { 0 };
@@ -3178,8 +3232,9 @@ static int context_sendto(struct net_context *context,
 	context->send_cb = cb;
 	context->user_data = user_data;
 
-	if (IS_ENABLED(CONFIG_NET_TCP) &&
-	    net_context_get_proto(context) == NET_IPPROTO_TCP &&
+	proto = net_context_get_proto(context);
+
+	if (IS_ENABLED(CONFIG_NET_TCP) && proto == NET_IPPROTO_TCP &&
 	    !net_if_is_ip_offloaded(net_context_get_iface(context))) {
 		goto skip_alloc;
 	}
@@ -3190,8 +3245,7 @@ static int context_sendto(struct net_context *context,
 		return -ENOBUFS;
 	}
 
-	tmp_len = net_pkt_available_payload_buffer(
-				pkt, net_context_get_proto(context));
+	tmp_len = net_pkt_available_payload_buffer(pkt, proto);
 	if (tmp_len < alloc_len) {
 		if (net_context_get_type(context) == NET_SOCK_DGRAM ||
 		    net_context_get_type(context) == NET_SOCK_RAW) {
@@ -3257,8 +3311,7 @@ skip_alloc:
 		}
 
 		ret = net_try_send_data(pkt, timeout);
-	} else if (IS_ENABLED(CONFIG_NET_UDP) &&
-	    net_context_get_proto(context) == NET_IPPROTO_UDP) {
+	} else if (IS_ENABLED(CONFIG_NET_UDP) && proto == NET_IPPROTO_UDP) {
 		ret = context_setup_udp_packet(context, family, pkt, buf, len, msghdr,
 					       dst_addr, addrlen, dont_fragment);
 		if (ret < 0) {
@@ -3273,8 +3326,7 @@ skip_alloc:
 		}
 
 		ret = net_try_send_data(pkt, timeout);
-	} else if (IS_ENABLED(CONFIG_NET_TCP) &&
-		   net_context_get_proto(context) == NET_IPPROTO_TCP) {
+	} else if (IS_ENABLED(CONFIG_NET_TCP) && proto == NET_IPPROTO_TCP) {
 
 		ret = net_tcp_queue(context, buf, len, msghdr);
 		if (ret < 0) {
@@ -3918,6 +3970,7 @@ enum net_verdict net_context_packet_received(struct net_conn *conn,
 					     void *user_data)
 {
 	struct net_context *context = find_context(conn);
+	net_context_recv_cb_t recv_cb;
 	enum net_verdict verdict = NET_DROP;
 
 	NET_ASSERT(context);
@@ -3928,9 +3981,6 @@ enum net_verdict net_context_packet_received(struct net_conn *conn,
 	net_context_set_iface(context, net_pkt_iface(pkt));
 	net_pkt_set_context(pkt, context);
 
-	/* If there is no callback registered, then we can only drop
-	 * the packet.
-	 */
 	if (!context_allow_udp_options(context, pkt)) {
 		goto unlock;
 	}
@@ -3942,7 +3992,14 @@ enum net_verdict net_context_packet_received(struct net_conn *conn,
 	}
 #endif /* CONFIG_NET_UDP_OPTIONS_DPLPMTUD */
 
-	if (!context->recv_cb) {
+	/* If there is no callback registered, then we can only drop
+	 * the packet.
+	 *
+	 * Snapshot the callback while holding the context lock. Another thread
+	 * may disable receiving immediately after the unlock below.
+	 */
+	recv_cb = context->recv_cb;
+	if (!recv_cb) {
 		goto unlock;
 	}
 
@@ -3957,7 +4014,7 @@ enum net_verdict net_context_packet_received(struct net_conn *conn,
 
 	k_mutex_unlock(&context->lock);
 
-	context->recv_cb(context, pkt, ip_hdr, proto_hdr, 0, user_data);
+	recv_cb(context, pkt, ip_hdr, proto_hdr, 0, user_data);
 
 	verdict = NET_OK;
 
@@ -3975,9 +4032,10 @@ static int recv_dgram(struct net_context *context,
 		      k_timeout_t timeout,
 		      void *user_data)
 {
-	struct net_sockaddr local_addr = {
-		.sa_family = net_context_get_family(context),
+	struct net_sockaddr_storage local_addr_storage = {
+		.ss_family = net_context_get_family(context),
 	};
+	struct net_sockaddr *local_addr = net_sad(&local_addr_storage);
 	struct net_sockaddr *laddr = NULL;
 	uint16_t lport = 0U;
 	int ret;
@@ -3992,22 +4050,22 @@ static int recv_dgram(struct net_context *context,
 	if (IS_ENABLED(CONFIG_NET_IPV6) &&
 	    net_context_get_family(context) == NET_AF_INET6) {
 		if (net_context_is_local_addr_set(context)) {
-			net_ipaddr_copy(&net_sin6(&local_addr)->sin6_addr,
+			net_ipaddr_copy(&net_sin6(local_addr)->sin6_addr,
 				     &net_sin6(&context->local)->sin6_addr);
 
-			laddr = &local_addr;
+			laddr = local_addr;
 		}
 
-		net_sin6(&local_addr)->sin6_port =
+		net_sin6(local_addr)->sin6_port =
 			net_sin6(&context->local)->sin6_port;
 		lport = net_sin6(&context->local)->sin6_port;
 	} else if (IS_ENABLED(CONFIG_NET_IPV4) &&
 		   net_context_get_family(context) == NET_AF_INET) {
 		if (net_context_is_local_addr_set(context)) {
-			net_ipaddr_copy(&net_sin(&local_addr)->sin_addr,
+			net_ipaddr_copy(&net_sin(local_addr)->sin_addr,
 				      &net_sin(&context->local)->sin_addr);
 
-			laddr = &local_addr;
+			laddr = local_addr;
 		}
 
 		lport = net_sin(&context->local)->sin_port;

@@ -74,7 +74,15 @@
 	status = "okay";
 };
 
+&vreg {
+	status = "okay";
+};
+
 &rng {
+	status = "okay";
+};
+
+&die_temp {
 	status = "okay";
 };
 

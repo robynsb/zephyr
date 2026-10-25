@@ -39,13 +39,11 @@ extern "C" {
 #define sys_port_trace_k_thread_join_exit(thread, timeout, ret)                                    \
 	sys_trace_k_thread_join_exit(thread, timeout, ret)
 
-#define sys_port_trace_k_thread_sleep_enter(timeout)     sys_trace_k_thread_sleep_enter(timeout)
-#define sys_port_trace_k_thread_sleep_exit(timeout, ret) sys_trace_k_thread_sleep_exit(timeout, ret)
+#define sys_port_trace_k_thread_sleep_ticks_enter(timeout)                                         \
+	sys_trace_k_thread_sleep_ticks_enter(timeout)
+#define sys_port_trace_k_thread_sleep_ticks_exit(timeout, ret)                                     \
+	sys_trace_k_thread_sleep_ticks_exit(timeout, ret)
 
-#define sys_port_trace_k_thread_msleep_enter(ms)     sys_trace_k_thread_msleep_enter(ms)
-#define sys_port_trace_k_thread_msleep_exit(ms, ret) sys_trace_k_thread_msleep_exit(ms, ret)
-#define sys_port_trace_k_thread_usleep_enter(us)     sys_trace_k_thread_usleep_enter(us)
-#define sys_port_trace_k_thread_usleep_exit(us, ret) sys_trace_k_thread_usleep_exit(us, ret)
 #define sys_port_trace_k_thread_busy_wait_enter(usec_to_wait)                                      \
 	sys_trace_k_thread_busy_wait_enter(usec_to_wait)
 #define sys_port_trace_k_thread_busy_wait_exit(usec_to_wait)                                       \
@@ -314,12 +312,8 @@ void sys_trace_k_thread_heap_assign(struct k_thread *thread, struct k_heap *heap
 void sys_trace_k_thread_join_blocking(struct k_thread *thread, k_timeout_t timeout);
 void sys_trace_k_thread_join_enter(struct k_thread *thread, k_timeout_t timeout);
 void sys_trace_k_thread_join_exit(struct k_thread *thread, k_timeout_t timeout, int ret);
-void sys_trace_k_thread_sleep_enter(k_timeout_t timeout);
-void sys_trace_k_thread_sleep_exit(k_timeout_t timeout, int ret);
-void sys_trace_k_thread_msleep_enter(int32_t ms);
-void sys_trace_k_thread_msleep_exit(int32_t ms, int ret);
-void sys_trace_k_thread_usleep_enter(int32_t us);
-void sys_trace_k_thread_usleep_exit(int32_t us, int ret);
+void sys_trace_k_thread_sleep_ticks_enter(k_timeout_t timeout);
+void sys_trace_k_thread_sleep_ticks_exit(k_timeout_t timeout, int ret);
 void sys_trace_k_thread_busy_wait_enter(uint32_t usec_to_wait);
 void sys_trace_k_thread_busy_wait_exit(uint32_t usec_to_wait);
 void sys_trace_k_thread_yield(void);
@@ -1017,7 +1011,10 @@ void sys_trace_rtio_submit_enter(const struct rtio *r, uint32_t wait_count);
 void sys_trace_rtio_submit_exit(const struct rtio *r);
 void sys_trace_rtio_sqe_acquire_enter(const struct rtio *r);
 void sys_trace_rtio_sqe_acquire_exit(const struct rtio *r, const struct rtio_sqe *sqe);
-void sys_trace_rtio_sqe_cancel(const struct rtio_sqe *sqe);
+/* Takes the raw rtio_sqe_handle_t value; typed as uint32_t here to avoid pulling
+ * the RTIO headers (which use these tracing hooks) into every tracing user.
+ */
+void sys_trace_rtio_sqe_cancel(uint32_t handle);
 void sys_trace_rtio_cqe_submit_enter(const struct rtio *r, int result, uint32_t flags);
 void sys_trace_rtio_cqe_submit_exit(const struct rtio *r);
 void sys_trace_rtio_cqe_acquire_enter(const struct rtio *r);
@@ -1034,7 +1031,7 @@ void sys_trace_rtio_chain_next_exit(const struct rtio *r, const struct rtio_iode
 #define sys_port_trace_rtio_submit_exit(r)              sys_trace_rtio_submit_exit(r)
 #define sys_port_trace_rtio_sqe_acquire_enter(r)        sys_trace_rtio_sqe_acquire_enter(r)
 #define sys_port_trace_rtio_sqe_acquire_exit(r, sqe)    sys_trace_rtio_sqe_acquire_exit(r, sqe)
-#define sys_port_trace_rtio_sqe_cancel(sqe)             sys_trace_rtio_sqe_cancel(sqe)
+#define sys_port_trace_rtio_sqe_cancel(handle)          sys_trace_rtio_sqe_cancel(handle)
 #define sys_port_trace_rtio_cqe_submit_enter(r, result, flags)                                     \
 	sys_trace_rtio_cqe_submit_enter(r, result, flags)
 #define sys_port_trace_rtio_cqe_submit_exit(r)           sys_trace_rtio_cqe_submit_exit(r)

@@ -121,6 +121,7 @@ struct mspi_dw_config {
 	uint8_t max_queued_dummy_bytes;
 	uint8_t tx_fifo_threshold;
 	uint8_t rx_fifo_threshold;
+	uint8_t rx_sample_dly;
 #ifdef CONFIG_MSPI_DMA
 	uint8_t dma_tx_data_level;
 	uint8_t dma_rx_data_level;
@@ -1016,6 +1017,8 @@ static int _api_dev_config(const struct device *dev,
 		dev_data->max_clocks_per_ce = 0;
 	}
 
+	vendor_specific_dev_config(dev, param_mask, cfg);
+
 	return 0;
 }
 
@@ -1741,7 +1744,7 @@ static int api_transceive(const struct device *dev,
 
 	rc = pm_device_runtime_get(dev);
 	if (rc < 0) {
-		LOG_ERR("pm_device_runtime_get() failed: %d", rc);
+		LOG_ERR_PM_DEVICE_RUNTIME_GET(dev, rc);
 		return rc;
 	}
 
@@ -1774,7 +1777,7 @@ static int finalize_transceive(const struct device *dev, int rc)
 
 	rc2 = pm_device_runtime_put(dev);
 	if (rc2 < 0) {
-		LOG_ERR("pm_device_runtime_put() failed: %d", rc2);
+		LOG_ERR_PM_DEVICE_RUNTIME_PUT(dev, rc2);
 		rc = (rc < 0 ? rc : rc2);
 	}
 
@@ -1860,7 +1863,7 @@ static int _api_xip_config(const struct device *dev,
 			 */
 			rc = pm_device_runtime_put(dev);
 			if (rc < 0) {
-				LOG_ERR("pm_device_runtime_put() failed: %d", rc);
+				LOG_ERR_PM_DEVICE_RUNTIME_PUT(dev, rc);
 				return rc;
 			}
 		}
@@ -1892,7 +1895,7 @@ static int _api_xip_config(const struct device *dev,
 		 */
 		rc = pm_device_runtime_get(dev);
 		if (rc < 0) {
-			LOG_ERR("pm_device_runtime_get() failed: %d", rc);
+			LOG_ERR_PM_DEVICE_RUNTIME_GET(dev, rc);
 			return rc;
 		}
 
@@ -1901,12 +1904,13 @@ static int _api_xip_config(const struct device *dev,
 		ctrl.write |= FIELD_PREP(XIP_WRITE_CTRL_WAIT_CYCLES_MASK,
 					 params->tx_dummy);
 
-		/* Make sure the baud rate and serial clock phase/polarity
-		 * registers are configured properly. They may not be if
-		 * non-XIP transfers have not been performed yet.
+		/* Make sure the baud rate, serial clock phase/polarity and RX
+		 * sample delay registers are configured properly. They may not
+		 * be if non-XIP transfers have not been performed yet.
 		 */
 		write_ctrlr0(dev, dev_data->ctrlr0);
 		write_baudr(dev, dev_data->baudr);
+		write_rx_sample_dly(dev, dev_data->rx_sample_dly);
 
 		write_xip_incr_inst(dev, params->read_cmd);
 		write_xip_wrap_inst(dev, params->read_cmd);
@@ -1921,7 +1925,7 @@ static int _api_xip_config(const struct device *dev,
 			LOG_ERR("XIP write access not supported by this controller");
 			rc = pm_device_runtime_put(dev);
 			if (rc < 0) {
-				LOG_ERR("pm_device_runtime_put() failed: %d", rc);
+				LOG_ERR_PM_DEVICE_RUNTIME_PUT(dev, rc);
 			}
 			return -ENOTSUP;
 #endif
@@ -1972,7 +1976,7 @@ static int api_memmap_config(const struct device *dev,
 
 	rc = pm_device_runtime_get(dev);
 	if (rc < 0) {
-		LOG_ERR("pm_device_runtime_get() failed: %d", rc);
+		LOG_ERR_PM_DEVICE_RUNTIME_GET(dev, rc);
 		return rc;
 	}
 
@@ -1992,7 +1996,7 @@ static int api_memmap_config(const struct device *dev,
 
 	rc2 = pm_device_runtime_put(dev);
 	if (rc2 < 0) {
-		LOG_ERR("pm_device_runtime_put() failed: %d", rc2);
+		LOG_ERR_PM_DEVICE_RUNTIME_PUT(dev, rc2);
 		rc = (rc < 0 ? rc : rc2);
 	}
 
@@ -2076,6 +2080,7 @@ static int dev_init(const struct device *dev)
 
 	dev_data->ctrlr0 |= FIELD_PREP(CTRLR0_SSI_IS_MST_BIT,
 				       dev_config->op_mode == MSPI_OP_MODE_CONTROLLER);
+	dev_data->rx_sample_dly = dev_config->rx_sample_dly;
 
 	dev_config->irq_config();
 
@@ -2186,7 +2191,8 @@ static DEVICE_API(mspi, drv_api) = {
 				7 * TX_FIFO_DEPTH(inst) / 8 - 1),	\
 	.rx_fifo_threshold =						\
 		DT_INST_PROP_OR(inst, rx_fifo_threshold,		\
-				1 * RX_FIFO_DEPTH(inst) / 8 - 1)
+				1 * RX_FIFO_DEPTH(inst) / 8 - 1),	\
+	.rx_sample_dly = DT_INST_PROP_OR(inst, rx_sample_delay_initial, 0)
 
 #define MSPI_DW_DMA_DATA_LEVELS(inst)					\
 	.dma_tx_data_level =						\

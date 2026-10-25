@@ -52,6 +52,7 @@ CREATE_FLAG(flag_pa_request);
 CREATE_FLAG(flag_bis_sync_requested);
 CREATE_FLAG(flag_big_sync_mic_failure);
 CREATE_FLAG(flag_sink_started);
+CREATE_FLAG(flag_broadcast_code_received);
 
 static struct bt_bap_broadcast_sink *g_sink;
 static size_t stream_sync_cnt;
@@ -454,6 +455,7 @@ static void broadcast_code_cb(struct bt_conn *conn,
 	req_recv_state = recv_state;
 
 	memcpy(recv_state_broadcast_code, broadcast_code, BT_ISO_BROADCAST_CODE_SIZE);
+	SET_FLAG(flag_broadcast_code_received);
 }
 
 static void scanning_state_cb(struct bt_conn *conn, bool is_scanning)
@@ -581,15 +583,11 @@ static void validate_stream_codec_cfg(const struct bt_bap_stream *stream)
 
 static void stream_started_cb(struct bt_bap_stream *stream)
 {
-	struct audio_test_stream *test_stream = audio_test_stream_from_bap_stream(stream);
 	struct bt_bap_ep_info info;
 	struct bt_conn *ep_conn;
 	int err;
 
-	memset(&test_stream->last_info, 0, sizeof(test_stream->last_info));
-	test_stream->rx_cnt = 0U;
-	test_stream->valid_rx_cnt = 0U;
-	UNSET_FLAG(test_stream->flag_audio_received);
+	bap_common_stream_started_cb(stream);
 
 	err = bt_bap_ep_get_info(stream->ep, &info);
 	if (err != 0) {
@@ -958,6 +956,33 @@ static void wait_for_data(void)
 	LOG_INF("Data received");
 }
 
+static bool find_recv_state_by_broadcast_id_cb(
+	const struct bt_bap_scan_delegator_recv_state *recv_state, void *user_data)
+{
+	const uint32_t *broadcast_id = user_data;
+
+	return recv_state->broadcast_id == *broadcast_id;
+}
+
+static void test_recv_state_decrypting(void)
+{
+	const struct bt_bap_scan_delegator_recv_state *recv_state;
+
+	recv_state = bt_bap_scan_delegator_find_state(find_recv_state_by_broadcast_id_cb,
+						       &broadcaster_broadcast_id);
+	if (recv_state == NULL) {
+		FAIL("Could not find receive state for broadcast ID 0x%06X\n",
+		     broadcaster_broadcast_id);
+		return;
+	}
+
+	if (recv_state->encrypt_state != BT_BAP_BIG_ENC_STATE_DEC) {
+		FAIL("Invalid encrypt_state 0x%02X, expected 0x%02X\n", recv_state->encrypt_state,
+		     BT_BAP_BIG_ENC_STATE_DEC);
+		return;
+	}
+}
+
 static void test_common(void)
 {
 	int err;
@@ -1114,6 +1139,21 @@ static void test_sink_encrypted(void)
 	}
 
 	wait_for_data();
+	test_recv_state_decrypting();
+
+	test_broadcast_stop();
+	test_broadcast_sync(BROADCAST_CODE);
+
+	WAIT_FOR_FLAG(flag_sink_started);
+
+	LOG_INF("Waiting for %zu streams to be started", stream_sync_cnt);
+	for (size_t i = 0U; i < stream_sync_cnt; i++) {
+		err = k_sem_take(&sem_stream_started, K_FOREVER);
+		__ASSERT_NO_MSG(err == 0);
+	}
+
+	wait_for_data();
+	test_recv_state_decrypting();
 
 	backchannel_sync_send_all(); /* let other devices know we have received data */
 
@@ -1263,11 +1303,38 @@ static void broadcast_sink_with_assistant_incorrect_code(void)
 
 	LOG_INF("Waiting for BIG sync request");
 	WAIT_FOR_FLAG(flag_bis_sync_requested);
+	/* Re-arm before syncing, as the assistant requests the BIS sync again as soon as it
+	 * observes the bad code state
+	 */
+	UNSET_FLAG(flag_bis_sync_requested);
+
+	LOG_INF("Waiting for the (incorrect) broadcast code");
+	WAIT_FOR_FLAG(flag_broadcast_code_received);
+	/* Re-arm before the sync fails, as the assistant provides the correct code as soon as
+	 * the broadcast code is requested again
+	 */
+	UNSET_FLAG(flag_broadcast_code_received);
+
 	test_broadcast_sync(recv_state_broadcast_code);
+
 	/* Wait for MIC failure */
 	WAIT_FOR_FLAG(flag_big_sync_mic_failure);
 
+	LOG_INF("Waiting for BIG sync to be requested again");
+	WAIT_FOR_FLAG(flag_bis_sync_requested);
+
+	LOG_INF("Waiting for the (correct) broadcast code");
+	WAIT_FOR_FLAG(flag_broadcast_code_received);
+
+	test_broadcast_sync(recv_state_broadcast_code);
+
+	WAIT_FOR_FLAG(flag_sink_started);
+
 	backchannel_sync_send_all(); /* let other devices know we have received data */
+
+	LOG_INF("Waiting for BIG sync terminate request");
+	WAIT_FOR_UNSET_FLAG(flag_bis_sync_requested);
+	test_broadcast_stop();
 
 	LOG_INF("Waiting for PA sync terminate request");
 	WAIT_FOR_UNSET_FLAG(flag_pa_request);

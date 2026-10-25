@@ -6,7 +6,7 @@
 
 /dts-v1/;
 
-#include <nxp/imxrt/nxp_rt1170_cm7.dtsi>
+#include <nxp/imxrt/imxrt11xx/nxp_rt1170_cm7.dtsi>
 #include "mimxrt1170_evk.dtsi"
 
 / {
@@ -130,6 +130,7 @@ nxp_mipi_i2c: &lpi2c5 {
 	status = "okay";
 	detect-dat3;
 	pwr-gpios = <&gpio10 2 GPIO_ACTIVE_LOW>;
+	no-1-8-v;
 
 	sdmmc {
 		compatible = "zephyr,sdmmc-disk";

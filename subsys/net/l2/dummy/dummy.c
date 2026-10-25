@@ -15,12 +15,15 @@ LOG_MODULE_REGISTER(net_l2_dummy, LOG_LEVEL_NONE);
 
 #include <zephyr/net/dummy.h>
 
-#include "net_stats.h"
-
 static inline enum net_verdict dummy_recv(struct net_if *iface,
 					  struct net_pkt *pkt)
 {
-	const struct dummy_api *api = net_if_get_device(iface)->api;
+	const struct device *dev = net_if_get_device(iface);
+	const struct dummy_api *api;
+
+	NET_ASSERT(dev != NULL);
+
+	api = dev->api;
 
 	if (api == NULL) {
 		return NET_DROP;
@@ -35,9 +38,14 @@ static inline enum net_verdict dummy_recv(struct net_if *iface,
 
 static inline int dummy_send(struct net_if *iface, struct net_pkt *pkt)
 {
-	const struct dummy_api *api = net_if_get_device(iface)->api;
+	const struct device *dev = net_if_get_device(iface);
+	const struct dummy_api *api;
 	size_t pkt_len;
 	int ret;
+
+	NET_ASSERT(dev != NULL);
+
+	api = dev->api;
 
 	if (!api) {
 		return -ENOENT;
@@ -49,13 +57,9 @@ static inline int dummy_send(struct net_if *iface, struct net_pkt *pkt)
 	 */
 	pkt_len = net_pkt_get_len(pkt);
 
-	ret = net_l2_send(api->send, net_if_get_device(iface), iface, pkt);
+	ret = net_l2_send(api->send, dev, iface, pkt);
 	if (!ret) {
-		if (IS_ENABLED(CONFIG_NET_STATISTICS)) {
-			NET_DBG("Sending pkt %p len %zu", pkt, pkt_len);
-			net_stats_update_bytes_sent(iface, pkt_len);
-		}
-
+		/* net_if_tx() updates the sent statistics with this length */
 		ret = (int)pkt_len;
 		net_pkt_unref(pkt);
 	}
@@ -66,7 +70,12 @@ static inline int dummy_send(struct net_if *iface, struct net_pkt *pkt)
 static inline int dummy_enable(struct net_if *iface, bool state)
 {
 	int ret = 0;
-	const struct dummy_api *api = net_if_get_device(iface)->api;
+	const struct device *dev = net_if_get_device(iface);
+	const struct dummy_api *api;
+
+	NET_ASSERT(dev != NULL);
+
+	api = dev->api;
 
 	if (!api) {
 		return -ENOENT;
@@ -74,11 +83,11 @@ static inline int dummy_enable(struct net_if *iface, bool state)
 
 	if (!state) {
 		if (api->stop) {
-			ret = api->stop(net_if_get_device(iface));
+			ret = api->stop(dev);
 		}
 	} else {
 		if (api->start) {
-			ret = api->start(net_if_get_device(iface));
+			ret = api->start(dev);
 		}
 	}
 

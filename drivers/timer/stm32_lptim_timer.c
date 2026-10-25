@@ -369,7 +369,7 @@ void sys_clock_set_timeout(uint32_t ticks, bool idle)
 
 		LL_LPTIM_DisableIT_ARROK(LPTIM);
 		LL_LPTIM_ClearFlag_ARROK(LPTIM);
-		NVIC_ClearPendingIRQ(DT_IRQN(LPTIM_SYSTIMER_NODE));
+		k_irq_clear_pending(DT_IRQN(LPTIM_SYSTIMER_NODE));
 		/* Stop clocks for LPTIM, since RTC is used instead */
 		clock_control_off(clk_ctrl, (clock_control_subsys_t) &lptim_clk[0]);
 
@@ -403,6 +403,11 @@ void sys_clock_set_timeout(uint32_t ticks, bool idle)
 	if (err < 0) {
 		return;
 	}
+
+	if (idle) {
+		return;
+	}
+
 	/* passing ticks==1 means "announce the next tick",
 	 * ticks value of zero is legal and
 	 * treated identically: it simply indicates the kernel would like the

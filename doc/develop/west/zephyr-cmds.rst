@@ -77,9 +77,8 @@ Software bill of materials: ``west spdx``
 
 This command generates a Software Bill of Materials (SBOM) for a Zephyr build as a set of `SPDX`_
 documents. It records the source files that went into the build, the build artifacts they produced,
-and the relationships between them. ``SPDX-License-Identifier`` comments found in source files are
-scanned and filled into the documents, together with file hashes and (best-effort) copyright
-notices.
+and the relationships between them. The license and copyright of every file are scanned and filled
+into the documents, together with file hashes.
 
 .. _west-spdx-versions:
 
@@ -90,24 +89,20 @@ Choosing an SPDX version
 select another version with the ``--spdx-version`` option.
 
 SPDX 2.3 is a superset of 2.2 and adds fields such as ``PrimaryPackagePurpose``. Pick SPDX 2.x for
-compatibility with tooling that does not yet understand SPDX 3.0; pick SPDX 3.0 for the richer,
-machine-readable build provenance described in :ref:`west-spdx-build-profile`.
+compatibility with tooling that does not yet understand SPDX 3; pick SPDX 3.0 or above for the
+richer, machine-readable build provenance described in :ref:`west-spdx-build-profile`.
+
+.. note::
+
+   SPDX 3.1 support is experimental: the SPDX 3.1 specification is still in development.
 
 Generating SPDX documents
 -------------------------
 
-#. Pre-populate a build directory :file:`BUILD_DIR` like this:
+#. Enable :kconfig:option:`CONFIG_BUILD_OUTPUT_META` in your project, so that the build
+   records what ``west spdx`` needs.
 
-   .. code-block:: bash
-
-      west spdx --init -d BUILD_DIR
-
-   This step ensures the build directory contains the CMake metadata (a CMake file-API query)
-   required for SPDX document generation.
-
-#. Enable :kconfig:option:`CONFIG_BUILD_OUTPUT_META` in your project.
-
-#. Build your application using this pre-created build directory, like so:
+#. Build your application:
 
    .. code-block:: bash
 
@@ -134,8 +129,7 @@ Generating SPDX documents
 
    .. code-block:: bash
 
-     west spdx --init  -d BUILD_DIR/hello_world
-     west build -d BUILD_DIR/hello_world
+     west build --sysbuild -d BUILD_DIR
      west spdx -d BUILD_DIR/hello_world
 
 Output documents
@@ -154,19 +148,51 @@ JSON-LD format:
 
 For SPDX 3.0, every document declares conformance to the Core, Software and Simple Licensing
 profiles, and :file:`build.jsonld` additionally declares the :ref:`Build profile
-<west-spdx-build-profile>` that captures how the artifacts were produced.
+<west-spdx-build-profile>` that captures how the artifacts were produced. Element IDs are full
+IRIs under the namespace prefix (``-n``), so the documents of separate builds, such as the images
+of a :ref:`sysbuild <sysbuild>` build, can be combined into one graph as long as each build has its
+own prefix, which the default prefix guarantees.
 
-Each file in the bill-of-materials is scanned, so that its hashes (SHA256, SHA1, and MD5)
-can be recorded, along with any detected licenses if an
-``SPDX-License-Identifier`` comment appears in the file.
+Every file in the bill-of-materials is scanned so that its hashes (SHA512, SHA256 and SHA1) can be
+recorded, together with its license and copyright.
 
-Copyright notices are extracted using the third-party :command:`reuse` tool from the REUSE group.
-When found, these notices are added to SPDX documents as ``FileCopyrightText`` fields (SPDX 2.x)
-or copyright properties (SPDX 3.0).
+Both are resolved with the third-party :command:`reuse` tool from the REUSE group, so ``west spdx``
+honours every way the `REUSE specification`_ allows them to be declared: an
+``SPDX-License-Identifier`` and ``SPDX-FileCopyrightText`` comment in the file itself, a
+:file:`.license` file sitting next to it, or a :file:`REUSE.toml` at the root of the repository
+annotating whole sets of paths at once. That last form is the only way to license a file that
+cannot hold a comment of its own, binary blobs in particular.
+
+What is found is written out as ``LicenseInfoInFile``, ``LicenseConcluded`` and
+``FileCopyrightText`` (SPDX 2.x), or as the element's license and copyright properties (SPDX 3.0).
 
 .. note::
    Copyright extraction uses heuristics that may not capture complete notice text, so
    ``FileCopyrightText`` content is best-effort. This aligns with SPDX specification recommendations.
+
+Package identification
+----------------------
+
+Every package records where it came from, so that the SBOM can be matched against vulnerability
+databases:
+
+- a **PURL** (Package URL) built from the repository the sources were checked out from, pinned to
+  the release tag when the checked-out revision is tagged and to the revision itself otherwise. It
+  identifies the exact tree that was built, which for a fork is the fork's own repository.
+
+- a **CPE** (Common Platform Enumeration) name, which identifies the product and version rather
+  than the checkout, and so does not depend on which remote the sources came from.
+
+For Zephyr itself, the CPE is ``cpe:2.3:o:zephyrproject:zephyr:<version>:<update>:*:*:*:*:*:*``,
+built from the version reported by Zephyr's :zephyr_file:`VERSION` file. Any ``EXTRAVERSION``
+becomes the CPE ``update`` field, so a release candidate is recorded as
+``cpe:2.3:o:zephyrproject:zephyr:4.4.0:rc3:*:*:*:*:*:*`` and a final release as
+``cpe:2.3:o:zephyrproject:zephyr:4.4.0:-:*:*:*:*:*:*``. Both the ``zephyr`` source package and the
+Zephyr entry in ``modules-deps`` carry it.
+
+Modules are identified the same way, and can additionally declare curated references (for instance
+the upstream project's CPE, when the module is a fork) in their :file:`zephyr/module.yml`. See
+:ref:`modules <modules-vulnerability-monitoring>`.
 
 Relationships
 -------------
@@ -208,6 +234,10 @@ Command-line options
 
 ``west spdx`` accepts these additional options:
 
+- ``-i``, ``--init``: create the CMake file-based API query in a build directory before it is
+  configured. Deprecated, and to be removed in Zephyr 5.0: a build with
+  :kconfig:option:`CONFIG_BUILD_OUTPUT_META` now requests the query itself.
+
 - ``-n PREFIX``: a prefix for the Document Namespaces that will be included in
   the generated SPDX documents. See `SPDX specification clause 6`_ for
   details. If ``-n`` is omitted, a default namespace will be generated
@@ -216,7 +246,7 @@ Command-line options
 - ``-s SPDX_DIR``: specifies an alternate directory where the SPDX documents
   should be written instead of :file:`BUILD_DIR/spdx/`.
 
-- ``--spdx-version {2.2,2.3,3.0}``: specifies which SPDX specification version to use.
+- ``--spdx-version {2.2,2.3,3.0,3.1}``: specifies which SPDX specification version to use.
   Defaults to ``2.3``. See :ref:`west-spdx-versions` for the differences between
   the versions.
 
@@ -237,6 +267,8 @@ Command-line options
    The generation of SBOM documents for the ``native_sim`` platform is currently not supported.
 
 .. _SPDX: https://spdx.dev/
+
+.. _REUSE specification: https://reuse.software/spec/
 
 .. _SPDX 3.0 Build profile:
    https://spdx.github.io/spdx-spec/v3.0.1/model/Build/Build/
@@ -297,6 +329,32 @@ auto-cache) for a matching blob filename. Cached files may be stored either
 under their original filename or with a SHA-256 suffix (``<filename>.<sha>``).
 If found, the blob is copied from the cache to the blob path; otherwise
 it is downloaded from its URL(s) to the blob path.
+
+One or more download mirrors can be configured via the ``blobs.mirrors``
+config option. Its value is a JSON object that contains one or more
+key-value pairs, where each key is a remote URL prefix (a string) and each
+value is either a single mirror URL prefix (a string) or a list of mirror
+URL prefixes (an array of strings).
+
+A single mirror for a remote URL prefix::
+
+  west config blobs.mirrors '{"https://github.com/": "https://example.com/github-mirror/"}'
+
+More than one mirror for the same remote URL prefix, tried in list order::
+
+  west config blobs.mirrors '{
+    "https://github.com/": [
+      "https://example.com/github1-mirror/",
+      "https://example.com/github2-mirror/"
+    ]
+  }'
+
+For each blob URL, every mirror whose remote URL prefix matches is tried,
+ordered so that the *longest* (most specific) matching remote URL prefix is
+tried first (like git's ``insteadOf``); mirrors for shorter, less specific
+matches are tried afterward. Mirrors configured for the same remote URL
+prefix are tried in the order they are listed. The original URL is tried
+last, as a fallback if every mirror fails.
 
 .. _west-twister:
 
@@ -407,6 +465,7 @@ There are several sub-commands available to manage patches for Zephyr or other m
 workspace:
 
 * ``apply``: apply patches listed in ``patches.yml``
+* ``reverse``: reverse patches listed in ``patches.yml`` that have been previously applied
 * ``clean``: remove all patches that have been applied, and reset to the manifest checkout state
 * ``list``: list all patches in ``patches.yml``
 * ``gh-fetch``: fetch patches from a GitHub pull request
@@ -481,6 +540,15 @@ the external application repository, and then the following commands can be run.
     west patch clean
     west update
     west patch apply --roll-back # roll-back all patches if one does not apply cleanly
+
+Optionally, patches can be reversed rather than cleaning all modules. This leaves non-conflicting,
+unrelated edits to modules in place, but removes only the changes made by patches. This is useful
+when developing patches and testing them in an application, but not wanting to clean all patches
+and lose any manual edits made to the module.
+
+.. code-block:: bash
+
+    west patch reverse
 
 If a patch needs to be reworked, remember to update the ``patches.yml`` file with the new SHA256
 checksum.

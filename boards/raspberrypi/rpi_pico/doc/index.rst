@@ -9,6 +9,9 @@ a USB connector, and an SWD interface.
 
 The Pico W additionally contains an `Infineon CYW43439`_ 2.4 GHz Wi-Fi/Bluetooth module.
 
+The RP2040 has two Cortex-M0+ cores. Zephyr currently runs on one core only;
+running code on the second core is not supported.
+
 The USB bootloader allows the ability to flash without any adapter,
 in a drag-and-drop manner.
 It is also possible to flash and debug the boards with their SWD interface,
@@ -129,6 +132,9 @@ Raspberry Pi Pico's PIO is a programmable chip that can implement a variety of p
    * - WS2812 (PIO)
      - :kconfig:option:`CONFIG_LED_STRIP`
      - :dtcompatible:`worldsemi,ws2812-rpi_pico-pio`
+   * - I2S (PIO)
+     - :kconfig:option:`CONFIG_I2S`
+     - :dtcompatible:`raspberrypi,pico-i2s-pio`
 
 System requirements
 *******************

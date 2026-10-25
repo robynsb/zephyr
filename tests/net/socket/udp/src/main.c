@@ -482,6 +482,87 @@ ZTEST_USER(net_socket_udp, test_v4_sendmsg_recvfrom)
 	zassert_equal(rv, 0, "close failed");
 }
 
+/* A control message header with a length that cannot be valid ends the walk
+ * over the control buffer: one that is shorter than a header, and one that
+ * is longer than the rest of the buffer, where the largest value makes the
+ * aligned length wrap around to zero on 32-bit targets. A length of zero is
+ * what the stack finds when the buffer is larger than the control messages
+ * placed in it and the rest is zeroed.
+ */
+ZTEST_USER(net_socket_udp, test_v4_sendmsg_invalid_control_length)
+{
+	static const net_socklen_t lengths[] = {
+		0,
+		sizeof(struct net_cmsghdr) - 1,
+		NET_CMSG_SPACE(sizeof(int)) + 1,
+		UINT32_MAX,
+	};
+	int rv;
+	int client_sock;
+	int server_sock;
+	struct net_sockaddr_in client_addr;
+	struct net_sockaddr_in server_addr;
+	struct net_msghdr msg;
+	struct net_cmsghdr *cmsg;
+	struct net_iovec io_vector[1];
+	union {
+		struct net_cmsghdr hdr;
+		unsigned char  buf[2 * NET_CMSG_SPACE(sizeof(int))];
+	} cmsgbuf;
+
+	prepare_sock_udp_v4(MY_IPV4_ADDR, ANY_PORT, &client_sock, &client_addr);
+	prepare_sock_udp_v4(MY_IPV4_ADDR, SERVER_PORT, &server_sock, &server_addr);
+
+	rv = zsock_bind(server_sock,
+			(struct net_sockaddr *)&server_addr,
+			sizeof(server_addr));
+	zassert_equal(rv, 0, "server bind failed");
+
+	rv = zsock_bind(client_sock,
+			(struct net_sockaddr *)&client_addr,
+			sizeof(client_addr));
+	zassert_equal(rv, 0, "client bind failed");
+
+	io_vector[0].iov_base = TEST_STR_SMALL;
+	io_vector[0].iov_len = strlen(TEST_STR_SMALL);
+
+	ARRAY_FOR_EACH(lengths, i) {
+		memset(&cmsgbuf, 0, sizeof(cmsgbuf));
+		memset(&msg, 0, sizeof(msg));
+		msg.msg_control = &cmsgbuf.buf;
+		msg.msg_controllen = sizeof(cmsgbuf.buf);
+		msg.msg_iov = io_vector;
+		msg.msg_iovlen = 1;
+		msg.msg_name = &server_addr;
+		msg.msg_namelen = sizeof(server_addr);
+
+		cmsg = NET_CMSG_FIRSTHDR(&msg);
+		cmsg->cmsg_len = NET_CMSG_LEN(sizeof(int));
+		cmsg->cmsg_level = ZSOCK_SOL_SOCKET;
+		cmsg->cmsg_type = 1122;
+		*(int *)NET_CMSG_DATA(cmsg) = 42;
+
+		cmsg = NET_CMSG_NXTHDR(&msg, cmsg);
+		zassert_not_null(cmsg, "no room for a second header");
+		cmsg->cmsg_len = lengths[i];
+		zassert_is_null(NET_CMSG_NXTHDR(&msg, cmsg),
+				"walk does not stop at a header of length %u", lengths[i]);
+
+		comm_sendmsg_recvfrom(client_sock,
+				      (struct net_sockaddr *)&client_addr,
+				      sizeof(client_addr),
+				      &msg,
+				      server_sock,
+				      (struct net_sockaddr *)&server_addr,
+				      sizeof(server_addr));
+	}
+
+	rv = zsock_close(client_sock);
+	zassert_equal(rv, 0, "close failed");
+	rv = zsock_close(server_sock);
+	zassert_equal(rv, 0, "close failed");
+}
+
 ZTEST_USER(net_socket_udp, test_v4_sendmsg_recvfrom_no_aux_data)
 {
 	int rv;
@@ -2868,6 +2949,77 @@ ZTEST(net_socket_udp, test_v4_ttl)
 		       (struct net_sockaddr *)&server_addr, sizeof(server_addr),
 		       (struct net_sockaddr *)&server_addr, sizeof(server_addr),
 		       NET_AF_INET, ttl, 0);
+}
+
+/* A multicast sender must be handed a copy of its own datagram while
+ * IP_MULTICAST_LOOP is enabled. Run this over Ethernet on purpose: the copy is
+ * cloned before the L2 header is written, so only an L2 that has a header of
+ * its own catches the copy being run through L2 processing on receive.
+ */
+ZTEST(net_socket_udp, test_v4_mcast_loop)
+{
+	struct net_sockaddr_in bind_addr = { 0 };
+	struct net_sockaddr_in mcast_addr = { 0 };
+	struct net_ip_mreqn mreqn = { 0 };
+	int loop = 1;
+	int send_sock;
+	int recv_sock;
+	int ret;
+
+	memcpy(&mreqn.imr_multiaddr, &my_mcast_addr2, sizeof(mreqn.imr_multiaddr));
+	mreqn.imr_ifindex = net_if_get_by_iface(eth_iface);
+
+	mcast_addr.sin_family = NET_AF_INET;
+	mcast_addr.sin_port = net_htons(SERVER_PORT);
+	memcpy(&mcast_addr.sin_addr, &my_mcast_addr2, sizeof(mcast_addr.sin_addr));
+
+	recv_sock = zsock_socket(NET_AF_INET, NET_SOCK_DGRAM, NET_IPPROTO_UDP);
+	zassert_true(recv_sock >= 0, "Cannot create socket (%d)", -errno);
+
+	bind_addr.sin_family = NET_AF_INET;
+	bind_addr.sin_port = net_htons(SERVER_PORT);
+	bind_addr.sin_addr.s_addr = net_htonl(NET_INADDR_ANY);
+	ret = zsock_bind(recv_sock, (struct net_sockaddr *)&bind_addr, sizeof(bind_addr));
+	zassert_ok(ret, "Cannot bind socket (%d)", -errno);
+
+	ret = zsock_setsockopt(recv_sock, NET_IPPROTO_IP, ZSOCK_IP_ADD_MEMBERSHIP,
+			       &mreqn, sizeof(mreqn));
+	zassert_ok(ret, "Cannot join multicast group (%d)", -errno);
+
+	/* Bind the sender to the Ethernet address so the datagram leaves over
+	 * Ethernet, and to a different port because a datagram whose source is
+	 * one of our own addresses is rejected when the ports match.
+	 */
+	send_sock = zsock_socket(NET_AF_INET, NET_SOCK_DGRAM, NET_IPPROTO_UDP);
+	zassert_true(send_sock >= 0, "Cannot create socket (%d)", -errno);
+
+	bind_addr.sin_port = net_htons(CLIENT_PORT);
+	memcpy(&bind_addr.sin_addr, &my_addr2, sizeof(bind_addr.sin_addr));
+	ret = zsock_bind(send_sock, (struct net_sockaddr *)&bind_addr, sizeof(bind_addr));
+	zassert_ok(ret, "Cannot bind socket (%d)", -errno);
+
+	ret = zsock_setsockopt(send_sock, NET_IPPROTO_IP, ZSOCK_IP_MULTICAST_LOOP,
+			       &loop, sizeof(loop));
+	zassert_ok(ret, "Cannot enable multicast loop (%d)", -errno);
+
+	ret = zsock_sendto(send_sock, TEST_STR_SMALL, strlen(TEST_STR_SMALL), 0,
+			   (struct net_sockaddr *)&mcast_addr, sizeof(mcast_addr));
+	zassert_equal(ret, strlen(TEST_STR_SMALL), "Cannot send (%d)", -errno);
+
+	k_msleep(10);
+
+	memset(rx_buf, 0, sizeof(rx_buf));
+	ret = zsock_recv(recv_sock, rx_buf, sizeof(rx_buf), ZSOCK_MSG_DONTWAIT);
+	zassert_equal(ret, strlen(TEST_STR_SMALL),
+		      "Sender did not get its own multicast back (%d)", -errno);
+	zassert_mem_equal(rx_buf, TEST_STR_SMALL, strlen(TEST_STR_SMALL),
+			  "Wrong data received");
+
+	ret = zsock_close(send_sock);
+	zassert_ok(ret, "Cannot close socket (%d)", -errno);
+
+	ret = zsock_close(recv_sock);
+	zassert_ok(ret, "Cannot close socket (%d)", -errno);
 }
 
 ZTEST(net_socket_udp, test_v4_mcast_ttl)

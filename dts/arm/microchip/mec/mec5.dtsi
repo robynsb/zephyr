@@ -17,6 +17,10 @@
 #include "mec5/mec5-vw-routing.dtsi"
 
 / {
+	aliases {
+		watchdog0 = &watchdog0;
+	};
+
 	cpus {
 		#address-cells = <1>;
 		#size-cells = <0>;
@@ -263,11 +267,11 @@
 		};
 
 		watchdog0: watchdog@40000400 {
+			compatible = "microchip,xec-watchdog";
 			reg = <0x40000400 0x400>;
 			interrupts = <171 0>;
 			girqs = <MCHP_XEC_ECIA_GIRQ_ENC(21, 2)>;
 			pcr-scr = <MCHP_XEC_SCR_ENCODE(1, 9)>;
-			status = "disabled";
 		};
 
 		rtimer: timer@40007400 {
@@ -717,12 +721,13 @@
 			 */
 			espi_taf0: espi_taf@40008000 {
 				compatible = "microchip,xec-espi-saf-v2";
-				reg = <0x40008000 0x400>, <0x40071000 0x400>;
-				reg-names = "tafbr", "tafcomm";
+				reg = <0x40008000 0x400>, <0x40070000 0x400>, <0x40071000 0x400>;
+				reg-names = "tafbr", "tafqspi", "tafcomm";
 				interrupts = <166 3>, <167 3>;
-				interrupt-names = "done", "err";
-				girqs = <19 9>, <19 10>;
-				pcrs = <2 27>;
+				interrupt-names = "done", "busmon";
+				girqs = <MCHP_XEC_ECIA_GIRQ_ENC(19, 9)>,
+					<MCHP_XEC_ECIA_GIRQ_ENC(19, 10)>;
+				pcr-scr = <MCHP_XEC_SCR_ENCODE(2, 27)>;
 				status = "disabled";
 			};
 

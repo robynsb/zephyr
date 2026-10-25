@@ -262,6 +262,8 @@ TESTDATA_1_2 = [
      False, False, TwisterStatus.PASS, None, False, False),
     (1, True, 'ERROR: region `FLASH\' overflowed by 123 MB',
      True,  True, TwisterStatus.SKIP, 'FLASH overflow', True, False),
+    (1, True, 'ld: region `sram0_0_seg\' overflowed by 90576 bytes',
+     True,  True, TwisterStatus.SKIP, 'sram0_0_seg overflow', True, False),
     (1, True, 'Error: Image size (99 B) + trailer (1 B) exceeds requested size',
      True, True, TwisterStatus.SKIP, 'imgtool overflow', True, False),
     (1, True, 'mock.ANY',
@@ -274,7 +276,8 @@ TESTDATA_1_2 = [
     ' expected_change_skip, expected_add_missing',
     TESTDATA_1_2,
     ids=['no error, no instance run', 'no error, instance run',
-         'error - region overflow', 'error - image size exceed', 'error']
+         'error - region overflow', 'error - sram segment overflow',
+         'error - image size exceed', 'error']
 )
 @pytest.mark.parametrize('sys_platform', TESTDATA_1_1)
 def test_cmake_run_build(
@@ -374,6 +377,7 @@ TESTDATA_2_2 = [
      [os.path.join('dummy', 'cmake'),
       '-B' + os.path.join('build', 'dir'), '-DTC_RUNID=1', '-DTC_NAME=testcase',
       '-DSB_CONFIG_COMPILER_WARNINGS_AS_ERRORS=y',
+      '-DSB_CONFIG_DEPRECATED_KCONFIGS_AS_ERRORS=y',
       '-DEXTRA_GEN_EDT_ARGS=--edtlib-Werror', '-Gdummy_generator',
       f'-DPython3_EXECUTABLE={pathlib.Path(sys.executable).as_posix()}',
       '-DZEPHYR_TOOLCHAIN_VARIANT=zephyr',
@@ -390,6 +394,7 @@ TESTDATA_2_2 = [
      [os.path.join('dummy', 'cmake'),
       '-B' + os.path.join('build', 'dir'), '-DTC_RUNID=1', '-DTC_NAME=testcase',
       '-DSB_CONFIG_COMPILER_WARNINGS_AS_ERRORS=n',
+      '-DSB_CONFIG_DEPRECATED_KCONFIGS_AS_ERRORS=n',
       '-DEXTRA_GEN_EDT_ARGS=', '-Gdummy_generator',
       f'-DPython3_EXECUTABLE={pathlib.Path(sys.executable).as_posix()}',
       '-DZEPHYR_TOOLCHAIN_VARIANT=zephyr',
@@ -797,21 +802,26 @@ def test_projectbuilder_log_info(
 
 
 TESTDATA_5 = [
-    (True, False, False, "Valgrind error", 0, 0, 'build_dir/valgrind.log'),
-    (True, False, False, "Error", 0, 0, 'build_dir/build.log'),
-    (False, True, False, None, 1024, 0, 'build_dir/handler.log'),
-    (False, True, False, None, 0, 0, 'build_dir/build.log'),
-    (False, False, True, None, 0, 1024, 'build_dir/device.log'),
-    (False, False, True, None, 0, 0, 'build_dir/build.log'),
-    (False, False, False, None, 0, 0, 'build_dir/build.log'),
+    (True, False, False, "Valgrind error", 0, 0, 0, ['build_dir/valgrind.log']),
+    (True, False, False, "Error", 0, 0, 0, ['build_dir/build.log']),
+    (False, True, False, None, 1024, 0, 0, ['build_dir/handler.log']),
+    (False, True, False, None, 1024, 512, 0,
+     ['build_dir/handler.log', 'build_dir/handler_stderr.log']),
+    (False, True, False, None, 0, 512, 0, ['build_dir/handler_stderr.log']),
+    (False, True, False, None, 0, 0, 0, ['build_dir/build.log']),
+    (False, False, True, None, 0, 0, 1024, ['build_dir/device.log']),
+    (False, False, True, None, 0, 0, 0, ['build_dir/build.log']),
+    (False, False, False, None, 0, 0, 0, ['build_dir/build.log']),
 ]
 
 @pytest.mark.parametrize(
     'valgrind_log_exists, handler_log_exists, device_log_exists,' \
-    ' instance_reason, handler_log_getsize, device_log_getsize, expected_log',
+    ' instance_reason, handler_log_getsize, handler_stderr_log_getsize,' \
+    ' device_log_getsize, expected_logs',
     TESTDATA_5,
     ids=['valgrind log', 'valgrind log unused',
-         'handler log', 'handler log unused',
+         'handler log', 'handler log with stderr', 'stderr only',
+         'handler log unused',
          'device log', 'device log unused',
          'no logs']
 )
@@ -823,12 +833,15 @@ def test_projectbuilder_log_info_file(
     device_log_exists,
     instance_reason,
     handler_log_getsize,
+    handler_stderr_log_getsize,
     device_log_getsize,
-    expected_log
+    expected_logs
 ):
     def mock_exists(filename, *args, **kwargs):
         if filename == 'build_dir/handler.log':
             return handler_log_exists
+        if filename == 'build_dir/handler_stderr.log':
+            return handler_stderr_log_getsize > 0
         if filename == 'build_dir/valgrind.log':
             return valgrind_log_exists
         if filename == 'build_dir/device.log':
@@ -838,6 +851,8 @@ def test_projectbuilder_log_info_file(
     def mock_getsize(filename, *args, **kwargs):
         if filename == 'build_dir/handler.log':
             return handler_log_getsize
+        if filename == 'build_dir/handler_stderr.log':
+            return handler_stderr_log_getsize
         if filename == 'build_dir/device.log':
             return device_log_getsize
         return 0
@@ -856,7 +871,9 @@ def test_projectbuilder_log_info_file(
          mock.patch('twisterlib.runner.ProjectBuilder.log_info', log_info_mock):
         pb.log_info_file(None)
 
-    log_info_mock.assert_called_with(expected_log, mock.ANY)
+    assert log_info_mock.call_args_list == [
+        mock.call(expected_log, mock.ANY) for expected_log in expected_logs
+    ]
 
 
 TESTDATA_6 = [
@@ -2386,6 +2403,59 @@ def test_projectbuilder_cmake():
     pb.run_cmake.assert_called_once_with(['dummy'], ['dummy filter'])
 
 
+@pytest.mark.parametrize(
+    'platform_aliases, selector, expected_args',
+    [
+        (
+            [
+                'mimxrt700_evk@mx25um51345g/mimxrt798s/cm33_cpu0',
+                'mimxrt700_evk/mimxrt798s/cm33_cpu0',
+            ],
+            'mimxrt700_evk/mimxrt798s/cm33_cpu0',
+            ['SHIELD=zc143ac72mipi'],
+        ),
+        (
+            ['mimxrt700_evk@w25q512nw/mimxrt798s/cm33_cpu0'],
+            'mimxrt700_evk/mimxrt798s/cm33_cpu0',
+            [],
+        ),
+        (
+            ['mimxrt700_evk@w25q512nw/mimxrt798s/cm33_cpu0'],
+            'mimxrt700_evk@mx25um51345g/mimxrt798s/cm33_cpu0',
+            [],
+        ),
+        (
+            ['nrf54l15dk/nrf54l15/cpuapp'],
+            'nrf54l',
+            ['SHIELD=zc143ac72mipi'],
+        ),
+    ],
+)
+def test_projectbuilder_cmake_platform_extra_args_matches_platform_aliases(
+    mocked_jobserver, platform_aliases, selector, expected_args
+):
+    instance_mock = mock.Mock()
+    instance_mock.handler = mock.Mock(ready=False)
+    instance_mock.build_dir = os.path.join('build', 'dir')
+    instance_mock.platform.name = platform_aliases[0]
+    instance_mock.platform.aliases = platform_aliases
+    env_mock = mock.Mock()
+
+    pb = ProjectBuilder(instance_mock, env_mock, mocked_jobserver)
+    pb.testsuite.extra_args = [f'platform:{selector}:SHIELD=zc143ac72mipi']
+    pb.testsuite.conf_files = []
+    pb.testsuite.extra_conf_files = []
+    pb.testsuite.extra_overlay_confs = []
+    pb.testsuite.extra_dtc_overlay_files = []
+    pb.options.extra_args = []
+    pb.cmake_assemble_args = mock.Mock(return_value=['dummy'])
+    pb.run_cmake = mock.Mock()
+
+    pb.cmake()
+
+    assert pb.cmake_assemble_args.call_args.args[0] == expected_args
+
+
 def test_projectbuilder_build(mocked_jobserver):
     instance_mock = mock.Mock()
     instance_mock.testsuite.harness = 'test'
@@ -2591,6 +2661,8 @@ def test_projectbuilder_run(
     instance_mock.platform.arch = platform_arch
     instance_mock.testsuite.harness = harness
     instance_mock.sidecar = None
+    # A reason left over from a loaded test plan or a previous iteration.
+    instance_mock.reason = 'stale'
     env_mock = mock.Mock()
 
     pb = ProjectBuilder(instance_mock, env_mock, mocked_jobserver)
@@ -2602,6 +2674,12 @@ def test_projectbuilder_run(
     with mock.patch('twisterlib.runner.HarnessImporter.get_harness',
                     mock_harness):
         pb.run()
+
+    if ready:
+        assert instance_mock.status == TwisterStatus.NONE
+        assert instance_mock.reason is None
+    else:
+        assert instance_mock.reason == 'stale'
 
     if expect_parse_generated:
         pb.parse_generated.assert_called_once()
@@ -2934,6 +3012,7 @@ def test_twisterrunner_run(
         return None
 
     instances = {'dummy instance': mock.Mock(metrics={'k': 'v'})}
+    instances['dummy instance'].testsuite.extra_args = ['platform:native_sim:MAKE=/opt/make']
     suites = [mock.Mock()]
     env_mock = mock.Mock()
 
@@ -2943,6 +3022,7 @@ def test_twisterrunner_run(
     tr.options.retry_build_errors = True
     tr.options.jobs = None
     tr.options.build_only = None
+    tr.options.extra_args = ['USE_CCACHE=0']
     for k, v in options.items():
         setattr(tr.options, k, v)
     tr.update_counting_before_pipeline = mock.Mock()
@@ -2953,6 +3033,7 @@ def test_twisterrunner_run(
     gnumakejobserver_mock().name='GNUMakeJobServer'
     jobclient_mock = mock.Mock()
     jobclient_mock().name='JobClient'
+    fifo_supported_mock = mock.Mock(return_value=True)
 
     processing_queue = deque()
     processing_ready = {}
@@ -2984,6 +3065,7 @@ def test_twisterrunner_run(
                     mock_client_from_environ), \
          mock.patch('twisterlib.runner.GNUMakeJobServer',
                     gnumakejobserver_mock), \
+         mock.patch('twisterlib.runner.fifo_supported', fifo_supported_mock), \
          mock.patch('twisterlib.runner.JobClient', jobclient_mock), \
          mock.patch('multiprocessing.cpu_count', return_value=8), \
          mock.patch('sys.platform', platform), \
@@ -2992,6 +3074,13 @@ def test_twisterrunner_run(
         tr.run()
 
     assert f'JOBS: {expected_jobs}' in caplog.text
+
+    if expected_jobserver == 'GNUMakeJobServer':
+        fifo_supported_mock.assert_called_once_with(
+            env_mock.generator_cmd,
+            ['USE_CCACHE=0', 'platform:native_sim:MAKE=/opt/make'],
+        )
+        gnumakejobserver_mock.assert_called_with(expected_jobs, fifo=True)
 
     assert tr.jobserver.name == expected_jobserver
 

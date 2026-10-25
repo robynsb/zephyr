@@ -156,9 +156,9 @@ const __imx_boot_container_section container boot_header = {
 
 /* Handle CM7 core initialization based on execution mode */
 #if !defined(CONFIG_CM7_BOOT_FROM_FLASH)
-#define CM7_BOOT_ADDRESS   (CM7_FLASH_ADDR + CONFIG_CM7_FLEXSPI_OFFSET - ADJUSTED_LMA)
+#define CM7_BOOT_ADDRESS   (CM7_FLASH_ADDR - ADJUSTED_LMA)
 #else
-#define CM7_BOOT_ADDRESS   (CM7_FLASH_ADDR + CONFIG_CM7_FLEXSPI_OFFSET)
+#define CM7_BOOT_ADDRESS   CM7_FLASH_ADDR
 #endif /* defined(CONFIG_CM7_BOOT_FROM_FLASH) */
 #endif /* (defined(CONFIG_SECOND_CORE_MCUX) && defined(CONFIG_CPU_CORTEX_M33)) */
 
@@ -500,7 +500,8 @@ __weak void clock_init(void)
 
 #endif /* CONFIG_COMPARATOR_MCUX_ACMP || CONFIG_SENSOR_MCUX_ACMP */
 
-#if defined(CONFIG_ETH_NXP_IMX_NETC) && (DT_CHILD_NUM_STATUS_OKAY(DT_NODELABEL(netc)) != 0)
+#if (defined(CONFIG_ETH_NXP_IMX_NETC) || defined(CONFIG_MDIO_NXP_IMX_NETC)) && \
+	(DT_CHILD_NUM_STATUS_OKAY(DT_NODELABEL(netc)) != 0)
 	/* Configure ENET using SYS_PLL1_DIV2_CLK */
 	rootCfg.mux = kCLOCK_ENET_ClockRoot_MuxSysPll1Div2;
 	rootCfg.div = 4;
@@ -554,8 +555,8 @@ __weak void clock_init(void)
 		~BLK_CTRL_WAKEUPMIX_NETC_PORT_MISC_CFG_PORT4_RMII_REF_CLK_DIR_MASK;
 
 	/* Set TMR 1588 Ref clock source. */
-	BLK_CTRL_WAKEUPMIX->NETC_PORT_MISC_CFG |=
-		BLK_CTRL_WAKEUPMIX_NETC_PORT_MISC_CFG_TMR_EXT_CLK_SEL_MASK;
+	BLK_CTRL_WAKEUPMIX->NETC_PORT_MISC_CFG &=
+		~BLK_CTRL_WAKEUPMIX_NETC_PORT_MISC_CFG_TMR_EXT_CLK_SEL_MASK;
 #endif
 
 #ifdef CONFIG_CAN_MCUX_FLEXCAN

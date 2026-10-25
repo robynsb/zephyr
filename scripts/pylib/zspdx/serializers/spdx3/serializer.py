@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: Copyright The Zephyr Project Contributors
 # SPDX-License-Identifier: Apache-2.0
 
+import importlib
 import logging
 import os
 import re
@@ -22,11 +23,12 @@ from zspdx.model import (
 from zspdx.serializers.helpers import (
     CPE23TYPE_REGEX,
     PURL_REGEX,
+    format_blob_comment,
     generate_download_url,
-    get_standard_licenses,
     normalize_spdx_name,
 )
 from zspdx.spdxids import get_unique_file_id
+from zspdx.version import SPDX_VERSION_3_0, SPDX_VERSION_3_1
 
 _logger = logging.getLogger(__name__)
 
@@ -50,9 +52,24 @@ class SPDX3Serializer:
     # does not provide an absolute URI of its own.
     _DEFAULT_BUILD_TYPE = "urn:spdx.dev:zephyr-cmake"
 
-    def __init__(self, sbom_graph: SBOMGraph, spdx_version=None):
+    def __init__(self, sbom_graph: SBOMGraph, spdx_version=SPDX_VERSION_3_0):
         self.sbom_data = sbom_graph
-        self.spdx_version = spdx_version  # Not used for SPDX 3.0, but kept for API consistency
+        self.spdx_version = spdx_version
+
+        # Select the SPDX 3.x Python bindings matching the requested spec version.
+        # v3.1 is a strict superset of v3.0.1 with identical public class names, so
+        # only the binding module (which drives the emitted JSON-LD @context) and the
+        # specVersion string differ; the rest of the serializer stays version-agnostic.
+        if spdx_version == SPDX_VERSION_3_0:
+            self.spec_version = "3.0.1"
+            bindings = "v3_0_1"
+        elif spdx_version == SPDX_VERSION_3_1:
+            self.spec_version = "3.1.0"
+            bindings = "v3_1"
+        else:
+            raise ValueError(f"Unsupported SPDX version: {spdx_version}")
+        global spdx
+        spdx = getattr(importlib.import_module("spdx_python_model"), bindings)
 
         # Track SPDX 3.0 elements
         self.elements = []  # All SPDX3 elements (packages, files, relationships, etc.)
@@ -87,26 +104,11 @@ class SPDX3Serializer:
         # re-serializing them in every document that mentions them.
         self._element_home = None
 
-        # Namespace prefixes for shortened IDs
-        self.namespace_prefixes = {}
-        if self.sbom_data.namespace_prefix:
-            prefix = "zephyr"
-            uri = self.sbom_data.namespace_prefix.rstrip("/") + "/"
-            self.namespace_prefixes[uri] = prefix
-
-    def _shorten_id(self, full_uri: str) -> str:
-        """Shorten a URI-based ID using known namespace prefixes."""
-        for ns_uri, prefix in self.namespace_prefixes.items():
-            if full_uri.startswith(ns_uri):
-                return full_uri.replace(ns_uri, f"{prefix}:", 1)
-        return full_uri
-
     def _generate_package_id(self, component_name: str) -> str:
         """Generate URI-based ID for a package."""
         normalized = normalize_spdx_name(component_name)
         namespace = self.sbom_data.namespace_prefix.rstrip("/")
-        full_uri = f"{namespace}/packages/{normalized}"
-        return self._shorten_id(full_uri)
+        return f"{namespace}/packages/{normalized}"
 
     def _generate_file_id(self, file_path: str) -> str:
         """Generate URI-based ID for a file."""
@@ -115,14 +117,12 @@ class SPDX3Serializer:
         # Remove "SPDXRef-" prefix and normalize
         normalized_id = unique_id.replace("SPDXRef-", "").replace("_", "-")
         namespace = self.sbom_data.namespace_prefix.rstrip("/")
-        full_uri = f"{namespace}/files/{normalized_id}"
-        return self._shorten_id(full_uri)
+        return f"{namespace}/files/{normalized_id}"
 
     def _generate_relationship_id(self, index: int) -> str:
         """Generate URI-based ID for a relationship."""
         namespace = self.sbom_data.namespace_prefix.rstrip("/")
-        full_uri = f"{namespace}/relationships/{index}"
-        return self._shorten_id(full_uri)
+        return f"{namespace}/relationships/{index}"
 
     def _purpose_to_spdx3(self, purpose: ComponentPurpose) -> spdx.software_SoftwarePurpose:
         """Convert ComponentPurpose enum to SPDX 3.0 SoftwarePurpose."""
@@ -148,13 +148,13 @@ class SPDX3Serializer:
         if self.tool is None:
             # Create the creator agent (required by createdBy)
             self.creator_agent = spdx.SoftwareAgent()
-            self.creator_agent._id = self._shorten_id(f"{namespace}/agents/west-spdx-agent")
+            self.creator_agent._id = f"{namespace}/agents/west-spdx-agent"
             self.creator_agent.name = "West SPDX Generator"
             self.elements.append(self.creator_agent)
 
             # Create the tool (for createdUsing)
             self.tool = spdx.Tool()
-            self.tool._id = self._shorten_id(f"{namespace}/tools/west-spdx")
+            self.tool._id = f"{namespace}/tools/west-spdx"
             self.tool.name = self.sbom_data.metadata.get("tool_name") or "West SPDX Tool"
             # SPDX 3.0 has no Tool version field; record it as a packageUrl external
             # identifier, mirroring how the Build profile tools carry their version.
@@ -168,13 +168,13 @@ class SPDX3Serializer:
 
         if self.creation_info is None:
             self.creation_info = spdx.CreationInfo()
-            self.creation_info._id = self._shorten_id(f"{namespace}/creationinfo")
+            self.creation_info._id = f"{namespace}/creationinfo"
             self.creation_info.created = datetime.now(UTC)
             # createdBy references the Agent that created this SPDX document (REQUIRED)
             self.creation_info.createdBy.append(self.creator_agent._id)
             # createdUsing references the Tool that created this SPDX document (optional)
             self.creation_info.createdUsing.append(self.tool._id)
-            self.creation_info.specVersion = "3.0.1"
+            self.creation_info.specVersion = self.spec_version
             self.elements.append(self.creation_info)
 
             # Now set the tool's and agent's creationInfo
@@ -207,7 +207,7 @@ class SPDX3Serializer:
             namespace = self.sbom_data.namespace_prefix.rstrip("/")
             slug = normalize_spdx_name(name).lower().replace(" ", "-")
             agent = spdx.Organization()
-            agent._id = self._shorten_id(f"{namespace}/agents/{slug}")
+            agent._id = f"{namespace}/agents/{slug}"
             agent.name = name
             agent.creationInfo = self.creation_info._id
             self.elements.append(agent)
@@ -228,7 +228,7 @@ class SPDX3Serializer:
         """
         namespace = self.sbom_data.namespace_prefix.rstrip("/")
         tool = spdx.Tool()
-        tool._id = self._shorten_id(f"{namespace}/tools/{key}")
+        tool._id = f"{namespace}/tools/{key}"
         tool.name = name
         tool.creationInfo = self.creation_info._id
 
@@ -327,7 +327,7 @@ class SPDX3Serializer:
 
         namespace = self.sbom_data.namespace_prefix.rstrip("/")
         self.build = spdx.build_Build()
-        self.build._id = self._shorten_id(f"{namespace}/builds/default")
+        self.build._id = f"{namespace}/builds/default"
         self.build.creationInfo = self.creation_info._id
         self.build.build_buildType = self._DEFAULT_BUILD_TYPE
 
@@ -482,9 +482,7 @@ class SPDX3Serializer:
         """
         namespace = self.sbom_data.namespace_prefix.rstrip("/")
         target_build = spdx.build_Build()
-        target_build._id = self._shorten_id(
-            f"{namespace}/builds/{normalize_spdx_name(component.name)}"
-        )
+        target_build._id = f"{namespace}/builds/{normalize_spdx_name(component.name)}"
         target_build.creationInfo = self.creation_info._id
         target_build.build_buildType = self.build.build_buildType
         # per-language compile flags and defines used to produce this artifact
@@ -632,6 +630,13 @@ class SPDX3Serializer:
         # Copyright
         file_element.software_copyrightText = file_obj.copyright_text or NOASSERTION
 
+        # blob provenance metadata, for files that modules declare as blobs
+        blob = file_obj.metadata.get("blob")
+        if blob:
+            file_element.comment = format_blob_comment(blob)
+            if blob.get("description"):
+                file_element.description = blob["description"]
+
         # Hashes - SPDX 3.0 uses verifiedUsing with Hash (which is a type of IntegrityMethod)
         for hash_type, hash_value in file_obj.hashes.items():
             if hash_value:
@@ -640,13 +645,16 @@ class SPDX3Serializer:
                     hash_obj.algorithm = spdx.HashAlgorithm.sha1
                 elif hash_type == "SHA256":
                     hash_obj.algorithm = spdx.HashAlgorithm.sha256
-                elif hash_type == "MD5":
-                    hash_obj.algorithm = spdx.HashAlgorithm.md5
+                elif hash_type == "SHA512":
+                    hash_obj.algorithm = spdx.HashAlgorithm.sha512
                 else:
                     _logger.warning(f"Unknown hash algorithm: {hash_type}")
                     continue
                 hash_obj.hashValue = hash_value
                 file_element.verifiedUsing.append(hash_obj)
+
+        if self.spdx_version == SPDX_VERSION_3_1 and file_obj.size is not None:
+            file_element.software_artifactSize = file_obj.size
 
         # License information will be added via relationships after file creation
 
@@ -760,19 +768,15 @@ class SPDX3Serializer:
             return None
 
         license_expr = spdx.simplelicensing_LicenseExpression()
-        standard_licenses = get_standard_licenses()
-
-        # Check if it's a standard license ID
-        if license_str in standard_licenses:
-            license_expr._id = f"https://spdx.org/licenses/{license_str}"
-        else:
-            # Custom license - use a namespace-based ID
-            namespace = self.sbom_data.namespace_prefix.rstrip("/")
-            # Normalize the license string for use in URI
-            normalized = normalize_spdx_name(
-                license_str.replace(" ", "-").replace("(", "").replace(")", "")
-            )
-            license_expr._id = self._shorten_id(f"{namespace}/licenses/{normalized}")
+        # License List licenses are defined here too, under the build namespace:
+        # spdx.org does not serve SPDX 3 elements at https://spdx.org/licenses/<id>,
+        # and defining that IRI in every build would give it one creationInfo per build.
+        namespace = self.sbom_data.namespace_prefix.rstrip("/")
+        # Normalize the license string for use in URI
+        normalized = normalize_spdx_name(
+            license_str.replace(" ", "-").replace("(", "").replace(")", "")
+        )
+        license_expr._id = f"{namespace}/licenses/{normalized}"
 
         license_expr.simplelicensing_licenseExpression = license_str
         license_expr.creationInfo = self.creation_info._id
@@ -870,7 +874,7 @@ class SPDX3Serializer:
         return document
 
     def _new_spdx_document(self, sbom_doc: SBOMDocument) -> spdx.SpdxDocument:
-        """Build the SpdxDocument shell: identity, namespaces, name and licensing."""
+        """Build the SpdxDocument shell: identity, name and licensing."""
         document = spdx.SpdxDocument()
 
         # Use the document's own namespace when set, otherwise the global prefix.
@@ -879,13 +883,7 @@ class SPDX3Serializer:
             if sbom_doc.namespace
             else self.sbom_data.namespace_prefix.rstrip("/")
         )
-        document._id = self._shorten_id(f"{namespace}/documents/{sbom_doc.name}")
-
-        for uri, prefix in self.namespace_prefixes.items():
-            ns_map = spdx.NamespaceMap()
-            ns_map.prefix = prefix
-            ns_map.namespace = uri
-            document.namespaceMap.append(ns_map)
+        document._id = f"{namespace}/documents/{sbom_doc.name}"
 
         document.name = self._DOCUMENT_NAMES.get(
             sbom_doc.name, f"Zephyr {sbom_doc.name.capitalize()}"

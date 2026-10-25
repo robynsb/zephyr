@@ -180,7 +180,7 @@ struct gpio_pca_series_part_config {
 struct gpio_pca_series_config {
 	struct gpio_driver_config common; /* gpio_driver_config needs to be first */
 	struct i2c_dt_spec i2c;           /* i2c bus dt spec */
-	const struct gpio_pca_series_part_config *part_cfg; /* config of part unmber */
+	const struct gpio_pca_series_part_config *part_cfg; /* config of part number */
 	struct gpio_dt_spec gpio_rst;                       /* device reset gpio */
 	bool automatic_reset;
 #ifdef CONFIG_GPIO_PCA_SERIES_INTERRUPT
@@ -1444,8 +1444,8 @@ static int gpio_pca_series_pin_interrupt_configure_standard(
 		}
 	}
 
-	int_mask = int_fall | int_rise;
-	input_latch = ~int_mask;
+	input_latch = int_fall | int_rise;
+	int_mask = ~input_latch;
 
 #ifdef CONFIG_GPIO_PCA_SERIES_CACHE_ALL
 	/** read from cache even if this register is not present on device */

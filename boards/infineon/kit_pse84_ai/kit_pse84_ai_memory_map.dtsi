@@ -1,6 +1,6 @@
 /*
- * SPDX-FileCopyrightText: <text>Copyright (c) 2026 Infineon Technologies AG,
- * or an affiliate of Infineon Technologies AG. All rights reserved.</text>
+ * SPDX-FileCopyrightText: Copyright (c) 2026 Infineon Technologies AG,
+ * SPDX-FileCopyrightText: or an affiliate of Infineon Technologies AG. All rights reserved.
  *
  * SPDX-License-Identifier: Apache-2.0
  */
@@ -111,10 +111,10 @@
 					reg = <0 DT_SIZE_M(1)>;
 				};
 
-				m33_xip: m33_xip@340400 {
+				m33_xip: m33_xip@340000 {
 					compatible = "zephyr,mapped-partition";
 					label = "m33-xip";
-					reg = <0x340400 DT_SIZE_M(2)>;
+					reg = <0x340000 DT_SIZE_M(2)>;
 				};
 			};
 		};
@@ -140,16 +140,10 @@
 				#size-cells = <1>;
 				ranges;
 
-				m33s_header: m33s_header@100000 {
-					compatible = "zephyr,mapped-partition";
-					label = "m33s-header";
-					reg = <0x100000 0x400>;
-				};
-
-				m33s_xip: m33s_xip@100400 {
+				m33s_xip: m33s_xip@100000 {
 					compatible = "zephyr,mapped-partition";
 					label = "m33s-xip";
-					reg = <0x100400 0x1ffc00>;
+					reg = <0x100000 0x200000>;
 				};
 			};
 		};
@@ -161,12 +155,12 @@
 		 * through the SAHB alias as cm55 does not have
 		 * instruction-cached execution for external flash.
 		 */
-		flash0_sahb: flash0_sahb@70000000 {
+		flash0_sahb: flash0_sahb@60000000 {
 			compatible = "soc-nv-flash";
-			reg = <0x70000000 DT_SIZE_M(64)>;
+			reg = <0x60000000 DT_SIZE_M(64)>;
 			#address-cells = <1>;
 			#size-cells = <1>;
-			ranges = <0x0 0x70000000 DT_SIZE_M(64)>;
+			ranges = <0x0 0x60000000 DT_SIZE_M(64)>;
 			write-block-size = <16>;
 			erase-block-size = <65536>;
 

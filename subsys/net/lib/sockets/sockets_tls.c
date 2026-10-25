@@ -177,6 +177,9 @@ struct tls_session_context {
 	/* DTLS peer address length. */
 	net_socklen_t dtls_peer_addrlen;
 
+	/* The local address this session's data came in on (server side only). */
+	struct net_sockaddr_storage dtls_local_addr;
+
 	/* DTLS session expiry time (server only). */
 	k_timepoint_t session_expiry;
 #endif /* CONFIG_NET_SOCKETS_ENABLE_DTLS */
@@ -244,6 +247,15 @@ __net_socket struct tls_context {
 
 		/** DTLS role, client by default. */
 		int8_t role;
+
+		/** Per-socket MFL override for ZSOCK_TLS_MAX_FRAGMENT_LENGTH.
+		 *  -1: use global Kconfig-derived value (default), also
+		 *      settable via ZSOCK_TLS_MFL_DEFAULT to reset an
+		 *      already overridden socket back to the global value.
+		 *   0: disable MFL extension (ZSOCK_TLS_MFL_DISABLED).
+		 *  1-4: ZSOCK_TLS_MFL_512 through ZSOCK_TLS_MFL_4096.
+		 */
+		int8_t mfl_code;
 
 		/** NULL-terminated list of allowed application layer
 		 * protocols.
@@ -440,7 +452,7 @@ static void tls_session_cache_settings_clear(void)
 #endif /* CONFIG_NET_SOCKETS_TLS_SESSION_CACHE_PERSISTENT */
 
 /* A mutex for protecting TLS context allocation. */
-static struct k_mutex context_lock;
+static K_MUTEX_DEFINE(context_lock);
 
 /* Arbitrary delay value to wait if Mbed TLS reports it cannot proceed for
  * reasons other than TX/RX block.
@@ -556,8 +568,6 @@ static int tls_init(void)
 	(void)memset(tls_contexts, 0, sizeof(tls_contexts));
 	(void)memset(client_cache, 0, sizeof(client_cache));
 
-	k_mutex_init(&context_lock);
-
 #if defined(MBEDTLS_SSL_CACHE_C)
 	mbedtls_ssl_cache_init(&server_cache);
 #endif
@@ -590,8 +600,7 @@ static inline bool is_handshake_complete(struct tls_session_context *session_ctx
 	)
 
 #if defined(CONFIG_NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH) &&	\
-	defined(MBEDTLS_SSL_MAX_FRAGMENT_LENGTH) &&		\
-	(MBEDTLS_TLS_EXT_ADV_CONTENT_LEN < 16384)
+	defined(MBEDTLS_SSL_MAX_FRAGMENT_LENGTH)
 
 BUILD_ASSERT(MBEDTLS_TLS_EXT_ADV_CONTENT_LEN >= 512,
 	     "Too small content length!");
@@ -611,10 +620,25 @@ static inline unsigned char tls_mfl_code_from_content_len(size_t len)
 	}
 }
 
-static inline void tls_set_max_frag_len(mbedtls_ssl_config *config, enum net_sock_type type)
+static inline void tls_set_max_frag_len(struct tls_context *context, enum net_sock_type type)
 {
 	unsigned char mfl_code;
-	size_t len = MBEDTLS_TLS_EXT_ADV_CONTENT_LEN;
+	size_t len;
+
+	if (context->options.mfl_code > ZSOCK_TLS_MFL_DISABLED) {
+		/* Per-socket override: codes 1-4 map directly to mbedTLS codes. */
+		mbedtls_ssl_conf_max_frag_len(&context->config,
+					      (unsigned char)context->options.mfl_code);
+		return;
+	} else if (context->options.mfl_code == ZSOCK_TLS_MFL_DISABLED) {
+		/* Explicitly disabled: leave conf->mfl_code at its default NONE,
+		 * which suppresses the extension in ClientHello.
+		 */
+		return;
+	}
+
+	/* mfl_code == -1: fall back to global Kconfig-derived value. */
+	len = MBEDTLS_TLS_EXT_ADV_CONTENT_LEN;
 
 #if defined(CONFIG_NET_SOCKETS_ENABLE_DTLS)
 	if (type == NET_SOCK_DGRAM && len > CONFIG_NET_SOCKETS_DTLS_MAX_FRAGMENT_LENGTH) {
@@ -623,10 +647,10 @@ static inline void tls_set_max_frag_len(mbedtls_ssl_config *config, enum net_soc
 #endif
 	mfl_code = tls_mfl_code_from_content_len(len);
 
-	mbedtls_ssl_conf_max_frag_len(config, mfl_code);
+	mbedtls_ssl_conf_max_frag_len(&context->config, mfl_code);
 }
 #else
-static inline void tls_set_max_frag_len(mbedtls_ssl_config *config, enum net_sock_type type) {}
+static inline void tls_set_max_frag_len(struct tls_context *context, enum net_sock_type type) {}
 #endif
 
 static struct tls_session_context *tls_session_alloc(void)
@@ -675,6 +699,7 @@ static struct tls_context *tls_alloc(void)
 
 			tls->is_used = true;
 			tls->options.verify_level = -1;
+			tls->options.mfl_code = -1;
 			tls->options.timeout_tx = K_FOREVER;
 			tls->options.timeout_rx = K_FOREVER;
 			tls->sock = -1;
@@ -1138,15 +1163,64 @@ static void dtls_peer_address_get(struct tls_session_context *session_ctx,
 static int dtls_tx(void *ctx, const unsigned char *buf, size_t len)
 {
 	struct tls_context *tls_ctx = ctx;
+	struct net_sockaddr_storage *local_addr = NULL;
 	ssize_t sent;
 
 	if (tls_ctx->options.role == MBEDTLS_SSL_IS_SERVER) {
 		dtls_server_refresh_session_timeout(tls_ctx->active_session);
+
+		if (tls_ctx->active_session->dtls_local_addr.ss_family != NET_AF_UNSPEC) {
+			local_addr = &tls_ctx->active_session->dtls_local_addr;
+		}
 	}
 
-	sent = zsock_sendto(tls_ctx->sock, buf, len, ZSOCK_MSG_DONTWAIT,
-			    net_sad(&tls_ctx->active_session->dtls_peer_addr),
-			    tls_ctx->active_session->dtls_peer_addrlen);
+	if (local_addr != NULL) {
+		/* A union keeps this properly aligned for net_cmsghdr, not just a byte array. */
+		union {
+			struct net_cmsghdr hdr;
+			uint8_t buf[NET_CMSG_SPACE(sizeof(struct net_in6_pktinfo))];
+		} cmsg_storage = { 0 };
+		uint8_t *cmsg_buf = cmsg_storage.buf;
+		struct net_cmsghdr *cmsg = &cmsg_storage.hdr;
+		struct net_iovec io_vec = { .iov_base = (void *)buf, .iov_len = len };
+		struct net_msghdr msg = {
+			.msg_name = net_sad(&tls_ctx->active_session->dtls_peer_addr),
+			.msg_namelen = tls_ctx->active_session->dtls_peer_addrlen,
+			.msg_iov = &io_vec,
+			.msg_iovlen = 1,
+			.msg_control = cmsg_buf,
+			.msg_controllen = sizeof(cmsg_storage.buf),
+		};
+
+		if (IS_ENABLED(CONFIG_NET_IPV6) && local_addr->ss_family == NET_AF_INET6) {
+			struct net_in6_pktinfo info = {
+				.ipi6_addr = ((struct net_sockaddr_in6 *)local_addr)->sin6_addr,
+			};
+
+			cmsg->cmsg_level = NET_IPPROTO_IPV6;
+			cmsg->cmsg_type = ZSOCK_IPV6_PKTINFO;
+			cmsg->cmsg_len = NET_CMSG_LEN(sizeof(info));
+			memcpy(NET_CMSG_DATA(cmsg), &info, sizeof(info));
+			msg.msg_controllen = NET_CMSG_SPACE(sizeof(info));
+		} else if (IS_ENABLED(CONFIG_NET_IPV4) && local_addr->ss_family == NET_AF_INET) {
+			struct net_in_pktinfo info = {
+				.ipi_spec_dst = ((struct net_sockaddr_in *)local_addr)->sin_addr,
+			};
+
+			cmsg->cmsg_level = NET_IPPROTO_IP;
+			cmsg->cmsg_type = ZSOCK_IP_PKTINFO;
+			cmsg->cmsg_len = NET_CMSG_LEN(sizeof(info));
+			memcpy(NET_CMSG_DATA(cmsg), &info, sizeof(info));
+			msg.msg_controllen = NET_CMSG_SPACE(sizeof(info));
+		}
+
+		sent = zsock_sendmsg(tls_ctx->sock, &msg, ZSOCK_MSG_DONTWAIT);
+	} else {
+		sent = zsock_sendto(tls_ctx->sock, buf, len, ZSOCK_MSG_DONTWAIT,
+				    net_sad(&tls_ctx->active_session->dtls_peer_addr),
+				    tls_ctx->active_session->dtls_peer_addrlen);
+	}
+
 	if (sent < 0) {
 		if (errno == EAGAIN) {
 			return MBEDTLS_ERR_SSL_WANT_WRITE;
@@ -1158,11 +1232,62 @@ static int dtls_tx(void *ctx, const unsigned char *buf, size_t len)
 	return sent;
 }
 
+/* Get the local address a DTLS packet came in on, from IPV6_PKTINFO/IP_PKTINFO.
+ * If that address turns out to be multicast, we leave it unset instead of
+ * storing it. That way the reply just goes out through plain sendto(), and
+ * the OS picks a normal address to send it from - replying "from" a
+ * multicast address wouldn't make sense.
+ */
+static void dtls_server_local_addr_from_cmsg(struct net_msghdr *msg,
+					     struct net_sockaddr_storage *local_addr)
+{
+	struct net_cmsghdr *cmsg;
+
+	local_addr->ss_family = NET_AF_UNSPEC;
+
+	for (cmsg = NET_CMSG_FIRSTHDR(msg); cmsg != NULL; cmsg = NET_CMSG_NXTHDR(msg, cmsg)) {
+		if (IS_ENABLED(CONFIG_NET_IPV6) && cmsg->cmsg_level == NET_IPPROTO_IPV6 &&
+		    cmsg->cmsg_type == ZSOCK_IPV6_PKTINFO &&
+		    cmsg->cmsg_len == NET_CMSG_LEN(sizeof(struct net_in6_pktinfo))) {
+			struct net_in6_pktinfo *info =
+				(struct net_in6_pktinfo *)NET_CMSG_DATA(cmsg);
+			struct net_sockaddr_in6 *addr6 = (struct net_sockaddr_in6 *)local_addr;
+
+			if (!net_ipv6_is_addr_mcast(&info->ipi6_addr)) {
+				addr6->sin6_family = NET_AF_INET6;
+				addr6->sin6_addr = info->ipi6_addr;
+			}
+			return;
+		}
+
+		if (IS_ENABLED(CONFIG_NET_IPV4) && cmsg->cmsg_level == NET_IPPROTO_IP &&
+		    cmsg->cmsg_type == ZSOCK_IP_PKTINFO &&
+		    cmsg->cmsg_len == NET_CMSG_LEN(sizeof(struct net_in_pktinfo))) {
+			struct net_in_pktinfo *info = (struct net_in_pktinfo *)NET_CMSG_DATA(cmsg);
+			struct net_sockaddr_in *addr4 = (struct net_sockaddr_in *)local_addr;
+
+			if (!net_ipv4_is_addr_mcast(&info->ipi_addr)) {
+				addr4->sin_family = NET_AF_INET;
+				addr4->sin_addr = info->ipi_addr;
+			}
+			return;
+		}
+	}
+}
+
 static int dtls_server_rx(void *ctx, unsigned char *buf, size_t len)
 {
 	struct tls_context *tls_ctx = ctx;
-	net_socklen_t addrlen = sizeof(struct net_sockaddr);
+	net_socklen_t addrlen = sizeof(struct net_sockaddr_storage);
 	struct net_sockaddr_storage addr = { 0 };
+	struct net_sockaddr_storage local_addr = { 0 };
+	union {
+		struct net_cmsghdr hdr;
+		uint8_t buf[NET_CMSG_SPACE(sizeof(struct net_in6_pktinfo))];
+	} cmsg_storage = { 0 };
+	uint8_t *cmsg_buf = cmsg_storage.buf;
+	struct net_iovec io_vec;
+	struct net_msghdr msg;
 	int err;
 	ssize_t received;
 	uint8_t tmp_buf;
@@ -1189,13 +1314,29 @@ static int dtls_server_rx(void *ctx, unsigned char *buf, size_t len)
 		return MBEDTLS_ERR_SSL_WANT_READ;
 	}
 
-	/* If the session matches, read the actual packet. */
-	received = zsock_recvfrom(tls_ctx->sock, buf, len,
-				  ZSOCK_MSG_DONTWAIT, net_sad(&addr), &addrlen);
+	/* If the session matches, use recvmsg() to read the packet and its local address. */
+	memset(cmsg_buf, 0, sizeof(cmsg_storage.buf));
+
+	io_vec.iov_base = buf;
+	io_vec.iov_len = len;
+
+	memset(&msg, 0, sizeof(msg));
+	msg.msg_name = net_sad(&addr);
+	msg.msg_namelen = sizeof(addr);
+	msg.msg_iov = &io_vec;
+	msg.msg_iovlen = 1;
+	msg.msg_control = cmsg_buf;
+	msg.msg_controllen = sizeof(cmsg_storage.buf);
+
+	received = zsock_recvmsg(tls_ctx->sock, &msg, ZSOCK_MSG_DONTWAIT);
 	if (received < 0) {
 		NET_ERR("DTLS server RX: failure %d", errno);
 		return MBEDTLS_ERR_NET_RECV_FAILED;
 	}
+
+	addrlen = msg.msg_namelen;
+	dtls_server_local_addr_from_cmsg(&msg, &local_addr);
+	tls_ctx->active_session->dtls_local_addr = local_addr;
 
 	dtls_server_refresh_session_timeout(tls_ctx->active_session);
 
@@ -1217,7 +1358,7 @@ static int dtls_server_rx(void *ctx, unsigned char *buf, size_t len)
 static int dtls_client_rx(void *ctx, unsigned char *buf, size_t len)
 {
 	struct tls_context *tls_ctx = ctx;
-	net_socklen_t addrlen = sizeof(struct net_sockaddr);
+	net_socklen_t addrlen = sizeof(struct net_sockaddr_storage);
 	struct net_sockaddr_storage addr = { 0 };
 	ssize_t received;
 
@@ -1363,7 +1504,7 @@ static int dtls_server_switch_active_session_by_cid(struct tls_context *tls_ctx)
 		 * static buffer for the purpose, and protect it with a mutex to
 		 * avoid races in case multiple DTLS server sockets run in parallel.
 		 */
-		addrlen = sizeof(struct net_sockaddr);
+		addrlen = sizeof(struct net_sockaddr_storage);
 		len = zsock_recvfrom(tls_ctx->sock, &dtls_helper_buf, sizeof(dtls_helper_buf),
 				     ZSOCK_MSG_DONTWAIT | ZSOCK_MSG_PEEK,
 				     net_sad(&addr), &addrlen);
@@ -1401,7 +1542,7 @@ static int dtls_server_switch_active_session_by_cid(struct tls_context *tls_ctx)
  */
 static int dtls_server_switch_session_on_rx(struct tls_context *tls_ctx)
 {
-	net_socklen_t addrlen = sizeof(struct net_sockaddr);
+	net_socklen_t addrlen = sizeof(struct net_sockaddr_storage);
 	struct net_sockaddr_storage addr = { 0 };
 	uint8_t tmp_buf;
 	int ret;
@@ -1990,7 +2131,7 @@ static int tls_mbedtls_init(struct tls_context *context, bool is_server)
 		 */
 		return -ENOMEM;
 	}
-	tls_set_max_frag_len(&context->config, context->type);
+	tls_set_max_frag_len(context, context->type);
 
 	switch (context->tls_version) {
 	case NET_IPPROTO_TLS_1_3:
@@ -2925,6 +3066,31 @@ static int tls_opt_cert_nocopy_set(struct tls_context *context,
 
 	return 0;
 }
+
+#if defined(CONFIG_NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH)
+static int tls_opt_mfl_set(struct tls_context *context,
+			   const void *optval, net_socklen_t optlen)
+{
+	const int *mfl;
+
+	if (optval == NULL) {
+		return -EINVAL;
+	}
+
+	if (optlen != sizeof(int)) {
+		return -EINVAL;
+	}
+
+	mfl = (const int *)optval;
+	if (*mfl < ZSOCK_TLS_MFL_DEFAULT || *mfl > ZSOCK_TLS_MFL_4096) {
+		return -EINVAL;
+	}
+
+	context->options.mfl_code = (int8_t)*mfl;
+
+	return 0;
+}
+#endif /* CONFIG_NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH */
 
 static int tls_opt_dtls_role_set(struct tls_context *context,
 				 const void *optval, net_socklen_t optlen)
@@ -4000,19 +4166,53 @@ ssize_t ztls_recvfrom_ctx(struct tls_context *ctx, void *buf, size_t max_len,
 #endif /* CONFIG_NET_SOCKETS_ENABLE_DTLS */
 }
 
+static int tls_data_check(struct tls_context *ctx);
+
 static int ztls_poll_prepare_pollin(struct tls_context *ctx)
 {
+	int ret;
+
+	if (ctx->is_listening) {
+		return 0;
+	}
+
 	/* If there already is Mbed TLS data to read, there is no
 	 * need to set the k_poll_event object. Return EALREADY
 	 * so we won't block in the k_poll.
 	 */
-	if (!ctx->is_listening) {
-		if (mbedtls_ssl_get_bytes_avail(&ctx->active_session->ssl) > 0) {
-			return -EALREADY;
-		}
+	if (mbedtls_ssl_get_bytes_avail(&ctx->active_session->ssl) > 0) {
+		return -EALREADY;
 	}
 
-	return 0;
+	if (!ctx->is_initialized) {
+		return 0;
+	}
+
+	/* Mbed TLS can hold a message that it already read from the underlying
+	 * socket but did not process yet, for example a further record of a
+	 * datagram that carried several. The socket has no readiness left to
+	 * report in that case, so waiting on it alone can sleep while data is
+	 * available. Advance such a message here instead.
+	 */
+	if (mbedtls_ssl_check_pending(&ctx->active_session->ssl) == 0) {
+		return 0;
+	}
+
+	ret = tls_data_check(ctx);
+	if (ret == 0) {
+		return 0;
+	}
+
+	/* Either plaintext is now exposed, or the session was closed or
+	 * failed. All three have to wake the poll. Latch the failure so that
+	 * the update path can turn it into POLLHUP or POLLERR, as the
+	 * underlying socket will never report it.
+	 */
+	if (ret < 0 && ret != -ENOTCONN) {
+		ctx->error = -ret;
+	}
+
+	return -EALREADY;
 }
 
 static int ztls_poll_prepare_ctx(struct tls_context *ctx,
@@ -4136,7 +4336,18 @@ static int tls_update_pollin(int fd, struct tls_context *ctx,
 	}
 
 	if ((pfd->revents & ZSOCK_POLLIN) == 0) {
-		/* No new data on a socket. */
+		/* No new data on a socket. A poll prepare probe may still have
+		 * left a closed session or a fatal error behind, which the
+		 * underlying socket will never report.
+		 */
+		if (!ctx->is_listening) {
+			if (ctx->active_session->session_closed) {
+				pfd->revents |= ZSOCK_POLLHUP;
+			} else if (ctx->error != 0) {
+				pfd->revents |= ZSOCK_POLLERR;
+			}
+		}
+
 		goto next;
 	}
 
@@ -4799,6 +5010,12 @@ int ztls_setsockopt_ctx(struct tls_context *ctx, int level, int optname,
 		/* Option handled at the socket dispatcher level. */
 		err = 0;
 		break;
+
+#if defined(CONFIG_NET_SOCKETS_TLS_SET_MAX_FRAGMENT_LENGTH)
+	case ZSOCK_TLS_MAX_FRAGMENT_LENGTH:
+		err = tls_opt_mfl_set(ctx, optval, optlen);
+		break;
+#endif
 
 	default:
 		/* Unknown or read-only option. */

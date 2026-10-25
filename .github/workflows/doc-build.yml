@@ -15,8 +15,8 @@ permissions:
   contents: read
 
 env:
-  DOXYGEN_VERSION: 1.15.0
-  DOXYGEN_SHA256SUM: 0ec2e5b2c3cd82b7106d19cb42d8466450730b8cb7a9e85af712be38bf4523a1
+  DOXYGEN_VERSION: 1.17.0
+  DOXYGEN_SHA256SUM: 75419ef4f446fc1c24ef12514b574e66e898ee6f527c6ae2ad84f91a905823c2
   JOB_COUNT: 8
 
 jobs:
@@ -70,7 +70,7 @@ jobs:
     runs-on:
       group: zephyr-runner-v2-linux-x64-4xlarge
     container:
-      image: ghcr.io/zephyrproject-rtos/ci-repo-cache:v0.29.2.20260422
+      image: ghcr.io/zephyrproject-rtos/ci-repo-cache:v0.29.4.20260912
       options: '--entrypoint /bin/bash'
     timeout-minutes: 60
     concurrency:
@@ -113,17 +113,24 @@ jobs:
 
     - name: Install Python packages required for documentation build
       run: |
+        # FIXME: The requirements files pin an unreleased reuse-tool change
+        #        (custom_properties) needed by the zephyr-licensing-exceptions::
+        #        directive. The snapshot reports the same version as the
+        #        release the CI image ships, so pip skips it unless reuse is
+        #        uninstalled first. Drop this and the pin once the API is in a
+        #        reuse release.
+        pip uninstall -y reuse
         pip install -r scripts/requirements-actions.txt --require-hashes
         pip install -r doc/requirements.txt --require-hashes
 
     - name: Set up Node.js
-      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
       with:
         node-version: 24
 
     - name: Install and vendor copies of JS libs within within docs sources
       run: |
-        npm install --prefix doc
+        npm install --prefix doc --ignore-scripts
         for pkg in mermaid d3; do
           mkdir -p doc/_static/js/${pkg}
           cp -a doc/node_modules/${pkg}/dist/. doc/_static/js/${pkg}/
@@ -176,7 +183,7 @@ jobs:
           libxkbcommon0 libxdamage1 libgbm1 libpango-1.0-0 \
           libcairo2 libasound2t64
 
-        npm install -g pa11y-ci@4 pa11y-ci-reporter-html@7
+        npm install -g pa11y-ci@4 pa11y-ci-reporter-html@7 --ignore-scripts
         npx puppeteer browsers install chrome
 
         python3 -m http.server 8000 --directory doc/_build/html &
@@ -258,19 +265,19 @@ jobs:
 
     - name: Upload accessibility report
       if: false # temporarily disabled due to CI issues
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: accessibility-report
         path: accessibility-report.tar.xz
 
     - name: Upload HTML output
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: html-output
         path: html-output.tar.xz
 
     - name: Upload Doxygen coverage artifacts
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: api-coverage
         path: api-coverage.tar.xz
@@ -302,7 +309,7 @@ jobs:
 
 
     - name: Upload PR number
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       if: github.event_name == 'pull_request'
       with:
         name: pr_num
@@ -350,7 +357,7 @@ jobs:
         echo "/opt/doxygen-${DOXYGEN_VERSION}/bin" >> $GITHUB_PATH
 
     - name: Setup Zephyr project
-      uses: zephyrproject-rtos/action-zephyr-setup@5ec39f5cba83346d83a836dfed1524270c660e28 # v1.0.14
+      uses: zephyrproject-rtos/action-zephyr-setup@be8136a8bba01580485d98b7ad2d32477c36a49a # v1.0.15
       with:
         app-path: zephyr
         toolchains: 'arm-zephyr-eabi'
@@ -379,7 +386,7 @@ jobs:
 
     - name: upload-build
       if: always()
-      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
       with:
         name: pdf-output
         if-no-files-found: ignore

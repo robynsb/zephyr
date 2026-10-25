@@ -505,15 +505,8 @@ static int eth_initialize(const struct device *dev)
 
 	/* Set up gated and source clocks */
 	for (size_t n = 0; n < cfg->pclken_cnt; n++) {
-		if (IN_RANGE(cfg->pclken[n].bus, STM32_PERIPH_BUS_MIN, STM32_PERIPH_BUS_MAX)) {
-			ret = clock_control_on(DEVICE_DT_GET(STM32_CLOCK_CONTROL_NODE),
-					(clock_control_subsys_t)&cfg->pclken[n]);
-		} else {
-			ret = clock_control_configure(DEVICE_DT_GET(STM32_CLOCK_CONTROL_NODE),
-					(clock_control_subsys_t)&cfg->pclken[n],
-					NULL);
-		}
-
+		ret = clock_control_on(DEVICE_DT_GET(STM32_CLOCK_CONTROL_NODE),
+				       (clock_control_subsys_t)&cfg->pclken[n]);
 		if (ret != 0) {
 			LOG_ERR("Failed to setup ethernet clock #%zu", n);
 			return -EIO;
@@ -581,6 +574,7 @@ static int eth_stm32_hal_set_config(const struct device *dev,
 
 	switch (type) {
 	case ETHERNET_CONFIG_TYPE_MAC_ADDRESS:
+		memcpy(dev_data->mac_addr, config->mac_address.addr, sizeof(dev_data->mac_addr));
 		HAL_ETH_GetConfig(heth, &eth_cfg);
 		memcpy(eth_cfg.mac_addr, dev_data->mac_addr, sizeof(dev_data->mac_addr));
 

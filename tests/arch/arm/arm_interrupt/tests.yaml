@@ -1,6 +1,8 @@
 common:
-  filter: CONFIG_ARMV6_M_ARMV8_M_BASELINE or CONFIG_ARMV7_M_ARMV8_M_MAINLINE or
-    (CONFIG_ARMV7_R and CONFIG_GIC)
+  # The test connects an ISR with arch_irq_connect_dynamic(), so it needs
+  # the CONFIG_DYNAMIC_INTERRUPTS set by prj.conf to have taken effect.
+  filter: (CONFIG_ARMV6_M_ARMV8_M_BASELINE or CONFIG_ARMV7_M_ARMV8_M_MAINLINE or
+    (CONFIG_ARMV7_R and CONFIG_GIC)) and CONFIG_DYNAMIC_INTERRUPTS
   tags:
     - arm
     - fpu
@@ -15,7 +17,6 @@ tests:
     extra_configs:
       - CONFIG_NO_OPTIMIZATIONS=y
       - CONFIG_ZTEST_WARN_NO_OPTIMIZATIONS=n
-      - CONFIG_ARM_GCC_FP_WORKAROUND=y
       - CONFIG_IDLE_STACK_SIZE=512
       - CONFIG_MAIN_STACK_SIZE=2048
       - CONFIG_ZTEST_STACK_SIZE=1280

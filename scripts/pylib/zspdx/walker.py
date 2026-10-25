@@ -26,6 +26,7 @@ from zspdx.model import (
     SBOMFile,
     SBOMGraph,
 )
+from zspdx.serializers.helpers import resolvable_revision
 
 _logger = logging.getLogger(__name__)
 
@@ -38,6 +39,15 @@ SPDX_TOOL_NAME = "Zephyr SPDX builder"
 
 # GitHub namespace under which Zephyr mirrors its modules.
 ZEPHYR_GITHUB_NAMESPACE = "zephyrproject-rtos"
+
+# Fallback identity of the Zephyr sources when their git remote is unknown.
+ZEPHYR_UPSTREAM_PURL = f"pkg:github/{ZEPHYR_GITHUB_NAMESPACE}/zephyr"
+
+# CPE 2.3 part, vendor and product Zephyr advisories are registered under in NVD.
+ZEPHYR_CPE_PREFIX = "cpe:2.3:o:zephyrproject:zephyr"
+
+# Matches a Zephyr release tag, e.g. "v4.3.0" or "v4.4.0-rc3".
+ZEPHYR_RELEASE_TAG_REGEX = r'v(?P<version>\d+\.\d+\.\d+(?:-[a-z0-9.\-]+)?)'
 
 # Free-form notes emitted as package comments to clarify each package's role. The
 # "-sources" and "-deps" packages are systematically emitted for every module, so
@@ -152,6 +162,11 @@ class Walker:
         # queue of pending source file paths to create, process and assign
         self.pending_sources = []
 
+        # blob declarations from the modules' module.yml files, keyed by the
+        # blob's absolute path; used to enrich matching Files with the blob's
+        # provenance metadata (url, version, sha256, ...)
+        self.module_blobs = {}
+
         # queue of pending relationship data to create, process and assign
         # Format: (from_type, from_identifier, to_type, to_identifier, relationship_type)
         # Types: "component", "file"
@@ -200,7 +215,9 @@ class Walker:
         host_type, namespace, package = parsed
         purl = f'pkg:{host_type}/{namespace}/{package}'
         if version:
-            purl += f'@{version}'
+            # A purl version is meant to be resolved, so it carries the commit
+            # rather than west's "this is not the manifest revision" suffix.
+            purl += f'@{resolvable_revision(version)}'
 
         return purl
 
@@ -273,6 +290,70 @@ class Walker:
         if extra:
             version += f"-{extra}"
         return version
+
+    @staticmethod
+    def _zephyr_cpe(version):
+        """Build the CPE 2.3 name for a Zephyr version.
+
+        CPE keeps a pre-release qualifier in its own ``update`` field, so
+        "4.4.0-rc3" becomes ``...:zephyr:4.4.0:rc3:*`` and "4.3.0" keeps the
+        "no update" marker, ``...:zephyr:4.3.0:-:*``. Returns "" when no version
+        is known.
+        """
+        if not version:
+            return ""
+        release, _, update = version.partition("-")
+        return f"{ZEPHYR_CPE_PREFIX}:{release}:{update or '-'}:*:*:*:*:*:*"
+
+    def _zephyr_version(self, zephyr):
+        """Determine the version of the Zephyr tree described by ``zephyr`` meta.
+
+        A release tag pointing at the checked-out revision is authoritative; any
+        other build is versioned by the repository's own VERSION file. Returns ""
+        when neither is available.
+        """
+        for tag in zephyr.get("tags") or []:
+            match = re.fullmatch(ZEPHYR_RELEASE_TAG_REGEX, tag)
+            if match:
+                return match.group("version")
+
+        return self._read_zephyr_version(zephyr.get("path", ""))
+
+    def _apply_zephyr_identity(self, component, zephyr):
+        """Attach the version, package URLs and CPE identifying Zephyr itself.
+
+        The purl follows the tree's own git remote, pinned to a release tag when
+        the checked-out revision carries one, and falls back to the upstream
+        repository when no remote is known. The CPE identifies the product and
+        version instead, and so is recorded whichever remote the sources came from.
+        """
+        url = zephyr.get("remote") or zephyr.get("url", "")
+        if url:
+            component.url = url
+        if zephyr.get("revision"):
+            component.revision = zephyr.get("revision")
+
+        component.version = self._zephyr_version(zephyr)
+
+        tags = [
+            tag for tag in zephyr.get("tags") or [] if re.fullmatch(ZEPHYR_RELEASE_TAG_REGEX, tag)
+        ]
+        purls = [self._build_purl(url, tag) for tag in tags]
+        if not purls:
+            purls = [self._build_purl(url, component.revision)]
+        if not any(purls):
+            pin = (
+                next(iter(tags), "") or resolvable_revision(component.revision) or component.version
+            )
+            purls = [f"{ZEPHYR_UPSTREAM_PURL}@{pin}" if pin else ZEPHYR_UPSTREAM_PURL]
+
+        for purl in purls:
+            if purl:
+                component.add_external_reference(purl)
+
+        cpe = self._zephyr_cpe(component.version)
+        if cpe:
+            component.add_external_reference(cpe)
 
     def _set_creation_metadata(self, zephyr):
         """Record SBOM creator provenance (author organization and tool version).
@@ -350,7 +431,10 @@ class Walker:
         cmake_reply_dir_path = os.path.join(self.cfg.build_dir, ".cmake", "api", "v1", "reply")
         if not os.path.exists(cmake_reply_dir_path):
             _logger.error(f'cmake api reply directory {cmake_reply_dir_path} does not exist')
-            _logger.error('was query directory created before cmake build ran?')
+            _logger.error(
+                're-run CMake with CONFIG_BUILD_OUTPUT_META enabled so the build '
+                'requests the file-based API reply'
+            )
             return None
         if not os.path.isdir(cmake_reply_dir_path):
             _logger.error(
@@ -549,38 +633,7 @@ class Walker:
         component.supplier = ZEPHYR_ORGANIZATION
         component.comment = SOURCES_COMMENT
 
-        zephyr_url = zephyr.get("remote") or zephyr.get("url", "")
-        if zephyr_url:
-            component.url = zephyr_url
-
-        if zephyr.get("revision"):
-            component.revision = zephyr.get("revision")
-
-        purl = None
-        zephyr_tags = zephyr.get("tags", "")
-        if zephyr_tags:
-            # Find tag vX.Y.Z
-            for tag in zephyr_tags:
-                version = re.fullmatch(r'^v(?P<version>\d+\.\d+\.\d+)$', tag)
-                purl = self._build_purl(zephyr_url, tag)
-
-                if purl:
-                    component.add_external_reference(purl)
-
-                # Extract version from tag once
-                if component.version == "" and version:
-                    component.version = version.group('version')
-
-        # Fall back to a revision-pinned package URL when no release tag is known,
-        # so the component still carries a purl for vulnerability matching.
-        if purl is None and zephyr_url:
-            purl = self._build_purl(zephyr_url, component.revision)
-            if purl:
-                component.add_external_reference(purl)
-
-        if len(component.version) > 0:
-            cpe = f'cpe:2.3:o:zephyrproject:zephyr:{component.version}:-:*:*:*:*:*:*'
-            component.add_external_reference(cpe)
+        self._apply_zephyr_identity(component, zephyr)
 
         self.sbom_graph.add_component(component, "zephyr")
         self.doc_zephyr.add_described_component(component)
@@ -616,7 +669,33 @@ class Walker:
             self.doc_zephyr.add_described_component(module_component)
             self.component_zephyr_modules[module_name] = module_component
 
+            self.collect_module_blobs(module_path)
+
         return True
+
+    # load a module's blob declarations from its module.yml, keyed by the
+    # blob's absolute path (blobs live under <module>/zephyr/blobs/, see the
+    # "Binary Blobs" section of the modules documentation)
+    def collect_module_blobs(self, module_path):
+        for module_yml in ("module.yml", "module.yaml"):
+            module_yml_path = os.path.join(module_path, "zephyr", module_yml)
+            if os.path.isfile(module_yml_path):
+                break
+        else:
+            return
+
+        try:
+            with open(module_yml_path) as f:
+                meta = yaml.safe_load(f)
+        except (OSError, yaml.YAMLError):
+            _logger.warning(f"failed to load module metadata from {module_yml_path}", exc_info=True)
+            return
+
+        for blob in (meta or {}).get("blobs", []):
+            blob_abspath = os.path.normpath(
+                os.path.join(module_path, "zephyr", "blobs", blob.get("path", ""))
+            )
+            self.module_blobs[blob_abspath] = blob
 
     def setup_sdk_component(self):
         """Set up SDK sources component."""
@@ -642,35 +721,7 @@ class Walker:
         # no PrimaryPackagePurpose: this is a reference-only dependency package with no files
         component = SBOMComponent(name="zephyr-deps", comment=ZEPHYR_DEPS_COMMENT)
         component.supplier = ZEPHYR_ORGANIZATION
-        component.url = zephyr.get("remote") or zephyr.get("url", "")
-        component.revision = zephyr.get("revision", "")
-
-        purl = None
-        zephyr_tags = zephyr.get("tags", None)
-        if zephyr_tags:
-            # Find tag vX.Y.Z
-            for tag in zephyr_tags:
-                version = re.fullmatch(r'^v(?P<version>\d+\.\d+\.\d+)$', tag)
-                purl = self._build_purl(component.url, tag)
-
-                if purl:
-                    component.add_external_reference(purl)
-
-                # Extract version from tag once
-                if component.version == "" and version:
-                    component.version = version.group('version')
-        else:
-            if zephyr.get("revision"):
-                purl = self._build_purl(component.url, zephyr.get("revision"))
-            if purl:
-                component.add_external_reference(purl)
-
-        if len(component.version) > 0:
-            cpe = f'cpe:2.3:o:zephyrproject:zephyr:{component.version}:-:*:*:*:*:*:*'
-            component.add_external_reference(cpe)
-
-        if component.version == "" and zephyr.get("revision"):
-            component.version = zephyr.get("revision")
+        self._apply_zephyr_identity(component, zephyr)
 
         self.sbom_graph.add_component(component, "modules-deps")
         self.doc_modules_deps.add_described_component(component)
@@ -775,6 +826,7 @@ class Walker:
                 # get its source files if build file is found
                 if bf:
                     self.collect_pending_source_files(cfg_target, component, bf)
+                    self.collect_linked_libraries(cfg_target, component, bf)
             else:
                 _logger.debug(f"  - target {cfg_target.name} has no build artifacts")
 
@@ -944,6 +996,75 @@ class Walker:
             src_abspath = os.path.join(self.cm.paths_source, src.path)
         return get_c_includes(self.compiler_path, src_abspath, cg)
 
+    # collect prebuilt libraries (e.g. vendor blobs) linked into this target,
+    # from the target's link command fragments. The codemodel only expresses
+    # libraries built by other targets as dependencies; prebuilt libraries only
+    # show up on the link command line, either as a path (libraries linked as
+    # imported targets, the way hal_stm32 links most of its binary blobs) or as
+    # an -lNAME / -l:FILENAME flag to be resolved against -L search directories
+    # (the way hal_espressif and hal_stm32's STM32WB0 BLE stack link theirs).
+    # call with:
+    #   1) ConfigTarget
+    #   2) Component for that target
+    #   3) build File for that target
+    def collect_linked_libraries(self, cfg_target, component, bf):
+        lib_dirs = []
+        lib_names = []
+        lib_paths = []
+
+        for fragment in cfg_target.target.link_command_fragments:
+            frag = fragment.fragment.strip().strip('"')
+            if not frag:
+                continue
+            if frag.startswith("-L"):
+                # a search path; -L flags are also found in "libraries" role
+                # fragments when passed through zephyr_link_libraries()
+                lib_dirs.append(frag[2:].strip().strip('"'))
+            elif fragment.role != "libraries":
+                continue
+            elif frag.startswith("-l"):
+                lib_names.append(frag[2:].strip())
+            elif not frag.startswith("-"):
+                lib_paths.append(frag)
+
+        candidates = []
+        for path in lib_paths:
+            if not os.path.isabs(path):
+                path = os.path.join(self.cm.paths_build, path)
+            candidates.append(os.path.normpath(path))
+
+        # resolve -lNAME against the search directories, like the linker would;
+        # names only found in the toolchain's own implicit directories (e.g.
+        # -lgcc) are left out
+        for name in lib_names:
+            # GNU ld's -l:FILENAME form names the file verbatim, while plain
+            # -lNAME expands to libNAME.a
+            filename = name[1:] if name.startswith(":") else f"lib{name}.a"
+            for lib_dir in lib_dirs:
+                if not os.path.isabs(lib_dir):
+                    lib_dir = os.path.join(self.cm.paths_build, lib_dir)
+                candidate = os.path.normpath(os.path.join(lib_dir, filename))
+                if os.path.isfile(candidate):
+                    candidates.append(candidate)
+                    break
+
+        seen = set()
+        for lib_abspath in candidates:
+            if lib_abspath in seen:
+                continue
+            seen.add(lib_abspath)
+
+            # libraries built by this build are already covered by the
+            # target dependency relationships
+            if self._is_within(lib_abspath, self.cm.paths_build):
+                continue
+            if not os.path.isfile(lib_abspath):
+                continue
+
+            _logger.debug(f"    - add pending linked library {lib_abspath}")
+            self.pending_sources.append((lib_abspath, component))
+            self.pending_relationships.append(("file", bf.path, "file", lib_abspath, "STATIC_LINK"))
+
     # collect relationships for dependencies of this target Component
     # call with:
     #   1) all ConfigTargets from CodeModel
@@ -1011,7 +1132,15 @@ class Walker:
                 continue
 
             # create File and assign it to the Component
-            self.sbom_graph.add_file(SBOMFile(path=src_abspath), owning_component)
+            sbom_file = SBOMFile(path=src_abspath)
+
+            # if this file is a blob declared by its module, carry the blob's
+            # provenance metadata along
+            blob = self.module_blobs.get(src_abspath)
+            if blob:
+                sbom_file.metadata["blob"] = blob
+
+            self.sbom_graph.add_file(sbom_file, owning_component)
 
     # figure out which Component should own the given file based on path
     def _is_within(self, src_abspath, base_dir):
@@ -1050,19 +1179,21 @@ class Walker:
         ):
             return self.component_sdk
 
-        # Check app
-        if self.component_app and self._is_within(src_abspath, self.component_app.base_dir):
-            return self.component_app
-
-        # Check zephyr sources and module sources. A module path is nested under
-        # the zephyr west topdir, so prefer the deepest matching base_dir to attribute
-        # a file to its owning module rather than to the top-level zephyr component.
-        zephyr_candidates = list(self.component_zephyr_modules.values())
+        # Check app sources, zephyr sources and module sources together,
+        # preferring the deepest (most specific) matching base_dir. A module can
+        # be nested under the application's source directory or under the zephyr
+        # west topdir, so an ordered check that returned the app (or the
+        # top-level zephyr) component first would misattribute a module's files.
+        # Selecting the deepest base_dir instead assigns each file to its true
+        # owner.
+        candidates = list(self.component_zephyr_modules.values())
         if self.component_zephyr:
-            zephyr_candidates.append(self.component_zephyr)
+            candidates.append(self.component_zephyr)
+        if self.component_app:
+            candidates.append(self.component_app)
 
         best_match = None
-        for component in zephyr_candidates:
+        for component in candidates:
             if self._is_within(src_abspath, component.base_dir) and (
                 best_match is None or len(component.base_dir) > len(best_match.base_dir)
             ):

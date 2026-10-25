@@ -1,5 +1,5 @@
 # Copyright (c) 2021 Linaro
-# Copyright 2024-2025 Arm Limited and/or its affiliates <open-source-office@arm.com>
+# Copyright 2024-2026 Arm Limited and/or its affiliates <open-source-office@arm.com>
 # Copyright (c) 2026 Andrei-Edward Popa
 # SPDX-License-Identifier: Apache-2.0
 
@@ -12,13 +12,22 @@
 #     FVP  is used by default for corstone310/fvp.
 #
 
+board_set_debugger_ifnset(pyocd)
+board_set_flasher_ifnset(pyocd)
+
+if(CONFIG_CPU_CORTEX_M)
+  board_runner_args(pyocd "--target=cortex_m")
+endif()
+
+include(${ZEPHYR_BASE}/boards/common/pyocd.board.cmake)
+
 if(CONFIG_BOARD_MPS3_AN536_CPU0)
   set(SUPPORTED_EMU_PLATFORMS qemu)
 
   # QEMU settings
-  set(QEMU_CPU_TYPE_${ARCH} cortex-r52)
-  set(QEMU_FLAGS_${ARCH}
-    -cpu ${QEMU_CPU_TYPE_${ARCH}}
+  set(QEMU_CPU_TYPE cortex-r52)
+  set(QEMU_BOARD_FLAGS
+    -cpu ${QEMU_CPU_TYPE}
     -machine mps3-an536
     -vga none
     )
@@ -26,9 +35,9 @@ elseif(CONFIG_BOARD_MPS3_CORSTONE300_AN547)
   set(SUPPORTED_EMU_PLATFORMS qemu)
 
   # QEMU settings
-  set(QEMU_CPU_TYPE_${ARCH} cortex-m55)
-  set(QEMU_FLAGS_${ARCH}
-    -cpu ${QEMU_CPU_TYPE_${ARCH}}
+  set(QEMU_CPU_TYPE cortex-m55)
+  set(QEMU_BOARD_FLAGS
+    -cpu ${QEMU_CPU_TYPE}
     -machine mps3-an547
     -vga none
     )

@@ -135,18 +135,18 @@ static void finalize_cancel_locked(struct k_work *work)
 	 */
 	flag_clear(&work->flags, K_WORK_CANCELING_BIT);
 
-	/* Search for and remove the matching container, and release
+	/* Search for and remove matching containers, and release
 	 * what's waiting for the completion.  The same work item can
 	 * appear multiple times in the list if multiple threads
-	 * attempt to cancel it.
+	 * attempt to cancel it; each waiter must be woken.
 	 */
 	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&pending_cancels, wc, tmp, node) {
 		if (wc->work == work) {
 			sys_slist_remove(&pending_cancels, prev, &wc->node);
 			k_sem_give(&wc->sem);
-			break;
+		} else {
+			prev = &wc->node;
 		}
-		prev = &wc->node;
 	}
 }
 
@@ -852,7 +852,7 @@ void k_work_queue_start(struct k_work_q *queue,
 	/* In future, this whole function will be deprecated, but for now, we
 	 * have to use the `thread` field to create a new thread in it.
 	 */
-	TOOLCHAIN_DISABLE_WARNING("-Wdeprecated-declarations");
+	TOOLCHAIN_DISABLE_WARNING(TOOLCHAIN_WARNING_DEPRECATED_DECLARATIONS);
 
 	uint32_t flags = K_WORK_QUEUE_STARTED;
 
@@ -897,7 +897,7 @@ void k_work_queue_start(struct k_work_q *queue,
 
 	SYS_PORT_TRACING_OBJ_FUNC_EXIT(k_work_queue, start, queue);
 
-	TOOLCHAIN_ENABLE_WARNING("-Wdeprecated-declarations");
+	TOOLCHAIN_ENABLE_WARNING(TOOLCHAIN_WARNING_DEPRECATED_DECLARATIONS);
 }
 
 int k_work_queue_drain(struct k_work_q *queue,

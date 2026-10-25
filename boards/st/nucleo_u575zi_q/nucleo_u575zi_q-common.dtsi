@@ -8,6 +8,7 @@
 #include <st/u5/stm32u575Xi.dtsi>
 #include <st/u5/stm32u575zitxq-pinctrl.dtsi>
 #include "arduino_r3_connector.dtsi"
+#include "st_zio_connector.dtsi"
 #include <zephyr/dt-bindings/input/input-event-codes.h>
 
 / {
@@ -138,19 +139,27 @@
 	status = "okay";
 };
 
+&adc12_common {
+	st,adc-prescaler = <4>;
+	st,adc-clock-source = "ASYNC";
+	status = "okay";
+};
+
 &adc1 {
 	pinctrl-0 = <&adc1_in1_pc0>;
 	pinctrl-names = "default";
-	st,adc-clock-source = "ASYNC";
+	status = "okay";
+};
+
+&adc4_common {
 	st,adc-prescaler = <4>;
+	st,adc-clock-source = "ASYNC";
 	status = "okay";
 };
 
 &adc4 {
 	pinctrl-0 = <&adc4_in18_pb0>;
 	pinctrl-names = "default";
-	st,adc-clock-source = "ASYNC";
-	st,adc-prescaler = <4>;
 	status = "okay";
 };
 
@@ -209,6 +218,10 @@ zephyr_udc0: &usbotg_fs {
 };
 
 &vref1 {
+	status = "okay";
+};
+
+&vref4 {
 	status = "okay";
 };
 

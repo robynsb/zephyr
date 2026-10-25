@@ -14,6 +14,7 @@ LOG_MODULE_REGISTER(modem_chat, CONFIG_MODEM_MODULES_LOG_LEVEL);
 #include <string.h>
 
 #include <zephyr/modem/chat.h>
+#include <zephyr/sys/__assert.h>
 
 #include "modem_workqueue.h"
 
@@ -112,6 +113,12 @@ static void modem_chat_log_received_command(struct modem_chat *chat)
 
 static void modem_chat_script_stop(struct modem_chat *chat, enum modem_chat_script_result result)
 {
+	struct k_sem *sync_waiter = chat->script_stopped_sem;
+	struct modem_chat_script_completion_info info;
+	modem_chat_script_callback callback;
+	uint16_t script_chat_it;
+	void *user_data;
+
 	if ((chat == NULL) || (chat->script == NULL)) {
 		return;
 	}
@@ -125,10 +132,21 @@ static void modem_chat_script_stop(struct modem_chat *chat, enum modem_chat_scri
 		LOG_WRN("%s: timed out", chat->script->name);
 	}
 
-	/* Call back with result */
-	if (chat->script->callback != NULL) {
-		chat->script->callback(chat, result, chat->user_data);
+	/* modem_chat_script_next advances the iterator past the end of the array */
+	script_chat_it = chat->script_chat_it;
+	if ((result == MODEM_CHAT_SCRIPT_RESULT_SUCCESS) &&
+	    (chat->script->script_chats_size > 0) &&
+	    (script_chat_it == chat->script->script_chats_size)) {
+		script_chat_it--;
 	}
+
+	/* Cache all callback information so it remains valid after internal state reset */
+	info.script = chat->script;
+	info.script_chat = (chat->script->script_chats_size > 0)
+				       ? &chat->script->script_chats[script_chat_it]
+				       : NULL;
+	callback = chat->script->callback;
+	user_data = chat->user_data;
 
 	/* Clear parse_match in case it is stored in the script being stopped */
 	if ((chat->parse_match != NULL) &&
@@ -152,14 +170,23 @@ static void modem_chat_script_stop(struct modem_chat *chat, enum modem_chat_scri
 	k_work_cancel(&chat->script_send_work);
 	k_work_cancel_delayable(&chat->script_send_timeout_work);
 
+	if (sync_waiter) {
+		/* Store result before releasing chat object */
+		*chat->script_result = result;
+	}
+
 	/* Clear script running state */
 	atomic_clear_bit(&chat->script_state, MODEM_CHAT_SCRIPT_STATE_RUNNING_BIT);
 
-	/* Store result of script for script stoppted indication */
-	chat->script_result = result;
+	/* Call back with result */
+	if (callback != NULL) {
+		callback(chat, result, &info, user_data);
+	}
 
-	/* Indicate script stopped */
-	k_sem_give(&chat->script_stopped_sem);
+	/* Unblock sync waiter */
+	if (sync_waiter) {
+		k_sem_give(sync_waiter);
+	}
 }
 
 static void modem_chat_set_script_send_state(struct modem_chat *chat,
@@ -249,6 +276,15 @@ static void modem_chat_script_next(struct modem_chat *chat, bool initial)
 	LOG_DBG("%s: step: %u", chat->script->name, chat->script_chat_it);
 
 	script_chat = &chat->script->script_chats[chat->script_chat_it];
+
+#if defined(CONFIG_MODEM_CHAT_COMMANDS_CONDITIONAL)
+	if ((script_chat->run_check != NULL) && !script_chat->run_check(chat->user_data)) {
+		/* Current chat should be skipped, reschedule work immediately to run next step */
+		LOG_DBG("skipping: %.*s", script_chat->request_size, script_chat->request);
+		modem_work_schedule(&chat->script_send_timeout_work, K_NO_WAIT);
+		return;
+	}
+#endif
 
 	/* Continue script */
 	if (modem_chat_script_chat_has_request(chat)) {
@@ -868,7 +904,6 @@ int modem_chat_init(struct modem_chat *chat, const struct modem_chat_config *con
 	chat->matches[MODEM_CHAT_MATCHES_INDEX_UNSOL] = config->unsol_matches;
 	chat->matches_size[MODEM_CHAT_MATCHES_INDEX_UNSOL] = config->unsol_matches_size;
 	atomic_set(&chat->script_state, 0);
-	k_sem_init(&chat->script_stopped_sem, 0, 1);
 	k_work_init(&chat->receive_work, modem_chat_process_handler);
 	k_work_init(&chat->script_run_work, modem_chat_script_run_handler);
 	k_work_init_delayable(&chat->script_timeout_work, modem_chat_script_timeout_handler);
@@ -899,9 +934,16 @@ bool modem_chat_is_running(struct modem_chat *chat)
 	return atomic_test_bit(&chat->script_state, MODEM_CHAT_SCRIPT_STATE_RUNNING_BIT);
 }
 
-int modem_chat_run_script_async(struct modem_chat *chat, const struct modem_chat_script *script)
+static int _run_script_internal(struct modem_chat *chat, const struct modem_chat_script *script,
+				struct k_sem *waiter, enum modem_chat_script_result *result)
 {
 	bool script_is_running;
+
+	__ASSERT_NO_MSG(script != NULL);
+	if (waiter != NULL) {
+		/* Both waiter and result must be provided */
+		__ASSERT_NO_MSG(result != NULL);
+	}
 
 	if (chat->pipe == NULL) {
 		return -EPERM;
@@ -932,28 +974,38 @@ int modem_chat_run_script_async(struct modem_chat *chat, const struct modem_chat
 		return -EBUSY;
 	}
 
-	k_sem_reset(&chat->script_stopped_sem);
+	chat->script_stopped_sem = waiter;
+	chat->script_result = result;
 
 	chat->pending_script = script;
 	modem_work_submit(&chat->script_run_work);
 	return 0;
 }
 
+int modem_chat_run_script_async(struct modem_chat *chat, const struct modem_chat_script *script)
+{
+	return _run_script_internal(chat, script, NULL, NULL);
+}
+
 int modem_chat_run_script(struct modem_chat *chat, const struct modem_chat_script *script)
 {
+	enum modem_chat_script_result result = MODEM_CHAT_SCRIPT_RESULT_ABORT;
+	struct k_sem waiter;
 	int ret;
 
-	ret = modem_chat_run_script_async(chat, script);
+	k_sem_init(&waiter, 0, 1);
+
+	ret = _run_script_internal(chat, script, &waiter, &result);
 	if (ret < 0) {
 		return ret;
 	}
 
-	ret = k_sem_take(&chat->script_stopped_sem, K_FOREVER);
+	ret = k_sem_take(&waiter, K_FOREVER);
 	if (ret < 0) {
 		return ret;
 	}
 
-	return (chat->script_result == MODEM_CHAT_SCRIPT_RESULT_SUCCESS) ? 0 : -EAGAIN;
+	return (result == MODEM_CHAT_SCRIPT_RESULT_SUCCESS) ? 0 : -EAGAIN;
 }
 
 void modem_chat_script_abort(struct modem_chat *chat)
@@ -973,6 +1025,8 @@ void modem_chat_release(struct modem_chat *chat)
 	k_work_cancel_sync(&chat->script_abort_work, &sync);
 	k_work_cancel_sync(&chat->receive_work, &sync);
 	k_work_cancel_sync(&chat->script_send_work, &sync);
+	k_work_cancel_delayable_sync(&chat->script_timeout_work, &sync);
+	k_work_cancel_delayable_sync(&chat->script_send_timeout_work, &sync);
 
 	chat->pipe = NULL;
 	chat->receive_buf_len = 0;
@@ -981,8 +1035,6 @@ void modem_chat_release(struct modem_chat *chat)
 	chat->script = NULL;
 	chat->script_chat_it = 0;
 	atomic_set(&chat->script_state, 0);
-	chat->script_result = MODEM_CHAT_SCRIPT_RESULT_ABORT;
-	k_sem_reset(&chat->script_stopped_sem);
 	chat->script_send_state = MODEM_CHAT_SCRIPT_SEND_STATE_IDLE;
 	chat->script_send_pos = 0;
 	chat->parse_match = NULL;

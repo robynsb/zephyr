@@ -148,7 +148,6 @@ foreach(var AFLAGS CFLAGS CXXFLAGS CPPFLAGS LDFLAGS)
 endforeach()
 
 zephyr_compile_definitions(
-  KERNEL
   __ZEPHYR__=1
 )
 
@@ -169,7 +168,7 @@ if(CONFIG_COMPILER_WARNINGS_AS_ERRORS)
   zephyr_link_libraries($<TARGET_PROPERTY:linker,warnings_as_errors>)
 endif()
 
-if(CONFIG_DEPRECATION_TEST OR NOT CONFIG_WARN_DEPRECATED)
+if(NOT CONFIG_WARN_DEPRECATED)
   zephyr_compile_options($<$<COMPILE_LANGUAGE:C>:$<TARGET_PROPERTY:compiler,no_deprecation_warning>>)
   zephyr_compile_options($<$<COMPILE_LANGUAGE:CXX>:$<TARGET_PROPERTY:compiler,no_deprecation_warning>>)
   zephyr_compile_options($<$<COMPILE_LANGUAGE:ASM>:$<TARGET_PROPERTY:asm,no_deprecation_warning>>)
@@ -293,12 +292,6 @@ if(CONFIG_STD_C23)
   set(CSTD c2x)
 elseif(CONFIG_STD_C17)
   set(CSTD c17)
-elseif(CONFIG_STD_C11)
-  set(CSTD c11)
-elseif(CONFIG_STD_C99)
-  set(CSTD c99)
-elseif(CONFIG_STD_C90)
-  set(CSTD c90)
 else()
   message(FATAL_ERROR "Unreachable code. Expected C standard to have been chosen.")
 endif()
@@ -340,6 +333,9 @@ if(CONFIG_CPP)
   elseif(CONFIG_STD_CPP23)
     set(STD_CPP_DIALECT_FLAGS $<TARGET_PROPERTY:compiler-cpp,dialect_cpp23>)
     list(APPEND CMAKE_CXX_COMPILE_FEATURES ${compile_features_cpp23})
+  elseif(CONFIG_STD_CPP26)
+    set(STD_CPP_DIALECT_FLAGS $<TARGET_PROPERTY:compiler-cpp,dialect_cpp26>)
+    list(APPEND CMAKE_CXX_COMPILE_FEATURES ${compile_features_cpp26})
   else()
     message(FATAL_ERROR
       "Unreachable code. Expected C++ standard to have been chosen. See Kconfig.zephyr.")
@@ -691,6 +687,11 @@ elseif(NOT ZEPHYR_GIT_INDEX)
   endif()
 endif()
 
+zephyr_get(APP_BUILD_VERSION SYSBUILD LOCAL)
+if(DEFINED APP_BUILD_VERSION)
+  set(app_build_version_argument "-DAPP_BUILD_VERSION=${APP_BUILD_VERSION}")
+endif()
+
 if(ZEPHYR_GIT_INDEX)
   set(git_dependency ${ZEPHYR_GIT_INDEX})
 endif()
@@ -723,7 +724,7 @@ if(EXISTS ${APPLICATION_SOURCE_DIR}/VERSION)
       -DVERSION_TYPE=APP
       -DVERSION_FILE=${APPLICATION_SOURCE_DIR}/VERSION
       -DAPP_VERSION_CUSTOMIZATION="$<TARGET_PROPERTY:app_version_h,APP_VERSION_CUSTOMIZATION>"
-      ${build_version_argument}
+      ${app_build_version_argument}
       -P ${ZEPHYR_BASE}/cmake/gen_version_h.cmake
     DEPENDS ${APPLICATION_SOURCE_DIR}/VERSION ${git_dependency}
       $<TARGET_PROPERTY:app_version_h,APP_VERSION_DEPENDS>
@@ -1939,6 +1940,9 @@ endif()
 
 set(KERNEL_META_PATH  ${PROJECT_BINARY_DIR}/${KERNEL_META_NAME} CACHE INTERNAL "")
 if(CONFIG_BUILD_OUTPUT_META)
+  # SBOM tooling reads CMake's object model alongside this metadata.
+  cmake_file_api(QUERY API_VERSION 1 CODEMODEL 2 TOOLCHAINS 1)
+
   list(APPEND
     post_build_commands
     COMMAND ${PYTHON_EXECUTABLE} ${ZEPHYR_BASE}/scripts/zephyr_module.py
@@ -2271,7 +2275,7 @@ if(LOG_DICT_DB_NAME_ARG)
       ${LOG_DICT_DB_NAME}
     )
   else()
-    # Seprate build target for generating logging dictionary database.
+    # Separate build target for generating logging dictionary database.
     # This needs to be explicitly called/used to generate the database.
     add_custom_command(
       OUTPUT ${LOG_DICT_DB_NAME}
@@ -2316,7 +2320,6 @@ if(HEX_FILES_TO_MERGE)
     )
 
   add_custom_target(mergehex ALL DEPENDS ${MERGED_HEX_NAME})
-  list(APPEND RUNNERS_DEPS mergehex)
 
   message(VERBOSE "Merging hex files: ${HEX_FILES_TO_MERGE}")
 endif()
@@ -2365,7 +2368,7 @@ endif()
 
 if(CONFIG_SOC_DEPRECATED_RELEASE)
   message(WARNING "
-      WARNING:  The SoC '${SOC_NAME}' is deprecated and will be
+      WARNING:  The SoC '${CONFIG_SOC}' is deprecated and will be
       removed in version ${CONFIG_SOC_DEPRECATED_RELEASE}"
   )
 endif()
@@ -2382,9 +2385,9 @@ if((CMAKE_BUILD_TYPE IN_LIST build_types) AND (NOT NO_BUILD_TYPE_WARNING))
   # optimization flag is present in that string.
   # To avoid false-positive matches, the flag must either be matched first
   # or last in string, or come after / followed by minimum a space.
-  if(NOT (CMAKE_C_FLAGS_${CMAKE_BUILD_TYPE_uppercase} MATCHES "(^| )${OPTIMIZATION_FLAG}($| )"))
+  if(NOT (CMAKE_C_FLAGS_${CMAKE_BUILD_TYPE_uppercase} MATCHES "(^| )${COMPILER_OPTIMIZATION_FLAG}($| )"))
     message(WARNING "
-      The CMake build type was set to '${CMAKE_BUILD_TYPE}', but the optimization flag was set to '${OPTIMIZATION_FLAG}'.
+      The CMake build type was set to '${CMAKE_BUILD_TYPE}', but the optimization flag was set to '${COMPILER_OPTIMIZATION_FLAG}'.
       This may be intentional and the warning can be turned off by setting the CMake variable 'NO_BUILD_TYPE_WARNING'"
       )
   endif()
@@ -2427,6 +2430,7 @@ if(CONFIG_LLEXT_EDK)
       ${SYSCALL_LONG_REGISTERS_ARG}
       ${SYSCALL_SPLIT_TIMEOUT_ARG}
     COMMAND ${CMAKE_COMMAND}
+        -DSYSBUILD=${SYSBUILD}
         -P ${ZEPHYR_BASE}/cmake/llext-edk.cmake
     DEPENDS ${logical_target_for_zephyr_elf} ${syscalls_json} build_info_yaml_saved llext_edk_build_props
     COMMAND_EXPAND_LISTS

@@ -171,6 +171,7 @@ int video_set_signal(const struct device *dev, struct k_poll_signal *sig);
  *
  * @retval 0 on success.
  * @retval -EINVAL Parameters are invalid.
+ * @retval -ERANGE Value outside of the control range.
  * @retval -ENOTSUP Format is not supported.
  * @retval -EIO General input / output error.
  */
@@ -368,6 +369,8 @@ static inline uint64_t video_frmival_nsec(const struct video_frmival *frmival)
  * @param match The resulting frame interval closest to @p desired
  *
  * @retval 0 If successful.
+ * @retval -EINVAL If parameters are invalid.
+ * @retval -ERANGE If the step is zero or the result does not fit in 32-bit values.
  */
 int video_closest_frmival_stepwise(const struct video_frmival_stepwise *stepwise,
 				   const struct video_frmival *desired,

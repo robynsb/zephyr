@@ -13,7 +13,10 @@
 #include <zephyr/kernel.h>
 #include <zephyr/ztest.h>
 #include <zephyr/net/net_ip.h>
+#include <zephyr/net/socket.h>
 #include <zephyr/net/zperf.h>
+
+#include "zperf_internal.h"
 
 #define LOOPBACK_IPV4_ADDR "127.0.0.1"
 #define TEST_PORT          5001
@@ -41,8 +44,12 @@ static enum zperf_status server_last_status = ZPERF_SESSION_ERROR;
 static struct zperf_results client_async_results;
 static enum zperf_status client_last_status = ZPERF_SESSION_ERROR;
 
-static void server_session_cb(enum zperf_status status,
-			      struct zperf_results *result,
+struct test_udp_stat {
+	struct zperf_udp_datagram datagram;
+	struct zperf_server_hdr server;
+} __packed;
+
+static void server_session_cb(enum zperf_status status, struct zperf_results *result,
 			      void *user_data)
 {
 	ARG_UNUSED(user_data);
@@ -114,7 +121,7 @@ static void fill_upload_params(struct zperf_upload_params *param)
 		      "Failed to parse loopback address");
 
 	memset(param, 0, sizeof(*param));
-	memcpy(&param->peer_addr, &peer, sizeof(peer));
+	memcpy(&param->peer_addr_storage, &peer, sizeof(peer));
 	param->duration_ms = TEST_DURATION_MS;
 	param->packet_size = TEST_PACKET_SIZE;
 	param->rate_kbps = TEST_RATE_KBPS;
@@ -146,6 +153,50 @@ static void zperf_after(void *fixture)
 	(void)zperf_tcp_download_stop();
 }
 
+ZTEST(zperf_api, test_packet_duration_zero_rate)
+{
+	/* 1000 bytes at 10 kbps:
+	 * (1000 * 8 * 1000000) / (10 * 1024) = 781250 us
+	 */
+	zassert_equal(zperf_packet_duration(1000, 10), 781250U,
+		      "Unexpected pacing delay for a non-zero rate");
+	zassert_equal(zperf_packet_duration(1000, 0), 0U,
+		      "A zero rate must not divide and means no pacing");
+	zassert_equal(zperf_packet_duration(1000, 4194304U), 1U,
+		      "A large rate must not wrap the duration divisor");
+}
+
+ZTEST(zperf_api, test_udp_upload_unlimited_rate)
+{
+	struct zperf_download_params download_param = {
+		.port = TEST_PORT,
+	};
+	struct zperf_upload_params upload_param;
+	struct zperf_results client_results = { 0 };
+	int ret;
+
+	ret = zperf_udp_download(&download_param, server_session_cb, NULL);
+	zassert_ok(ret, "Failed to start UDP server (%d)", ret);
+
+	fill_upload_params(&upload_param);
+	upload_param.rate_kbps = 0U;
+	/* Short run: POSIX waits 1 ms/packet; long enough to hit compensation. */
+	upload_param.duration_ms = 200;
+
+	ret = zperf_udp_upload(&upload_param, &client_results);
+	zassert_ok(ret, "Unlimited-rate UDP upload failed (%d)", ret);
+	zassert_true(client_results.nb_packets_sent > 0,
+		     "Unlimited-rate upload did not send any packets");
+
+	ret = k_sem_take(&session_finished, TEST_TIMEOUT);
+	zassert_ok(ret, "Timed out waiting for UDP server session to finish");
+	zassert_equal(server_last_status, ZPERF_SESSION_FINISHED,
+		      "UDP server session did not finish cleanly (status %d)",
+		      server_last_status);
+	zassert_true(server_results.nb_packets_rcvd > 0,
+		     "UDP server did not receive any packets");
+}
+
 ZTEST(zperf_api, test_udp_upload_download)
 {
 	struct zperf_download_params download_param = {
@@ -165,33 +216,156 @@ ZTEST(zperf_api, test_udp_upload_download)
 	zassert_ok(ret, "UDP upload failed (%d)", ret);
 
 	/* Client side: we sent packets and collected the server statistics. */
-	zassert_true(client_results.nb_packets_sent > 0,
-		     "Client did not send any UDP packets");
+	zassert_true(client_results.nb_packets_sent > 0, "Client did not send any UDP packets");
 	zassert_equal(client_results.packet_size, TEST_PACKET_SIZE,
-		      "Unexpected client packet size %u",
-		      client_results.packet_size);
-	zassert_true(client_results.client_time_in_us > 0,
-		     "Client transfer time not reported");
+		      "Unexpected client packet size %u", client_results.packet_size);
+	zassert_true(client_results.client_time_in_us > 0, "Client transfer time not reported");
 	zassert_true(client_results.nb_packets_rcvd > 0,
 		     "Server did not report any received packets to client");
-	zassert_true(client_results.nb_packets_rcvd <=
-			     client_results.nb_packets_sent,
+	zassert_true(client_results.nb_packets_rcvd <= client_results.nb_packets_sent,
 		     "Server received more packets (%u) than were sent (%u)",
-		     client_results.nb_packets_rcvd,
-		     client_results.nb_packets_sent);
+		     client_results.nb_packets_rcvd, client_results.nb_packets_sent);
+	zassert_equal(client_results.nb_packets_rcvd + client_results.nb_packets_lost,
+		      client_results.nb_packets_sent,
+		      "Server packet accounting does not match the sent total");
 
 	/* Server side: wait for the FINISHED callback and verify its stats. */
 	ret = k_sem_take(&session_finished, TEST_TIMEOUT);
 	zassert_ok(ret, "Timed out waiting for UDP server session to finish");
 	zassert_equal(server_last_status, ZPERF_SESSION_FINISHED,
-		      "UDP server session did not finish cleanly (status %d)",
-		      server_last_status);
-	zassert_true(server_results.nb_packets_rcvd > 0,
-		     "UDP server did not receive any packets");
-	zassert_true(server_results.total_len > 0,
-		     "UDP server did not report any received data");
-	zassert_true(server_results.time_in_us > 0,
-		     "UDP server did not report a transfer time");
+		      "UDP server session did not finish cleanly (status %d)", server_last_status);
+	zassert_true(server_results.nb_packets_rcvd > 0, "UDP server did not receive any packets");
+	zassert_true(server_results.total_len > 0, "UDP server did not report any received data");
+	zassert_true(server_results.time_in_us > 0, "UDP server did not report a transfer time");
+}
+
+static void verify_udp_packet_sequence(const int32_t *packet_ids, size_t packet_count,
+				       uint32_t expected_lost, uint32_t expected_outorder,
+				       uint32_t expected_total)
+{
+	struct zperf_download_params download_param = {
+		.port = TEST_PORT,
+	};
+	struct net_sockaddr_in peer = {
+		.sin_family = NET_AF_INET,
+		.sin_port = net_htons(TEST_PORT),
+	};
+	struct timeval timeout = {
+		.tv_sec = 2,
+	};
+	struct test_udp_stat stat = {0};
+	struct zperf_udp_datagram packet = {0};
+	int sock;
+	int ret;
+
+	ret = zperf_udp_download(&download_param, server_session_cb, NULL);
+	zassert_ok(ret, "Failed to start UDP server (%d)", ret);
+	zassert_equal(net_addr_pton(NET_AF_INET, LOOPBACK_IPV4_ADDR, &peer.sin_addr), 0,
+		      "Failed to parse loopback address");
+
+	sock = zsock_socket(NET_AF_INET, NET_SOCK_DGRAM, NET_IPPROTO_UDP);
+	zassert_true(sock >= 0, "Failed to create UDP socket (%d)", errno);
+	ret = zsock_setsockopt(sock, ZSOCK_SOL_SOCKET, ZSOCK_SO_RCVTIMEO, &timeout,
+			       sizeof(timeout));
+	zassert_ok(ret, "Failed to set UDP receive timeout (%d)", errno);
+
+	for (size_t i = 0; i < packet_count; i++) {
+		packet.id = net_htonl((uint32_t)packet_ids[i]);
+		ret = zsock_sendto(sock, &packet, sizeof(packet), 0, (struct net_sockaddr *)&peer,
+				   sizeof(peer));
+		zassert_equal(ret, sizeof(packet), "Failed to send packet ID %d (%d)",
+			      packet_ids[i], errno);
+	}
+
+	ret = zsock_recv(sock, &stat, sizeof(stat), 0);
+	zassert_equal(ret, sizeof(stat), "Failed to receive UDP statistics (%d)", errno);
+	zsock_close(sock);
+
+	ret = k_sem_take(&session_finished, TEST_TIMEOUT);
+	zassert_ok(ret, "Timed out waiting for UDP server session to finish");
+	zassert_equal(server_last_status, ZPERF_SESSION_FINISHED,
+		      "UDP server session did not finish cleanly (status %d)", server_last_status);
+	zassert_equal(server_results.nb_packets_rcvd, packet_count,
+		      "Expected %zu received packets, got %u", packet_count,
+		      server_results.nb_packets_rcvd);
+	zassert_equal(server_results.nb_packets_lost, expected_lost,
+		      "Expected %u lost packets, got %u", expected_lost,
+		      server_results.nb_packets_lost);
+	zassert_equal(server_results.nb_packets_outorder, expected_outorder,
+		      "Expected %u out-of-order packets, got %u", expected_outorder,
+		      server_results.nb_packets_outorder);
+	zassert_equal(net_ntohl(stat.server.error_cnt), expected_lost,
+		      "UDP ACK reported %u lost packets instead of %u",
+		      net_ntohl(stat.server.error_cnt), expected_lost);
+	zassert_equal(net_ntohl(stat.server.outorder_cnt), expected_outorder,
+		      "UDP ACK reported %u out-of-order packets instead of %u",
+		      net_ntohl(stat.server.outorder_cnt), expected_outorder);
+	zassert_equal(net_ntohl(stat.server.datagrams), expected_total,
+		      "UDP ACK reported a total of %u datagrams instead of %u",
+		      net_ntohl(stat.server.datagrams), expected_total);
+}
+
+ZTEST(zperf_api, test_udp_fin_accounts_for_trailing_loss)
+{
+	/* The iperf2 end of test handshake; iperf3 has none */
+	Z_TEST_SKIP_IFDEF(CONFIG_NET_ZPERF_IPERF3);
+
+	const int32_t packet_ids[] = {1, 2, -5};
+
+	verify_udp_packet_sequence(packet_ids, ARRAY_SIZE(packet_ids), 2, 0, 5);
+}
+
+ZTEST(zperf_api, test_udp_fin_reconciles_out_of_order_gap)
+{
+	/* The iperf2 end of test handshake; iperf3 has none */
+	Z_TEST_SKIP_IFDEF(CONFIG_NET_ZPERF_IPERF3);
+
+	const int32_t packet_ids[] = {1, 3, 2, -4};
+
+	verify_udp_packet_sequence(packet_ids, ARRAY_SIZE(packet_ids), 0, 1, 4);
+}
+
+ZTEST(zperf_api, test_udp_fin_does_not_reconcile_duplicate)
+{
+	/* The iperf2 end of test handshake; iperf3 has none */
+	Z_TEST_SKIP_IFDEF(CONFIG_NET_ZPERF_IPERF3);
+
+	const int32_t packet_ids[] = {1, 3, 3, -5};
+
+	verify_udp_packet_sequence(packet_ids, ARRAY_SIZE(packet_ids), 2, 1, 5);
+}
+
+ZTEST(zperf_api, test_udp_fin_does_not_reconcile_recovered_duplicate)
+{
+	/* The iperf2 end of test handshake; iperf3 has none */
+	Z_TEST_SKIP_IFDEF(CONFIG_NET_ZPERF_IPERF3);
+
+	const int32_t packet_ids[] = {1, 4, 2, 2, -5};
+
+	verify_udp_packet_sequence(packet_ids, ARRAY_SIZE(packet_ids), 1, 2, 5);
+}
+
+/* The server's byte count against what the client sent over TCP. An iperf2
+ * server counts until the client closes the connection, so it sees every
+ * byte. An iperf3 server counts until the client ends the test on the
+ * control connection, which can overtake the last of the data, so it may
+ * see a little less, as iperf3 itself reports.
+ */
+static void check_tcp_total(uint64_t server_len, uint64_t client_len)
+{
+	if (IS_ENABLED(CONFIG_NET_ZPERF_IPERF3)) {
+		zassert_true(server_len <= client_len,
+			     "TCP server received %" PRIu64 " bytes, client sent %" PRIu64,
+			     server_len, client_len);
+		zassert_true(client_len - server_len < client_len / 10,
+			     "TCP server received %" PRIu64 " bytes, client sent %" PRIu64,
+			     server_len, client_len);
+		return;
+	}
+
+	zassert_equal(server_len, client_len,
+		      "TCP server received %" PRIu64 " bytes, client sent %" PRIu64,
+		      server_len, client_len);
 }
 
 ZTEST(zperf_api, test_tcp_upload_download)
@@ -232,13 +406,7 @@ ZTEST(zperf_api, test_tcp_upload_download)
 	zassert_true(server_results.total_len > 0,
 		     "TCP server did not report any received data");
 
-	/* TCP is reliable, so the server must have received exactly what the
-	 * client sent.
-	 */
-	zassert_equal(server_results.total_len, client_results.total_len,
-		      "TCP server received %" PRIu64 " bytes, client sent %"
-		      PRIu64, server_results.total_len,
-		      client_results.total_len);
+	check_tcp_total(server_results.total_len, client_results.total_len);
 }
 
 ZTEST(zperf_api, test_udp_upload_async)
@@ -323,13 +491,7 @@ ZTEST(zperf_api, test_tcp_upload_async)
 	zassert_true(server_results.total_len > 0,
 		     "TCP server did not report any received data");
 
-	/* TCP is reliable, so the server must have received exactly what the
-	 * client sent.
-	 */
-	zassert_equal(server_results.total_len, client_async_results.total_len,
-		      "TCP server received %" PRIu64 " bytes, client sent %"
-		      PRIu64, server_results.total_len,
-		      client_async_results.total_len);
+	check_tcp_total(server_results.total_len, client_async_results.total_len);
 }
 
 ZTEST_SUITE(zperf_api, NULL, NULL, zperf_before, zperf_after, NULL);

@@ -98,9 +98,14 @@ void z_sched_usage_start(struct k_thread *thread)
 
 void z_sched_usage_stop(void)
 {
-	k_spinlock_key_t k   = k_spin_lock(&usage_lock);
+	struct _cpu *cpu = _current_cpu;
 
-	struct _cpu     *cpu = _current_cpu;
+	/* Only this CPU writes usage0, and callers keep local IRQs masked. */
+	if (cpu->usage0 == 0U) {
+		return;
+	}
+
+	k_spinlock_key_t k = k_spin_lock(&usage_lock);
 
 	uint32_t u0 = cpu->usage0;
 
@@ -251,11 +256,20 @@ int k_thread_runtime_stats_enable(k_tid_t  thread)
 	}
 
 	key = k_spin_lock(&usage_lock);
+	struct _cpu *cpu = _current_cpu;
 
 	if (!thread->base.usage.track_usage) {
 		thread->base.usage.track_usage = true;
 		thread->base.usage.num_windows++;
 		thread->base.usage.current = 0;
+
+		if (thread == cpu->current) {
+			uint32_t now = usage_now();
+
+			sched_cpu_update_usage(cpu, now - cpu->usage0);
+
+			cpu->usage0 = now;
+		}
 	}
 
 	k_spin_unlock(&usage_lock, key);
@@ -278,10 +292,13 @@ int k_thread_runtime_stats_disable(k_tid_t  thread)
 		thread->base.usage.track_usage = false;
 
 		if (thread == cpu->current) {
-			uint32_t cycles = usage_now() - cpu->usage0;
+			uint32_t now = usage_now();
+			uint32_t cycles = now - cpu->usage0;
 
 			sched_thread_update_usage(thread, cycles);
 			sched_cpu_update_usage(cpu, cycles);
+
+			cpu->usage0 = now;
 		}
 	}
 
@@ -423,9 +440,8 @@ int z_thread_stats_reset(struct k_obj_core *obj_core)
 	/* Update the current CPU stats. */
 
 	uint32_t now = usage_now();
-	uint32_t cycles = now - _current_cpu->usage0;
 
-	sched_cpu_update_usage(_current_cpu, cycles);
+	sched_cpu_update_usage(_current_cpu, now - _current_cpu->usage0);
 
 	_current_cpu->usage0 = now;
 

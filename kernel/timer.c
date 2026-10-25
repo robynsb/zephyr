@@ -17,7 +17,7 @@
 static struct k_spinlock timer_lock;
 
 #ifdef CONFIG_OBJ_CORE_TIMER
-static struct k_obj_type obj_type_timer;
+K_OBJ_TYPE_DEFINE(obj_type_timer, k_timer, K_OBJ_TYPE_TIMER_ID, NULL);
 #endif /* CONFIG_OBJ_CORE_TIMER */
 
 #if defined(CONFIG_TIMER_OBSERVER)
@@ -138,24 +138,22 @@ void z_timer_expiration_handler(struct _timeout *t)
 		return;
 	}
 
-	thread = z_waitq_head(&timer->wait_q);
+	LOCK_SCHED_SPINLOCK {
+		thread = z_waitq_head_locked(&timer->wait_q);
 
-	if (thread == NULL) {
-		k_spin_unlock(&timer_lock, key);
-		return;
+		if (thread != NULL) {
+			unpend_thread_no_timeout(thread);
+			arch_thread_return_value_set(thread, 0);
+			z_sched_ready_locked(thread);
+		}
 	}
-
-	z_unpend_thread_no_timeout(thread);
-
-	arch_thread_return_value_set(thread, 0);
 
 	k_spin_unlock(&timer_lock, key);
 
-	z_ready_thread(thread);
 }
 
 
-int k_timer_cleanup(struct k_timer *timer)
+int z_timer_cleanup(struct k_timer *timer, __maybe_unused bool locked)
 {
 	/* Not callable from an ISR: this is the one timer path that can
 	 * spin waiting for an in-flight handler, and an ISR spinning here
@@ -165,6 +163,7 @@ int k_timer_cleanup(struct k_timer *timer)
 
 	SYS_PORT_TRACING_OBJ_FUNC_ENTER(k_timer, cleanup, timer);
 
+	int ret = 0;
 	k_spinlock_key_t key;
 
 	/* Refuse if anyone is still pending on the timer's wait queue
@@ -174,10 +173,14 @@ int k_timer_cleanup(struct k_timer *timer)
 retry:
 	key = k_spin_lock(&timer_lock);
 
-	CHECKIF(z_waitq_head(&timer->wait_q) != NULL) {
-		k_spin_unlock(&timer_lock, key);
-		SYS_PORT_TRACING_OBJ_FUNC_EXIT(k_timer, cleanup, timer, -EAGAIN);
-		return -EAGAIN;
+	CHECKIF(locked && (z_waitq_head_locked(&timer->wait_q) != NULL)) {
+		ret = -EAGAIN;
+		goto out;
+	}
+
+	CHECKIF(!locked && (z_waitq_head(&timer->wait_q) != NULL)) {
+		ret = -EAGAIN;
+		goto out;
 	}
 
 	/* Cancel the timeout AND wait for any in-flight expiration
@@ -198,11 +201,23 @@ retry:
 		goto retry;
 	}
 
+out:
 	k_spin_unlock(&timer_lock, key);
 
-	SYS_PORT_TRACING_OBJ_FUNC_EXIT(k_timer, cleanup, timer, 0);
+#ifdef CONFIG_OBJ_CORE_TIMER
+	if (ret == 0) {
+		k_obj_core_unlink(K_OBJ_CORE(timer));
+	}
+#endif /* CONFIG_OBJ_CORE_TIMER */
 
-	return 0;
+	SYS_PORT_TRACING_OBJ_FUNC_EXIT(k_timer, cleanup, timer, ret);
+
+	return ret;
+}
+
+int k_timer_cleanup(struct k_timer *timer)
+{
+	return z_timer_cleanup(timer, false);
 }
 
 
@@ -450,7 +465,3 @@ static inline void z_vrfy_k_timer_user_data_set(struct k_timer *timer,
 #include <zephyr/syscalls/k_timer_user_data_set_mrsh.c>
 
 #endif /* CONFIG_USERSPACE */
-
-#ifdef CONFIG_OBJ_CORE_TIMER
-K_OBJ_TYPE_DEFINE(obj_type_timer, k_timer, K_OBJ_TYPE_TIMER_ID, NULL);
-#endif /* CONFIG_OBJ_CORE_TIMER */

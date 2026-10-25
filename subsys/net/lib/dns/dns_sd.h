@@ -127,17 +127,59 @@ bool dns_sd_rec_match(const struct dns_sd_rec *record,
  * If there is no IPv6 address to advertise, then @p addr6 should be
  * NULL.
  *
- * @param iface the network interface the query was received on
+ * @param iface the network interface the query was received on, may be NULL, in
+ *              which case the bind check is always performed
  * @param inst the DNS-SD record to advertise
  * @param addr4 pointer to the IPv4 address
  * @param addr6 pointer to the IPv6 address
+ * @param buf output buffer
+ * @param buf_size size of the output buffer
+ * @param announce if true, place the SRV/TXT/A/AAAA records in the Answer
+ *        section instead of the Additional Records section, as required by
+ *        RFC 6762 Section 8.3 for unsolicited announcements
+ *
+ * @return on success, number of bytes written to @p buf
+ * @return on failure, a negative errno value
+ */
+int dns_sd_handle_ptr_query(struct net_if *iface, const struct dns_sd_rec *inst,
+	const struct net_in_addr *addr4, const struct net_in6_addr *addr6,
+	uint8_t *buf, uint16_t buf_size, bool announce);
+
+/**
+ * @brief Handle a DNS SRV Query with DNS Service Discovery
+ *
+ * The response contains the SRV record in the Answer section and the
+ * corresponding A and AAAA records in the Additional section.
+ *
+ * @param iface the network interface the query was received on
+ * @param inst the DNS-SD record to advertise
+ * @param addr4 pointer to the IPv4 address, or NULL
+ * @param addr6 pointer to the IPv6 address, or NULL
  * @param buf output buffer
  * @param buf_size size of the output buffer
  *
  * @return on success, number of bytes written to @p buf
  * @return on failure, a negative errno value
  */
-int dns_sd_handle_ptr_query(struct net_if *iface, const struct dns_sd_rec *inst,
+int dns_sd_handle_srv_query(struct net_if *iface, const struct dns_sd_rec *inst,
+	const struct net_in_addr *addr4, const struct net_in6_addr *addr6,
+	uint8_t *buf, uint16_t buf_size);
+
+/**
+ * @brief Handle a DNS TXT Query with DNS Service Discovery
+ *
+ * The response contains the TXT record in the Answer section.
+ *
+ * @param inst the DNS-SD record to advertise
+ * @param addr4 pointer to the IPv4 address, or NULL
+ * @param addr6 pointer to the IPv6 address, or NULL
+ * @param buf output buffer
+ * @param buf_size size of the output buffer
+ *
+ * @return on success, number of bytes written to @p buf
+ * @return on failure, a negative errno value
+ */
+int dns_sd_handle_txt_query(const struct dns_sd_rec *inst,
 	const struct net_in_addr *addr4, const struct net_in6_addr *addr6,
 	uint8_t *buf, uint16_t buf_size);
 
@@ -156,8 +198,9 @@ int dns_sd_handle_ptr_query(struct net_if *iface, const struct dns_sd_rec *inst,
  * @return on failure, a negative errno value
  */
 int dns_sd_handle_service_type_enum(const struct dns_sd_rec *service,
-	const struct net_in_addr *addr4, const struct net_in6_addr *addr6,
-	uint8_t *buf, uint16_t buf_size);
+				    const struct net_in_addr *addr4,
+				    const struct net_in6_addr *addr6, uint8_t *buf,
+				    uint16_t buf_size);
 
 /**
  * @brief Check if DNS-SD record is a valid one.

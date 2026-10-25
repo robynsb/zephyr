@@ -61,6 +61,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import list_boards
 import list_hardware
 from get_maintainer import Maintainers, MaintainersError
+from list_undocumented_licenses import undocumented
 
 sys.path.insert(
     0, str(Path(__file__).resolve().parents[2] / "scripts" / "dts" / "python-devicetree" / "src")
@@ -379,11 +380,11 @@ class CheckPatch(ComplianceTest):
 
 class BoardYmlCheck(ComplianceTest):
     """
-    Check the board.yml files
+    Check the board.yml and shield.yml files
     """
 
     name = "BoardYml"
-    doc = "Check the board.yml file format"
+    doc = "Check the board.yml and shield.yml file format"
 
     def check_board_file(self, file, vendor_prefixes):
         """Validate a single board file."""
@@ -420,8 +421,9 @@ class BoardYmlCheck(ComplianceTest):
             if vendor_prefix_file.exists():
                 vendor_prefixes |= get_vendor_prefixes(vendor_prefix_file, self.error)
 
-        for file in path.glob("**/board.yml"):
-            self.check_board_file(file, vendor_prefixes)
+        for pattern in ("**/board.yml", "**/shield.yml"):
+            for file in path.glob(pattern):
+                self.check_board_file(file, vendor_prefixes)
 
 
 class ClangFormatCheck(ComplianceTest):
@@ -473,6 +475,11 @@ class ClangFormatCheck(ComplianceTest):
             except subprocess.CalledProcessError as ex:
                 patchset = unidiff.PatchSet.from_string(ex.output, encoding="utf-8")
                 for patch in patchset:
+                    # .clang-format-ignore: clang-format skips the file (exit 0, empty stdout).
+                    # clang-format-diff diffs against that empty output, yielding a spurious
+                    # full-file removal diff; unidiff reports that as is_removed_file.
+                    if patch.is_removed_file:
+                        continue
                     self._process_patch_error(file, patch)
 
 
@@ -510,10 +517,11 @@ class StyleCheckMixin:
                     changed.update((hunk.target_start, hunk.target_start + 1))
         return changed
 
-    def _check_files(self, tool, file_filter):
+    def _check_files(self, tool, file_filter, extra_args=()):
         # Run 'tool' on each added/modified file matching 'file_filter' and
         # report issues on changed lines only. 'tool' is a Path; file_filter is a
-        # predicate on the file path string.
+        # predicate on the file path string; 'extra_args' are passed to the tool
+        # before the file argument.
         for file in get_files(filter="d"):
             if not file_filter(file):
                 continue
@@ -523,7 +531,7 @@ class StyleCheckMixin:
                 continue
 
             result = subprocess.run(
-                [sys.executable, str(tool), file],
+                [sys.executable, str(tool), *extra_args, file],
                 cwd=GIT_TOP,
                 capture_output=True,
                 text=True,
@@ -830,6 +838,11 @@ class KconfigCheck(ComplianceTest):
     # Kconfig symbol prefix/namespace.
     CONFIG_ = "CONFIG_"
 
+    # Additional guidance appended to the "Undefined Kconfig symbols" failure
+    # message. Subclasses can override this to describe probable causes
+    # specific to the Kconfig tree being checked.
+    UNDEF_SYMBOL_HINT = ""
+
     def run(self):
         kconf = self.parse_kconfig()
 
@@ -841,6 +854,22 @@ class KconfigCheck(ComplianceTest):
         self.check_soc_name_sync(kconf)
         self.check_no_undef_outside_kconfig(kconf)
         self.check_disallowed_defconfigs(kconf)
+        self.check_no_parser_warnings(kconf)
+        self.check_hardening_data(kconf)
+
+    def check_no_parser_warnings(self, kconf):
+        """
+        Checks that the Kconfig parser emitted no warnings, for example a
+        symbol left without a type because the definition carrying it lives
+        in a module.
+        """
+        if not kconf.warnings:
+            return
+
+        self.failure(
+            "Kconfig parser warnings:\n\n"
+            + "\n".join(warning.strip() for warning in kconf.warnings)
+        )
 
     def get_modules(self, _module_dirs_file, modules_file, sysbuild_modules_file, settings_file):
         """
@@ -964,10 +993,16 @@ class KconfigCheck(ComplianceTest):
                     ).upper()
                     fp.write('config  ' + board_str + '\n')
                     fp.write('\t bool\n')
-                for board_dir in board.directories:
-                    fp.write(
-                        'source "' + (board_dir / ('Kconfig.' + board.name)).as_posix() + '"\n'
-                    )
+                fp.write(
+                    'source "'
+                    + (board.directories[0] / ('Kconfig.' + board.name)).as_posix()
+                    + '"\n'
+                )
+                if len(board.directories) > 1:
+                    for board_dir in board.directories[1:]:
+                        fp.write(
+                            'osource "' + (board_dir / ('Kconfig.' + board.name)).as_posix() + '"\n'
+                        )
 
         with open(kconfig_file, 'w') as fp:
             for board in v2_boards:
@@ -1383,6 +1418,150 @@ Found disallowed Kconfig symbol in SoC Kconfig files: {sym_name:35}
             [sym.name for sym in kconf_syms] + re.findall(regex, grep_stdout, re.MULTILINE)
         ).union(self.get_logging_syms(kconf))
 
+    def check_hardening_data(self, kconf):
+        """
+        Checks that the hardening database (scripts/kconfig/hardening.yaml
+        plus the hardening.yaml fragments next to subsystem Kconfig files)
+        parses, matches its schema, and only references Kconfig symbols that
+        exist, with values coherent with each symbol's type.
+        """
+        # scripts/kconfig is on sys.path since parse_kconfig() ran
+        import hardeninglib
+
+        # A misnamed fragment would silently not be loaded; make it loud.
+        fragment_name_re = re.compile(r"harden.*\.ya?ml$", re.IGNORECASE)
+        for root in hardeninglib.FRAGMENT_ROOTS:
+            root_dir = Path(ZEPHYR_BASE) / root
+            if not root_dir.is_dir():
+                continue
+            for path in root_dir.rglob("*.y*ml"):
+                if fragment_name_re.search(path.name) and path.name != hardeninglib.FRAGMENT_NAME:
+                    self.failure(
+                        f"{path.relative_to(ZEPHYR_BASE)} looks like a "
+                        "hardening database fragment but is not named "
+                        f"'{hardeninglib.FRAGMENT_NAME}', so it will not be "
+                        "loaded. Hint: rename it."
+                    )
+
+        try:
+            database = hardeninglib.load_database()
+        except hardeninglib.HardeningDatabaseError as e:
+            self.failure(f"Malformed hardening database: {e}")
+            return
+
+        profile_errors = hardeninglib.check_profile_integrity(database)
+        for error in profile_errors:
+            self.failure(
+                f"Hardening database: {error}\n"
+                "Hint: profiles are defined in scripts/kconfig/hardening.yaml."
+            )
+
+        defined_syms = self.get_defined_syms(kconf)
+        for name, rule in database['rules'].items():
+            hint = f"Hint: update '{rule['source']}' accordingly."
+
+            if name not in defined_syms:
+                self.failure(f"CONFIG_{name} in {rule['source']} does not exist in Kconfig. {hint}")
+                continue
+
+            sym = kconf.syms.get(name)
+            if sym is None:
+                # Defined only in a sample/test Kconfig tree; the symbol's
+                # type is not available for further checking.
+                continue
+
+            is_numeric = sym.orig_type in (kconfiglib.INT, kconfiglib.HEX)
+
+            # The schema guarantees a rule carries either a value or a
+            # min/max constraint, so 'value' is set in the branches below.
+            if rule['min'] is not None or rule['max'] is not None:
+                if not is_numeric:
+                    self.failure(
+                        f"CONFIG_{name} in {rule['source']} has a min/max "
+                        f"constraint, but is not an int/hex symbol. {hint}"
+                    )
+            elif sym.orig_type in (kconfiglib.BOOL, kconfiglib.TRISTATE):
+                valid = ('y', 'n', 'm') if sym.orig_type is kconfiglib.TRISTATE else ('y', 'n')
+                if rule['value'] not in valid:
+                    self.failure(
+                        f"CONFIG_{name} in {rule['source']} recommends value "
+                        f"'{rule['value']}', which is not valid for a "
+                        f"{kconfiglib.TYPE_TO_STR[sym.orig_type]} symbol. {hint}"
+                    )
+            elif is_numeric:
+                try:
+                    int(rule['value'], 0)
+                except ValueError:
+                    self.failure(
+                        f"CONFIG_{name} in {rule['source']} recommends "
+                        f"value '{rule['value']}', which is not valid "
+                        f"for an int/hex symbol. {hint}"
+                    )
+
+        # The redundancy analysis resolves profile inheritance, so it can
+        # only run once the profiles themselves are known to be consistent.
+        if not profile_errors:
+            self.check_no_redundant_hardening_rules(kconf, database)
+
+    def check_no_redundant_hardening_rules(self, kconf, database):
+        """
+        Checks that no 'n' rule in the hardening database is redundant: a
+        rule for a symbol that can only be enabled while violating another
+        'n' rule applying to at least the same profiles adds nothing (e.g.
+        FILE_SYSTEM_SHELL=n is pointless when SHELL=n is already flagged
+        for the same profiles and FILE_SYSTEM_SHELL depends on SHELL).
+        Rules for symbols that merely 'select' a flagged symbol are not
+        redundant; they point at the actionable option.
+        """
+        # scripts/kconfig is on sys.path since parse_kconfig() ran
+        import hardeninglib
+
+        profiles = database['profiles']
+
+        def applies_to(rule):
+            # profiles a rule is active in, following 'extends'
+            return {
+                p
+                for p in profiles
+                if hardeninglib.profile_closure(profiles, p) & set(rule['profiles'])
+            }
+
+        off_rules = {name: rule for name, rule in database['rules'].items() if rule['value'] == 'n'}
+
+        def required_syms(sym, seen):
+            # Symbols that must be enabled for 'sym' to be enabled:
+            # positive AND-branches of the direct dependencies, followed
+            # transitively. Conservative: OR/NOT branches are skipped.
+            out = []
+
+            def walk(expr):
+                if isinstance(expr, kconfiglib.Symbol):
+                    if not expr.is_constant and expr.name not in seen:
+                        seen.add(expr.name)
+                        out.append(expr)
+                        walk(expr.direct_dep)
+                elif isinstance(expr, tuple) and expr[0] == kconfiglib.AND:
+                    walk(expr[1])
+                    walk(expr[2])
+
+            walk(sym.direct_dep)
+            return out
+
+        for name, rule in off_rules.items():
+            sym = kconf.syms.get(name)
+            if sym is None:
+                continue
+            for dep in required_syms(sym, {name}):
+                other = off_rules.get(dep.name)
+                if other and applies_to(rule) <= applies_to(other):
+                    self.failure(
+                        f"CONFIG_{name} in {rule['source']} is redundant: "
+                        f"it requires CONFIG_{dep.name}, which "
+                        f"{other['source']} already recommends disabling "
+                        "for the same profiles. Hint: remove the "
+                        f"CONFIG_{name} rule."
+                    )
+
     def check_top_menu_not_too_long(self, kconf):
         """
         Checks that there aren't too many items in the top-level menu (which
@@ -1506,7 +1685,10 @@ https://docs.zephyrproject.org/latest/build/kconfig/tips.html#menuconfig-symbols
         )
 
         if undef_ref_warnings:
-            self.failure(f"Undefined Kconfig symbols:\n\n {undef_ref_warnings}")
+            msg = f"Undefined Kconfig symbols:\n\n {undef_ref_warnings}"
+            if self.UNDEF_SYMBOL_HINT:
+                msg += f"\n\n{self.UNDEF_SYMBOL_HINT}"
+            self.failure(msg)
 
     def check_soc_name_sync(self, kconf):
         root_args = argparse.Namespace(**{'soc_roots': [ZEPHYR_BASE]})
@@ -1680,6 +1862,9 @@ class KconfigBasicCheck(KconfigCheck):
     def check_no_undef_outside_kconfig(self, kconf):
         pass
 
+    def check_hardening_data(self, kconf):
+        pass
+
 
 class KconfigBasicNoModulesCheck(KconfigBasicCheck):
     """
@@ -1712,10 +1897,23 @@ class KconfigHWMv2Check(KconfigBasicCheck):
     """
 
     name = "KconfigHWMv2"
+    doc = zephyr_doc_detail_builder("/hardware/porting/board_porting.html#write-kconfig-files")
 
     # Use dedicated Kconfig board / soc v2 scheme file.
     # This file sources only v2 scheme tree.
     FILENAME = os.path.join(os.path.dirname(__file__), "Kconfig.board.v2")
+
+    UNDEF_SYMBOL_HINT = """\
+This check loads only the board and SoC Kconfig trees (Kconfig.<board> and
+Kconfig.soc files) without the rest of the Zephyr Kconfig tree, because those
+files must be loadable standalone; for example, sysbuild also loads them.
+
+Probable causes of the undefined symbol warnings above:
+- A Kconfig.<board> or Kconfig.soc file references a symbol defined outside
+  the board and SoC Kconfig trees, for example a driver or subsystem symbol.
+  Move the reference to the Kconfig or Kconfig.defconfig file of the board or
+  SoC instead, as those files are only loaded in the full Zephyr Kconfig tree.
+- The symbol name is misspelled, or the file defining it is not sourced."""
 
 
 class SysbuildKconfigCheck(KconfigCheck):
@@ -1739,6 +1937,11 @@ class SysbuildKconfigCheck(KconfigCheck):
         "SECOND_SAMPLE",  # Used in sysbuild documentation
         # zephyr-keep-sorted-stop
     }
+
+    def check_hardening_data(self, kconf):
+        # The hardening database references application Kconfig symbols,
+        # which do not exist in the sysbuild Kconfig tree.
+        pass
 
 
 class SysbuildKconfigBasicCheck(SysbuildKconfigCheck, KconfigBasicCheck):
@@ -1966,6 +2169,39 @@ class LicenseAndCopyrightCheck(ComplianceTest):
                 ),
             )
 
+        self._check_documented_exceptions(project, changed_files)
+
+    def _check_documented_exceptions(self, project: Project, changed_files: Iterable) -> None:
+        """Flag non-Apache-2.0 files that are not documented as an exception.
+
+        Zephyr is Apache-2.0 as a whole; per the project charter CC-BY-4.0 is
+        allowed for documentation only. Any other license, or CC-BY-4.0 on a
+        non-documentation file, must be listed on the
+        :ref:`licensing page <zephyr_licensing>`. That page is generated from
+        the ``[[annotations]]`` blocks in ``REUSE.toml`` that carry a
+        ``Zephyr-Description`` key, so such a file is considered documented if and
+        only if it is matched by one of those blocks. The detection itself lives
+        in ``scripts/list_undocumented_licenses.py`` and is shared with that
+        tool and the docs licensing page.
+        """
+        for file, licenses in undocumented(project, changed_files):
+            self.fmtd_failure(
+                "error",
+                "Undocumented license",
+                file,
+                line=1,
+                desc=(
+                    f"File is licensed as {', '.join(sorted(licenses))}, which is not "
+                    "Apache-2.0. Importing code under another license has prerequisites; make "
+                    "sure the steps in "
+                    "https://docs.zephyrproject.org/latest/contribute/guidelines.html"
+                    "#components-using-other-licenses have been followed. Then document the "
+                    "component as an [[annotations]] entry with a 'Zephyr-Description' key in "
+                    "REUSE.toml, so it is listed on the licensing page "
+                    "(https://docs.zephyrproject.org/latest/LICENSING.html)."
+                ),
+            )
+
 
 class GitLint(ComplianceTest):
     """
@@ -2090,6 +2326,10 @@ class CMakeStyle(StyleCheckMixin, ComplianceTest):
     Checks the CMake style of added/modified files against the Zephyr CMake style
     guidelines, using scripts/cmake/cmake_style.py. Only issues on lines touched
     by the change are reported, so pre-existing style is not flagged.
+
+    Downstream projects can extend the mixed-case command allow-list by pointing
+    the CMAKE_STYLE_MIXED_CASE_FILE environment variable at an extra allow-list
+    file (same format as scripts/cmake/cmake_style_mixed_case.txt).
     """
 
     name = "CMakeStyle"
@@ -2104,9 +2344,16 @@ class CMakeStyle(StyleCheckMixin, ComplianceTest):
                 "'pip install tree-sitter tree-sitter-cmake'"
             )
 
+        # Load extensions to the mixed-case command allow-list
+        extra_args = []
+        if path := os.environ.get("CMAKE_STYLE_MIXED_CASE_FILE", None):
+            logging.info(f"Loading extra mixed-case commands from {path}")
+            extra_args += ["--mixed-case-file", path]
+
         self._check_files(
             ZEPHYR_BASE / "scripts" / "cmake" / "cmake_style.py",
             lambda file: file.endswith(".cmake") or Path(file).name == "CMakeLists.txt",
+            extra_args=extra_args,
         )
 
 
@@ -2352,8 +2599,8 @@ class KeepSorted(ComplianceTest):
     MARKER = "zephyr-keep-sorted"
 
     def block_check_sorted(self, block_data, *, regex, strip, fold, icase):
-        def _test_indent(txt: str):
-            return txt.startswith((" ", "\t"))
+        def _is_continuation(txt: str):
+            return txt.startswith((" ", "\t")) or txt.rstrip() == ")"
 
         if regex is None:
             block_data = textwrap.dedent(block_data)
@@ -2374,12 +2621,12 @@ class KeepSorted(ComplianceTest):
                 if not re.match(regex, line):
                     continue
             else:
-                if _test_indent(line):
+                if _is_continuation(line):
                     continue
 
                 if fold:
                     # Fold back indented lines after the current one
-                    for cont in takewhile(_test_indent, lines[idx + 1 :]):
+                    for cont in takewhile(_is_continuation, lines[idx + 1 :]):
                         line += cont.strip()
 
             if icase:
@@ -3037,6 +3284,8 @@ def _run_tests_parallel(testcases, jobs, loglevel):
     # 'jobs' is 0). Returns the same tuples as _run_tests_sequential().
     jobs = jobs or os.cpu_count() or 1
     jobs = min(jobs, len(testcases)) or 1
+    if jobs == 1:
+        return _run_tests_sequential(testcases)
 
     # Start the slowest checks first so that they are not left running alone at
     # the end. The Kconfig-based checks each parse a full Kconfig tree.
@@ -3158,16 +3407,16 @@ def parse_args(argv):
         nargs='?',
         type=int,
         const=0,
-        default=None,
+        default=0,
         metavar='N',
         help='''Run the checks in parallel, using N worker processes (one per
-                CPU if N is 0 or omitted). The default is to run the checks
-                sequentially.''',
+                CPU if N is 0 or omitted, which is the default). Pass 1 to run
+                the checks sequentially.''',
     )
 
     args = parser.parse_args(argv)
 
-    if args.parallel is not None and args.parallel < 0:
+    if args.parallel < 0:
         parser.error("argument -p/--parallel: N must be >= 0")
 
     return args
@@ -3231,10 +3480,10 @@ def _main(args):
 
         testcases.append(testcase)
 
-    if args.parallel is not None:
-        results = _run_tests_parallel(testcases, args.parallel, args.loglevel)
-    else:
+    if args.parallel == 1:
         results = _run_tests_sequential(testcases)
+    else:
+        results = _run_tests_parallel(testcases, args.parallel, args.loglevel)
 
     for testcase, case, fmtd_failures in results:
         # Annotate if required

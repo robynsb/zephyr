@@ -20,6 +20,13 @@ tests:
       - net
     extra_configs:
       - CONFIG_NET_ZPERF_SERVER=n
+  sample.net.zperf.iperf3:
+    harness: net
+    platform_allow: qemu_x86
+    tags:
+      - net
+    extra_args:
+      - EXTRA_CONF_FILE="overlay-iperf3.conf"
   sample.net.zperf.loopback_icount:
     harness: console
     platform_allow:
@@ -153,6 +160,13 @@ tests:
     platform_allow:
       - beagleconnect_freedom@C5/cc1352p
       - beagleconnect_freedom@C7/cc1352p7
+  sample.net.zperf.nrf7002dk.legacy_nrf_clock:
+    extra_args: SNIPPET=wifi-ipv4
+    extra_configs:
+      - CONFIG_CLOCK_CONTROL_NRF=y
+      - CONFIG_WARN_DEPRECATED=n
+      - CONFIG_BUILD_ONLY_NO_BLOBS=y
+    platform_allow: nrf7002dk/nrf5340/cpuapp
   sample.net.zperf.nrf7002dk:
     extra_args: SNIPPET=wifi-ipv4
     tags:
@@ -168,6 +182,15 @@ tests:
     extra_configs:
       - CONFIG_NET_SOCKETS_PACKET=y
       - CONFIG_NET_ZPERF_RAW_TX=y
+  sample.net.zperf.raw_tx.nrf7002dk.legacy_nrf_clock:
+    extra_args: SNIPPET=wifi-ipv4
+    extra_configs:
+      - CONFIG_CLOCK_CONTROL_NRF=y
+      - CONFIG_WARN_DEPRECATED=n
+      - CONFIG_BUILD_ONLY_NO_BLOBS=y
+      - CONFIG_NET_SOCKETS_PACKET=y
+      - CONFIG_NET_ZPERF_RAW_TX=y
+    platform_allow: nrf7002dk/nrf5340/cpuapp
   sample.net.zperf.raw_tx.nrf7002dk:
     extra_args: SNIPPET=wifi-ipv4
     tags:

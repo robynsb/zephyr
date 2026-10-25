@@ -403,8 +403,9 @@ class JsonReport:
                 suite["status"] = TwisterStatus.NOTRUN
                 suite["reason"] = instance.reason
             else:
+                # Not run yet, as in a test plan saved before running:
+                # there is no reason to give.
                 suite["status"] = TwisterStatus.NONE
-                suite["reason"] = 'Unknown Instance status'
 
             if instance.status != TwisterStatus.NONE:
                 suite["execution_time"] =  f"{float(handler_time):.2f}"
@@ -545,12 +546,18 @@ class JsonReport:
             if "undefined reference" in line:
                 return line[line.index('undefined reference') :].strip()
             elif "error: ld returned" in line:
+                # What decides the reason is the line before this one, so
+                # when this is the first line there is nothing to decide
+                # it. lines[i - 1] at i == 0 is the last line of the log,
+                # which is a different file: reports.py appends the
+                # handler's stderr to the build log before parsing.
+                previous = lines[i - 1] if i else ""
                 if last_warning:
                     return last_warning
-                elif "overflowed by" in lines[i - 1]:
+                elif "overflowed by" in previous:
                     return "ld.bfd: region overflowed"
-                elif "ld.bfd: warning: " in lines[i - 1]:
-                    return "ld.bfd:" + lines[i - 1].split("ld.bfd:", 1)[-1]
+                elif "ld.bfd: warning: " in previous:
+                    return "ld.bfd:" + previous.split("ld.bfd:", 1)[-1]
                 return line
             elif "error: " in line:
                 return line[line.index('error: ') :].strip()

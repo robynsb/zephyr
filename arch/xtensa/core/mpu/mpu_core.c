@@ -414,7 +414,7 @@ static int mpu_map_region_add(struct xtensa_mpu_map *map,
 	/*
 	 * Entry for ending of the region.
 	 *
-	 * If the end address matches one of the entry (entry_slot_e != NULL), we resue
+	 * If the end address matches one of the entry (entry_slot_e != NULL), we reuse
 	 * this existing entry.
 	 *
 	 * If there is no exact address match in the map (entry_slot_e == NULL), we need to
@@ -490,7 +490,7 @@ static int mpu_map_region_add(struct xtensa_mpu_map *map,
 	/*
 	 * Entry for beginning of the region.
 	 *
-	 * If the start address matches one of the entry (entry_slot_s != NULL), we resue
+	 * If the start address matches one of the entry (entry_slot_s != NULL), we reuse
 	 * this existing entry.
 	 *
 	 * If there is no exact address match in the map (entry_slot_s == NULL), we need to
@@ -1025,6 +1025,71 @@ int arch_buffer_validate(const void *addr, size_t size, int write)
 	}
 
 	ret = 0;
+
+out:
+	return ret;
+}
+
+bool xtensa_buffer_is_kernel_readable(const void *addr, size_t size)
+{
+	uintptr_t aligned_addr;
+	size_t aligned_size, addr_offset;
+	bool ret = false;
+
+	/* addr/size arbitrary, fix this up into an aligned region */
+	aligned_addr = ROUND_DOWN((uintptr_t)addr, XCHAL_MPU_ALIGN);
+	addr_offset = (uintptr_t)addr - aligned_addr;
+
+	if (size_add_overflow(size, addr_offset, &aligned_size)) {
+		goto out;
+	}
+
+	aligned_size = ROUND_UP(size + addr_offset, XCHAL_MPU_ALIGN);
+
+	for (size_t offset = 0; offset < aligned_size; offset += XCHAL_MPU_ALIGN) {
+		uint32_t probed = xtensa_pptlb_probe(aligned_addr + offset);
+
+		if ((probed & XTENSA_MPU_PROBE_VALID_ENTRY_MASK) == 0U) {
+			/* There is no foreground or background entry associated
+			 * with the region.
+			 */
+			goto out;
+		}
+
+		uint8_t access_rights = (probed & XTENSA_MPU_PPTLB_ACCESS_RIGHTS_MASK) >>
+					XTENSA_MPU_PPTLB_ACCESS_RIGHTS_SHIFT;
+
+		/* The region must be readable in privileged (kernel) mode. */
+		switch (access_rights) {
+		case XTENSA_MPU_ACCESS_P_RO_U_NA:
+			__fallthrough;
+		case XTENSA_MPU_ACCESS_P_RX_U_NA:
+			__fallthrough;
+		case XTENSA_MPU_ACCESS_P_RW_U_NA:
+			__fallthrough;
+		case XTENSA_MPU_ACCESS_P_RWX_U_NA:
+			__fallthrough;
+		case XTENSA_MPU_ACCESS_P_RW_U_RWX:
+			__fallthrough;
+		case XTENSA_MPU_ACCESS_P_RW_U_RO:
+			__fallthrough;
+		case XTENSA_MPU_ACCESS_P_RWX_U_RX:
+			__fallthrough;
+		case XTENSA_MPU_ACCESS_P_RO_U_RO:
+			__fallthrough;
+		case XTENSA_MPU_ACCESS_P_RX_U_RX:
+			__fallthrough;
+		case XTENSA_MPU_ACCESS_P_RW_U_RW:
+			__fallthrough;
+		case XTENSA_MPU_ACCESS_P_RWX_U_RWX:
+			/* These permissions are okay. */
+			break;
+		default:
+			goto out;
+		}
+	}
+
+	ret = true;
 
 out:
 	return ret;

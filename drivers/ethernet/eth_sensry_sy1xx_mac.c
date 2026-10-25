@@ -45,9 +45,12 @@ LOG_MODULE_REGISTER(sy1xx_mac, CONFIG_ETHERNET_LOG_LEVEL);
 /* Clock divider mask */
 #define SY1XX_MAC_CTRL_CLK_DIV_MASK (0x3)
 
-#define MAX_MAC_PACKET_LEN      1600
-#define MAX_TX_RETRIES          5
-#define RECEIVE_GRACE_TIME_MSEC 1
+#define MAX_MAC_PACKET_LEN         1600
+#define SY1XX_MAC_RX_TIMESTAMP_SIZE 8
+#define SY1XX_MAC_RX_STATUS_SIZE    1
+#define SY1XX_MAC_RX_METADATA_SIZE  (SY1XX_MAC_RX_TIMESTAMP_SIZE + SY1XX_MAC_RX_STATUS_SIZE)
+#define MAX_TX_RETRIES             5
+#define RECEIVE_GRACE_TIME_MSEC    1
 
 #define SY1XX_ETH_STACK_SIZE      4096
 #define SY1XX_ETH_THREAD_PRIORITY K_PRIO_PREEMPT(0)
@@ -144,11 +147,7 @@ static int sy1xx_mac_set_promiscuous_mode(const struct device *dev, bool promisc
 
 	/* set promiscuous mode */
 	prom = sys_read32(cfg->ctrl_addr + SY1XX_MAC_ADDRESS_HIGH_REG);
-	if (promiscuous_mode) {
-		prom &= ~BIT(16);
-	} else {
-		prom |= BIT(16);
-	}
+	WRITE_BIT(prom, 16, promiscuous_mode);
 	sys_write32(prom, cfg->ctrl_addr + SY1XX_MAC_ADDRESS_HIGH_REG);
 
 	return 0;
@@ -169,7 +168,7 @@ static void sy1xx_mac_set_mac_addr(const struct device *dev)
 	sys_write32(v_low, cfg->ctrl_addr + SY1XX_MAC_ADDRESS_LOW_REG);
 
 	v_high = sys_read32(cfg->ctrl_addr + SY1XX_MAC_ADDRESS_HIGH_REG);
-	v_high |= (v_high & 0xffff0000) | sys_get_le16(&data->mac_addr[4]);
+	v_high = (v_high & 0xffff0000) | sys_get_le16(&data->mac_addr[4]);
 	sys_write32(v_high, cfg->ctrl_addr + SY1XX_MAC_ADDRESS_HIGH_REG);
 }
 
@@ -411,15 +410,23 @@ static int sy1xx_mac_low_level_receive(const struct device *dev, uint8_t *rx, ui
 
 	/* rx udma is ready */
 	bytes_transferred = SY1XX_UDMA_READ_REG(cfg->base_addr, SY1XX_UDMA_CFG_REG) & 0x0000ffff;
-	if (bytes_transferred) {
-		/* message received, copy data */
-		memcpy(rx, data->dma_buffers->rx, bytes_transferred);
-		*len = bytes_transferred;
-		ret = 0;
-	} else {
+	if (bytes_transferred == 0) {
 		/* no data, should never happen */
 		SY1XX_UDMA_CANCEL_RX(cfg->base_addr);
 		ret = -EINVAL;
+	} else if (bytes_transferred < SY1XX_MAC_RX_METADATA_SIZE +
+		   NET_ETH_MINIMAL_FRAME_SIZE) {
+		LOG_ERR("rx frame too short (%u bytes)", bytes_transferred);
+		ret = -EINVAL;
+	} else {
+		/*
+		 * The MAC appends its internal RTC timestamp and RX status to every
+		 * received frame. Do not pass this MAC-specific metadata to the
+		 * Ethernet stack.
+		 */
+		*len = bytes_transferred - SY1XX_MAC_RX_METADATA_SIZE;
+		memcpy(rx, data->dma_buffers->rx, *len);
+		ret = 0;
 	}
 
 	/* start new reception */

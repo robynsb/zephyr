@@ -114,7 +114,15 @@
 	status = "okay";
 };
 
+&vreg {
+	status = "okay";
+};
+
 &wdt0 {
+	status = "okay";
+};
+
+&die_temp {
 	status = "okay";
 };
 

@@ -313,7 +313,7 @@ retry:
 #ifndef CONFIG_WIFI_NM_WPA_SUPPLICANT
 /** Check if packet is mgmt and try to consume it.
  *
- * Return MLAN_STATUS_RESOURCE if not intrest in it.
+ * Return MLAN_STATUS_RESOURCE if not interest in it.
  * Return MLAN_STATUS_SUCCESS if packet is consumed.
  * Return MLAN_STATUS_FAILURE if error happens and needs to drop it.
  */
@@ -1147,7 +1147,7 @@ int net_get_if_addr(struct net_ip_config *addr, void *intrfc_handle)
 	interface_t *if_handle = (interface_t *)intrfc_handle;
 
 #if defined(CONFIG_NET_IPV4)
-	struct net_if_ipv4 *ipv4 = if_handle->netif->config.ip.ipv4;
+	struct net_if_ipv4 *ipv4 = net_if_get_config(if_handle->netif)->ip.ipv4;
 
 	addr->ipv4.address = NET_IPV4_ADDR_U32(ipv4->unicast[0].ipv4.address);
 	addr->ipv4.netmask = ipv4->unicast[0].netmask.s_addr;
@@ -1165,14 +1165,17 @@ int net_get_if_addr(struct net_ip_config *addr, void *intrfc_handle)
 		int i;
 
 		for (i = 0; i < CONFIG_DNS_RESOLVER_MAX_SERVERS; i++) {
-			if (ctx->servers[i].dns_server.sa_family == AF_INET) {
+			struct net_sockaddr *server_addr =
+				net_sad(&ctx->servers[i].dns_server_addr);
+
+			if (ctx->servers[i].dns_server_addr.ss_family == AF_INET) {
 				if (i == 0) {
-					addr->ipv4.dns1 = net_sin(&ctx->servers[i].dns_server)
-								  ->sin_addr.s_addr;
+					addr->ipv4.dns1 =
+						net_sin(server_addr)->sin_addr.s_addr;
 				}
 				if (i == 1) {
-					addr->ipv4.dns2 = net_sin(&ctx->servers[i].dns_server)
-								  ->sin_addr.s_addr;
+					addr->ipv4.dns2 =
+						net_sin(server_addr)->sin_addr.s_addr;
 				}
 			}
 		}
@@ -1236,7 +1239,7 @@ int net_get_if_ipv6_addr(struct net_ip_config *addr, void *intrfc_handle)
 	struct net_if_ipv6 *ipv6;
 	struct net_if_addr *unicast;
 
-	ipv6 = if_handle->netif->config.ip.ipv6;
+	ipv6 = net_if_get_config(if_handle->netif)->ip.ipv6;
 
 	addr->ipv6_count = 0;
 
@@ -1264,7 +1267,7 @@ uint8_t net_get_all_if_ipv6_addr_and_cnt(char *buf, uint32_t buf_size)
 	uint32_t offset = 0;
 
 	STRUCT_SECTION_FOREACH(net_if, iface) {
-		ipv6 = iface->config.ip.ipv6;
+		ipv6 = net_if_get_config(iface)->ip.ipv6;
 		for (i = 0; ipv6 && i < CONFIG_NET_IF_UNICAST_IPV6_ADDR_COUNT; i++) {
 			unicast = &ipv6->unicast[i];
 			if (!unicast->is_used) {
@@ -1291,7 +1294,7 @@ int net_get_if_ipv6_pref_addr(struct net_ip_config *addr, void *intrfc_handle)
 	struct net_if_ipv6 *ipv6;
 	struct net_if_addr *unicast;
 
-	ipv6 = if_handle->netif->config.ip.ipv6;
+	ipv6 = net_if_get_config(if_handle->netif)->ip.ipv6;
 
 	addr->ipv6_count = 0;
 
@@ -1339,9 +1342,13 @@ int net_get_if_ip_addr(uint32_t *ip, void *intrfc_handle)
 {
 #if defined(CONFIG_NET_IPV4)
 	interface_t *if_handle = (interface_t *)intrfc_handle;
-	struct net_if_ipv4 *ipv4 = if_handle->netif->config.ip.ipv4;
+	struct net_if_ipv4 *ipv4 = net_if_get_config(if_handle->netif)->ip.ipv4;
 
-	*ip = NET_IPV4_ADDR_U32(ipv4->unicast[0].ipv4.address);
+	if (ipv4 != NULL) {
+		*ip = NET_IPV4_ADDR_U32(ipv4->unicast[0].ipv4.address);
+	} else {
+		*ip = 0U;
+	}
 #else
 	ARG_UNUSED(intrfc_handle);
 	*ip = 0U;
@@ -1354,7 +1361,7 @@ int net_get_if_ip_mask(uint32_t *nm, void *intrfc_handle)
 {
 #if defined(CONFIG_NET_IPV4)
 	interface_t *if_handle = (interface_t *)intrfc_handle;
-	struct net_if_ipv4 *ipv4 = if_handle->netif->config.ip.ipv4;
+	struct net_if_ipv4 *ipv4 = net_if_get_config(if_handle->netif)->ip.ipv4;
 
 	*nm = ipv4->unicast[0].netmask.s_addr;
 #else
@@ -1655,7 +1662,7 @@ void *net_stack_buffer_alloc_rx(int offset, int len)
 
 		net_buf_add(p, p->size);
 		net_buf_pull(p, offset);
-		alloc_len -= p->len;
+		alloc_len -= p->size;
 		offset = 0;
 		p = p->frags;
 	}

@@ -370,10 +370,16 @@ static struct tbs_inst *lookup_inst_by_uri_scheme(const uint8_t *uri, uint8_t ur
 
 static void disconnected(struct bt_conn *conn, uint8_t reason)
 {
-	const uint8_t conn_index = bt_conn_index(conn);
+	uint8_t conn_index;
 	int err;
 
 	ARG_UNUSED(reason);
+
+	if (!bt_conn_is_type(conn, BT_CONN_TYPE_LE)) {
+		return;
+	}
+
+	conn_index = bt_conn_index(conn);
 
 	err = k_mutex_lock(&tbs_mutex, MUTEX_TIMEOUT);
 	if (err != 0) {
@@ -419,11 +425,13 @@ BT_CONN_CB_DEFINE(conn_cb) = {
 static int notify(struct bt_conn *conn, const struct bt_uuid *uuid,
 		  const struct bt_gatt_attr *attrs, const void *value, size_t value_len)
 {
-	const uint8_t att_header_size = 3U; /* opcode + handle */
-	const uint16_t att_mtu = bt_gatt_get_mtu(conn);
+	const int maxlen = bt_att_get_max_notify_size(conn, BT_ATT_CHAN_OPT_NONE);
 
-	__ASSERT(att_mtu > att_header_size, "Could not get valid ATT MTU");
-	const uint16_t maxlen = att_mtu - att_header_size; /* Subtract opcode and handle */
+	if (maxlen < 0) {
+		__ASSERT(maxlen != -EINVAL, "Unexpected -EINVAL");
+		LOG_DBG("Failed to get max notification size for %p: %d", conn, maxlen);
+		return maxlen; /* contains errno value */
+	}
 
 	if (maxlen < value_len) {
 		LOG_DBG("Truncating notification to %u (was %u)", maxlen, value_len);
@@ -1437,7 +1445,7 @@ static void current_calls_cfg_changed(const struct bt_gatt_attr *attr, uint16_t 
 	LOG_DBG("Index %u: value 0x%04x", inst_index(inst), value);
 
 	if (value == 0U) {
-		int err = k_mutex_lock(&tbs_mutex, K_FOREVER);
+		int err = k_mutex_lock(&tbs_mutex, MUTEX_TIMEOUT);
 
 		if (err != 0) {
 			LOG_DBG("Failed to lock mutex: %d", err);
@@ -1632,7 +1640,7 @@ static void call_state_cfg_changed(const struct bt_gatt_attr *attr, uint16_t val
 	LOG_DBG("Index %u: value 0x%04x", inst_index(inst), value);
 
 	if (value == 0U) {
-		int err = k_mutex_lock(&tbs_mutex, K_FOREVER);
+		int err = k_mutex_lock(&tbs_mutex, MUTEX_TIMEOUT);
 
 		if (err != 0) {
 			LOG_DBG("Failed to lock mutex: %d", err);
